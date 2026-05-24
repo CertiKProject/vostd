@@ -2,6 +2,7 @@ use vstd::prelude::*;
 
 use vstd_extra::ownership::*;
 
+use crate::mm::frame::meta::mapping::meta_addr;
 use crate::mm::frame::*;
 use crate::mm::page_prop::PageProperty;
 use crate::mm::page_table::*;
@@ -20,7 +21,7 @@ impl<C: PageTableConfig> OwnerOf for Child<C> {
         match self {
             Self::PageTable(node) => {
                 &&& owner.is_node()
-                &&& node.ptr.addr() == owner.node.unwrap().meta_perm.addr()
+                &&& node.ptr.addr() == meta_addr(owner.node.unwrap().slot_index)
                 &&& node.index() == frame_to_index(meta_to_frame(node.ptr.addr()))
             },
             Self::Frame(paddr, level, prop) => {
@@ -42,7 +43,7 @@ impl<'a, C: PageTableConfig> OwnerOf for ChildRef<'a, C> {
         match self {
             Self::PageTable(node) => {
                 &&& owner.is_node()
-                &&& node.inner.0.ptr.addr() == owner.node.unwrap().meta_perm.addr()
+                &&& node.inner.0.ptr.addr() == meta_addr(owner.node.unwrap().slot_index)
             },
             Self::Frame(paddr, level, prop) => {
                 &&& owner.is_frame()
@@ -129,8 +130,13 @@ impl<C: PageTableConfig> EntryOwner<C> {
                 raw_count: 0usize,
                 ..old_slot
             };
+            // Design B: the node's slot perm already lives canonically
+            // in `regions.slots[index]`, so the `from_pte` transition
+            // doesn't touch the `slots` map. Only `slot_owners[index]`
+            // updates (raw_count reset to 0 when the node is mapped
+            // under a parent PTE).
             MetaRegionOwners {
-                slots: regions.slots.insert(index, self.node.unwrap().meta_perm.points_to),
+                slots: regions.slots,
                 slot_owners: regions.slot_owners.insert(index, new_slot),
             }
         } else {

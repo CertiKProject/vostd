@@ -3,7 +3,7 @@ use vstd::prelude::*;
 use vstd_extra::ghost_tree::*;
 use vstd_extra::ownership::*;
 
-use crate::mm::frame::meta::mapping::frame_to_index;
+use crate::mm::frame::meta::mapping::{frame_to_index, meta_addr};
 use crate::mm::page_table::*;
 use crate::specs::arch::mm::NR_ENTRIES;
 use crate::specs::mm::frame::meta_owners::REF_COUNT_UNUSED;
@@ -23,10 +23,12 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
     pub open spec fn node_matching(self, owner: EntryOwner<C>, parent_owner: NodeOwner<C>, guard: PageTableGuard<'rcu, C>) -> bool {
         &&& parent_owner.level == owner.parent_level
         &&& parent_owner.inv()
-        &&& guard.inner.inner@.ptr.addr() == parent_owner.meta_perm.points_to.addr()
+        // Design B: address consistency vs the parent node's slot; the
+        // `is_init` / `wf` perm facts now come from `regions.inv()` +
+        // the caller's `relate_regions` borrow (lifted from this
+        // predicate, which used to dereference `parent_owner.meta_perm`).
+        &&& guard.inner.inner@.ptr.addr() == meta_addr(parent_owner.slot_index)
         &&& guard.inner.inner@.wf(parent_owner)
-        &&& parent_owner.meta_perm.is_init()
-        &&& parent_owner.meta_perm.wf(&parent_owner.meta_perm.inner_perms)
         &&& owner.match_pte(parent_owner.children_perm.value()[self.idx as int], owner.parent_level)
     }
 
@@ -162,10 +164,12 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
     -> bool {
         &&& forall|i: int| 0 <= i < NR_ENTRIES ==> i != self.idx ==>
             parent_owner0.children_perm.value()[i] == parent_owner1.children_perm.value()[i]
-        // meta_perm is unchanged: only children_perm and meta_own are modified by entry operations.
-        &&& parent_owner1.meta_perm.addr() == parent_owner0.meta_perm.addr()
-        &&& parent_owner1.meta_perm.points_to == parent_owner0.meta_perm.points_to
-        &&& parent_owner1.meta_perm.inner_perms == parent_owner0.meta_perm.inner_perms
+        // Design B: the slot perm lives in `regions.slots`, so the
+        // "perm unchanged" facts are now expressed as `slot_index`
+        // identity. The actual perm preservation across an entry
+        // mutation comes from the canonical `regions.slots` map (entry
+        // ops don't touch the slot perm).
+        &&& parent_owner1.slot_index == parent_owner0.slot_index
     }
 }
 

@@ -250,17 +250,14 @@ impl<M> Frame<M> {
     #[verus_spec(r =>
         with
             Tracked(regions): Tracked<&mut MetaRegionOwners>,
-            Tracked(perm): Tracked<&vstd::simple_pptr::PointsTo<MetaSlot>>,
             -> debt: Tracked<BorrowDebt>,
         requires
             Self::from_raw_requires_safety(*old(regions), paddr),
             old(regions).slot_owners[frame_to_index(paddr)].raw_count <= 1,
-            perm.is_init(),
-            perm.addr() == frame_to_meta(paddr),
-            perm.value().wf(old(regions).slot_owners[frame_to_index(paddr)]),
+            old(regions).slots.contains_key(frame_to_index(paddr)),
         ensures
             Self::from_raw_ensures(*old(regions), *final(regions), paddr, r),
-            final(regions).slots == old(regions).slots.insert(frame_to_index(paddr), *perm),
+            final(regions).slots == old(regions).slots,
             debt@.frame_index == frame_to_index(paddr),
             debt@.raw_count_at_issue == old(regions).slot_owners[frame_to_index(paddr)].raw_count,
     )]
@@ -273,7 +270,6 @@ impl<M> Frame<M> {
 
         proof {
             let index = frame_to_index(paddr);
-            regions.sync_slot_perm(index, perm);
 
             let tracked mut slot_own = regions.slot_owners.tracked_remove(index);
             slot_own.raw_count = 0usize;
@@ -568,18 +564,14 @@ impl<'a, M: AnyFrameMeta + Repr<MetaSlotStorage>> Frame<M> {
     /// - **Correctness**: The function returns a reference to the frame.
     /// - **Correctness**: The system context is unchanged.
     #[verus_spec(res =>
-        with
-            Tracked(regions): Tracked<&mut MetaRegionOwners>,
-            Tracked(perm): Tracked<&MetaPerm<M>>,
+        with Tracked(regions): Tracked<&mut MetaRegionOwners>,
         requires
             old(regions).inv(),
             old(regions).slot_owners[self.index()].raw_count <= 1,
             old(regions).slot_owners[self.index()].inner_perms.ref_count.value()
                 != crate::mm::frame::meta::REF_COUNT_UNUSED,
             old(regions).slot_owners[self.index()].self_addr == self.ptr.addr(),
-            perm.points_to.pptr() == self.ptr,
-            perm.points_to.value().wf(old(regions).slot_owners[self.index()]),
-            perm.is_init(),
+            old(regions).slots.contains_key(self.index()),
             self.inv(),
         ensures
             final(regions).inv(),
@@ -601,13 +593,10 @@ impl<'a, M: AnyFrameMeta + Repr<MetaSlotStorage>> Frame<M> {
                 i != self.index() ==> final(regions).slot_owners[i]
                     == old(regions).slot_owners[i],
             final(regions).slot_owners.dom() =~= old(regions).slot_owners.dom(),
-            // slots: borrow inserts the PointsTo at self.index(); existing keys are preserved.
-            forall |k: usize| old(regions).slots.contains_key(k) ==> #[trigger] final(regions).slots.contains_key(k),
-            forall |k: usize| old(regions).slots.contains_key(k) && k != self.index()
-                ==> old(regions).slots[k] == #[trigger] final(regions).slots[k],
-            // No new keys are added except possibly self.index().
-            forall |k: usize| k != self.index() ==>
-                (#[trigger] final(regions).slots.contains_key(k) ==> old(regions).slots.contains_key(k)),
+            // Design B: the slot perm is canonical in `regions.slots`
+            // throughout. `borrow_paddr` reads it in place and doesn't
+            // mutate the `slots` map.
+            final(regions).slots == old(regions).slots,
     )]
     pub fn borrow(&self) -> FrameRef<'a, M> {
         assert(regions.slot_owners.contains_key(self.index()));
@@ -615,9 +604,9 @@ impl<'a, M: AnyFrameMeta + Repr<MetaSlotStorage>> Frame<M> {
         // SAFETY: Both the lifetime and the type matches `self`.
 
         unsafe {
-            #[verus_spec(with Tracked(regions), Tracked(&perm.points_to))]
+            #[verus_spec(with Tracked(regions))]
             FrameRef::borrow_paddr(
-                #[verus_spec(with Tracked(&perm.points_to))]
+                #[verus_spec(with Tracked(regions.borrow_slot_perm(self.index())))]
                 self.start_paddr(),
             )
         }

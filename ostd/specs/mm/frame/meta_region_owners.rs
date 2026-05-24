@@ -9,7 +9,7 @@ use vstd_extra::cast_ptr::Repr;
 use vstd_extra::ghost_tree::TreePath;
 use vstd_extra::ownership::*;
 
-use super::meta_owners::{MetaPerm, MetaSlotModel, MetaSlotOwner, MetaSlotStorage};
+use super::meta_owners::{Metadata, MetaPerm, MetaSlotModel, MetaSlotOwner, MetaSlotStorage};
 use super::*;
 use crate::mm::frame::meta::{
     mapping::{frame_to_index_spec, frame_to_meta, max_meta_slots, meta_addr, META_SLOT_SIZE},
@@ -195,10 +195,10 @@ impl MetaRegionOwners {
             final(self).slots == old(self).slots.remove(index),
             final(self).slot_owners == old(self).slot_owners;
 
-    /// Move a slot pointer permission *into* `slots[index]` from caller-supplied storage.
-    /// Used by `Frame::from_raw` after the migration to typed slot perms — the perm being
-    /// returned to `regions.slots` has no `inner_perms` baggage; the inner-perms live in
-    /// `slot_owners[index].inner_perms`.
+    /// Park an externally-held slot pointer permission into `regions.slots`.
+    /// Callers that hold the slot perm via an owner object (e.g. `NodeOwner.meta_perm`)
+    /// invoke this immediately before `Frame::from_raw` so the perm is canonical in
+    /// `regions.slots[index]` at the from_raw call.
     pub axiom fn sync_slot_perm(
         tracked &mut self,
         index: usize,
@@ -207,6 +207,52 @@ impl MetaRegionOwners {
         ensures
             final(self).slots == old(self).slots.insert(index, *perm),
             final(self).slot_owners == old(self).slot_owners;
+
+    /// Borrow the untyped slot perm canonically parked in `regions.slots[index]`.
+    /// Pre-extracts the `inv()`-derived facts (`is_init`, `addr`, value-wf against
+    /// the owner) so callers don't have to re-prove them at each borrow site.
+    /// Zero new trust: thin wrapper over `slots.tracked_borrow`.
+    pub proof fn borrow_slot_perm<'a>(tracked &'a self, index: usize)
+        -> (tracked perm: &'a simple_pptr::PointsTo<MetaSlot>)
+        requires
+            self.inv(),
+            self.slots.contains_key(index),
+        ensures
+            *perm == self.slots[index],
+            perm.is_init(),
+            perm.addr() == meta_addr(index),
+            perm.value().wf(self.slot_owners[index]),
+            self.slot_owners.contains_key(index),
+            self.slot_owners[index].inv(),
+            self.slot_owners[index].self_addr == meta_addr(index),
+    {
+        self.slots.tracked_borrow(index)
+    }
+
+    /// Borrow a typed `MetaPerm<M>` view synthesised from `(slots[index],
+    /// slot_owners[index].inner_perms)`. The two pieces are the very fields of
+    /// `cast_ptr::PointsTo<MetaSlot, Metadata<M>>`, so this is a structural
+    /// re-bundling — but expressing it as an axiom is unavoidable because
+    /// `PointsTo::new` consumes ownership while we only hold a shared borrow.
+    ///
+    /// Precondition is the typed-Repr witness `Metadata::<M>::wf(...)`, i.e.
+    /// the ID-equality check that `MetaSlot::wf` already gives us under
+    /// `regions.inv() + slots.contains_key(index)`. Callers establish it via
+    /// `regions.inv()` and a `slot_owners[index].inner_perms` matching the
+    /// canonical slot — exactly what `metaregion_sound`-style predicates carry.
+    pub axiom fn borrow_meta_perm<'a, M: AnyFrameMeta + Repr<MetaSlotStorage>>(
+        tracked &'a self,
+        index: usize,
+    ) -> (tracked perm: &'a MetaPerm<M>)
+        requires
+            self.slots.contains_key(index),
+            <Metadata<M> as Repr<MetaSlot>>::wf(
+                self.slots[index].value(),
+                self.slot_owners[index].inner_perms,
+            ),
+        ensures
+            perm.points_to == self.slots[index],
+            perm.inner_perms == self.slot_owners[index].inner_perms;
 }
 
 } // verus!

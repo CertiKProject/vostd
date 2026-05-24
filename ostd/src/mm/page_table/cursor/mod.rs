@@ -556,6 +556,16 @@ impl<'rcu, C: PageTableConfig, A: InAtomicMode> Cursor<'rcu, C, A> {
             let tracked parent_owner = continuation.entry_own.node.tracked_borrow();
             let ghost regions_before_ref = *regions;
 
+            proof {
+                // Bridge: owner_snap's path_metaregion_sound at level-1 gives
+                // cont0.entry_own.metaregion_sound; lemma lifts to relate_regions.
+                // (owner.continuations has been tracked_removed, so use the snapshot.)
+                assert(regions.inv());
+                assert(owner_snap.continuations[owner_snap.level - 1].entry_own.metaregion_sound(*regions));
+                EntryOwner::<C>::node_relate_regions_from_metaregion_sound(
+                    cont0.entry_own, *regions);
+            }
+
             #[verus_spec(with Tracked(&child_owner.value), Tracked(&parent_owner), Tracked(regions))]
             let cur_child = entry.to_ref();
 
@@ -597,7 +607,7 @@ impl<'rcu, C: PageTableConfig, A: InAtomicMode> Cursor<'rcu, C, A> {
 
                         owner.map_children_implies(
                             CursorOwner::node_unlocked(guards0),
-                            CursorOwner::node_unlocked_except(*guards, child_node.meta_perm.addr()),
+                            CursorOwner::node_unlocked_except(*guards, meta_addr(child_node.slot_index)),
                         );
                         owner.cur_entry_node_implies_level_gt_1();
                     }
@@ -1050,6 +1060,11 @@ impl<'rcu, C: PageTableConfig, A: InAtomicMode> Cursor<'rcu, C, A> {
 
             let ghost regions_before_ref = *regions;
 
+            proof {
+                EntryOwner::<C>::node_relate_regions_from_metaregion_sound(
+                    cont0.entry_own, *regions);
+            }
+
             #[verus_spec(with Tracked(&child_owner.value), Tracked(&node_owner), Tracked(regions))]
             let cur_child = cur_entry.to_ref();
 
@@ -1106,8 +1121,16 @@ impl<'rcu, C: PageTableConfig, A: InAtomicMode> Cursor<'rcu, C, A> {
                     let ghost cont0 = continuation;
                     let tracked mut child_owner = continuation.take_child();
 
+                    let ghost child_entry_snap = child_owner.value;
                     let tracked mut parent_node_owner = continuation.entry_own.node.tracked_take();
                     let tracked mut child_node_owner = child_owner.value.node.tracked_take();
+
+                    proof {
+                        // Bridge: child entry's metaregion_sound (held pre-take) ⇒
+                        // child_node_owner.relate_regions, needed by nr_children's spec.
+                        EntryOwner::<C>::node_relate_regions_from_metaregion_sound(
+                            child_entry_snap, *regions);
+                    }
 
                     let ghost guards0 = *guards;
 
@@ -1115,7 +1138,7 @@ impl<'rcu, C: PageTableConfig, A: InAtomicMode> Cursor<'rcu, C, A> {
                     #[verus_spec(with Tracked(&child_node_owner), Tracked(guards))]
                     let mut pt_guard = pt.make_guard_unchecked(rcu_guard);
 
-                    #[verus_spec(with Tracked(&mut child_node_owner))]
+                    #[verus_spec(with Tracked(&mut child_node_owner), Tracked(regions))]
                     let nr_children = pt_guard.nr_children();
 
                     proof {
@@ -1130,7 +1153,7 @@ impl<'rcu, C: PageTableConfig, A: InAtomicMode> Cursor<'rcu, C, A> {
                             CursorOwner::node_unlocked(guards0),
                             CursorOwner::node_unlocked_except(
                                 *guards,
-                                child_node_owner.meta_perm.addr(),
+                                meta_addr(child_node_owner.slot_index),
                             ),
                         );
                     }
@@ -1146,7 +1169,7 @@ impl<'rcu, C: PageTableConfig, A: InAtomicMode> Cursor<'rcu, C, A> {
                         self.push_level(pt_guard);
                     } else {
                         let ghost guards_before_drop = *guards;
-                        let ghost locked_addr = child_node_owner.meta_perm.addr();
+                        let ghost locked_addr = meta_addr(child_node_owner.slot_index);
 
                         let _ = ManuallyDrop::new(pt_guard, Tracked(guards));
 
@@ -1380,6 +1403,9 @@ impl<'rcu, C: PageTableConfig, A: InAtomicMode> Cursor<'rcu, C, A> {
                         if child_owner.value.is_frame() {
                             assert(child_owner.value.frame_sub_pages_valid(*regions));
                         }
+                        // Bridge to relate_regions for parent_owner.
+                        EntryOwner::<C>::node_relate_regions_from_metaregion_sound(
+                            cont_pre_split.entry_own, *regions);
                     }
                     let split_child = (
                     #[verus_spec(with Tracked(&mut child_owner), Tracked(&mut parent_owner), Tracked(regions),
@@ -1944,6 +1970,7 @@ impl<'rcu, C: PageTableConfig, A: InAtomicMode> Cursor<'rcu, C, A> {
             1 <= old(self).level <= 4,
             old(self).path[old(self).level as int - 1] is Some,
             old(owner).metaregion_sound(*regions),
+            regions.inv(),
         ensures
             final(owner).inv(),
             final(self).inv(),
@@ -1967,17 +1994,26 @@ impl<'rcu, C: PageTableConfig, A: InAtomicMode> Cursor<'rcu, C, A> {
         let tracked child = parent_continuation.take_child();
         let tracked parent_own = parent_continuation.entry_own.node.tracked_take();
 
-        let ghost index = frame_to_index(meta_to_frame(parent_own.meta_perm.addr()));
+        let ghost index = frame_to_index(meta_to_frame(meta_addr(parent_own.slot_index)));
 
         let ghost ptei = AbstractVaddr::from_vaddr(self.va).index[owner.level - 1];
 
         proof {
             AbstractVaddr::from_vaddr_wf(self.va);
             owner0.va.reflect_prop(self.va);
+
+            // Bridge: cur_entry's precondition `old(owner).metaregion_sound(*regions)`
+            // gives `path_metaregion_sound` at every level. Instantiate at the
+            // current level to derive parent_own's `relate_regions`.
+            assert(regions.inv());
+            assert(owner0.continuations[owner0.level - 1].entry_own.metaregion_sound(*regions));
+            EntryOwner::<C>::node_relate_regions_from_metaregion_sound(
+                cont0.entry_own, *regions);
         }
 
         #[verus_spec(with Tracked(&parent_own),
-            Tracked(&child.value))]
+            Tracked(&child.value),
+            Tracked(regions))]
         let res = node.entry(pte_index::<C>(self.va, self.level));
 
         proof {
@@ -2328,7 +2364,7 @@ impl<'rcu, C: PageTableConfig, A: InAtomicMode> CursorMut<'rcu, C, A> {
 
             owner.map_children_implies(
                 CursorOwner::node_unlocked(guards0),
-                CursorOwner::node_unlocked_except(*guards, child_node.meta_perm.addr()),
+                CursorOwner::node_unlocked_except(*guards, meta_addr(child_node.slot_index)),
             );
 
             owner.cur_entry_node_implies_level_gt_1();
@@ -2455,6 +2491,13 @@ impl<'rcu, C: PageTableConfig, A: InAtomicMode> CursorMut<'rcu, C, A> {
 
             let ghost regions_before_ref = *regions;
 
+            proof {
+                // Bridge to relate_regions for parent_owner (used by to_ref's requires).
+                assert(cont0.entry_own.metaregion_sound(*regions));
+                EntryOwner::<C>::node_relate_regions_from_metaregion_sound(
+                    cont0.entry_own, *regions);
+            }
+
             #[verus_spec(with Tracked(&child_owner.value), Tracked(&parent_owner),
                 Tracked(regions))]
             let cur_child = cur_entry.to_ref();
@@ -2513,13 +2556,17 @@ impl<'rcu, C: PageTableConfig, A: InAtomicMode> CursorMut<'rcu, C, A> {
                             parent_owner,
                             continuation.guard,
                         ));
+                        // Bridge to relate_regions for parent_owner.
+                        assert(cont_pre_alloc.entry_own.metaregion_sound(*regions));
+                        EntryOwner::<C>::node_relate_regions_from_metaregion_sound(
+                            cont_pre_alloc.entry_own, *regions);
                     }
 
                     let child_guard = (
                     #[verus_spec(with Tracked(&mut child_owner), Tracked(&mut parent_owner), Tracked(regions), Tracked(guards))]
                     cur_entry.alloc_if_none(rcu_guard)).unwrap();
 
-                    let ghost new_node_addr = child_owner.value.node.unwrap().meta_perm.addr();
+                    let ghost new_node_addr = meta_addr(child_owner.value.node.unwrap().slot_index);
                     let ghost new_child_value = child_owner.value;
 
                     let ghost new_pt_idx = frame_to_index(
@@ -2551,7 +2598,7 @@ impl<'rcu, C: PageTableConfig, A: InAtomicMode> CursorMut<'rcu, C, A> {
                         continuation.put_child(child_owner);
                         owner.continuations.tracked_insert(owner.level - 1, continuation);
 
-                        assert(owner.cur_entry_owner().node.unwrap().meta_perm.addr()
+                        assert(meta_addr(owner.cur_entry_owner().node.unwrap().slot_index)
                             == new_node_addr);
 
                         assert forall|i: int|
@@ -2709,6 +2756,10 @@ impl<'rcu, C: PageTableConfig, A: InAtomicMode> CursorMut<'rcu, C, A> {
                         if child_owner.value.is_frame() {
                             assert(child_owner.value.frame_sub_pages_valid(*regions));
                         }
+                        // Bridge to relate_regions for parent_owner.
+                        assert(cont_pre_split.entry_own.metaregion_sound(*regions));
+                        EntryOwner::<C>::node_relate_regions_from_metaregion_sound(
+                            cont_pre_split.entry_own, *regions);
                     }
                     let split_child = (
                     #[verus_spec(with Tracked(&mut child_owner), Tracked(&mut parent_owner), Tracked(regions),
@@ -2875,7 +2926,7 @@ impl<'rcu, C: PageTableConfig, A: InAtomicMode> CursorMut<'rcu, C, A> {
             final(self).0.guard_level == old(self).0.guard_level,
             final(self).0.barrier_va == old(self).0.barrier_va,
     )]
-    #[verifier::rlimit(1200)]
+    #[verifier::rlimit(2400)]
     pub fn map(&mut self, item: C::Item) -> (res: Result<(), PageTableFrag<C>>) {
         let ghost self0 = *self;
         let ghost owner0 = *owner;
@@ -3677,7 +3728,14 @@ impl<'rcu, C: PageTableConfig, A: InAtomicMode> CursorMut<'rcu, C, A> {
         let tracked mut child_owner = continuation.take_child();
         let tracked mut parent_owner = continuation.entry_own.node.tracked_take();
 
-        #[verus_spec(with Tracked(&mut child_owner.value), Tracked(&mut parent_owner))]
+        proof {
+            // Bridge to relate_regions for parent_owner.
+            assert(cont0.entry_own.metaregion_sound(*regions));
+            EntryOwner::<C>::node_relate_regions_from_metaregion_sound(
+                cont0.entry_own, *regions);
+        }
+
+        #[verus_spec(with Tracked(&mut child_owner.value), Tracked(&mut parent_owner), Tracked(regions))]
         entry.protect(op);
 
         let ghost new_prop = child_owner.value.frame.unwrap().prop;
@@ -3756,7 +3814,7 @@ impl<'rcu, C: PageTableConfig, A: InAtomicMode> CursorMut<'rcu, C, A> {
             Tracked(regions): Tracked<&mut MetaRegionOwners>,
             Tracked(guards): Tracked<&mut Guards<'rcu, C>>
     )]
-    #[verifier::rlimit(10000)]
+    #[verifier::rlimit(20000)]
     fn replace_cur_entry(&mut self, new_child: Child<C>) -> (res: Option<PageTableFrag<C>>)
         requires
     // Diverges *precisely* in the `Child::PageTable` arm when the
@@ -3900,7 +3958,13 @@ impl<'rcu, C: PageTableConfig, A: InAtomicMode> CursorMut<'rcu, C, A> {
 
         proof {
             new_owner.value.in_scope = true;
+            // Bridge to relate_regions for parent_owner.
+            assert(cont0.entry_own.metaregion_sound(*regions));
+            EntryOwner::<C>::node_relate_regions_from_metaregion_sound(
+                cont0.entry_own, *regions);
         }
+
+        let ghost regions_pre_replace = *regions;
 
         #[verus_spec(with Tracked(regions),
             Tracked(&mut old_child_owner.value),
@@ -3909,6 +3973,22 @@ impl<'rcu, C: PageTableConfig, A: InAtomicMode> CursorMut<'rcu, C, A> {
         )]
         let old = cur_entry.replace(new_child);
         let ghost old_child_snap = old;  // ghost alias to avoid `old(...)` keyword ambiguity in proofs
+
+        proof {
+            // Explicitly surface `replace`'s ref_count preservation forall to
+            // the function-level postcondition triggers. Without this nudge,
+            // the typed-metadata complexity added by Design B inflates the
+            // quantifier instantiator's budget enough that the trivial
+            // propagation gets skipped.
+            assert forall|idx: usize|
+                #![trigger regions.slot_owners[idx].inner_perms.ref_count.value()]
+                regions.slot_owners[idx].inner_perms.ref_count.value()
+                    == regions_pre_replace.slot_owners[idx].inner_perms.ref_count.value()
+            by {
+                assert(regions.slot_owners[idx].inner_perms.ref_count.value()
+                    == regions_pre_replace.slot_owners[idx].inner_perms.ref_count.value());
+            }
+        }
 
         assert(Entry::<C>::metaregion_sound_neq_preserved(
             old_child_pre_replace,
@@ -4155,7 +4235,7 @@ impl<'rcu, C: PageTableConfig, A: InAtomicMode> CursorMut<'rcu, C, A> {
 
                 let ghost regions_before_borrow = *regions;
 
-                #[verus_spec(with Tracked(regions), Tracked(& old_node_owner.meta_perm))]
+                #[verus_spec(with Tracked(regions))]
                 let borrow_pt = pt.borrow();
 
                 let ghost regions_after_borrow = *regions;
@@ -4168,12 +4248,12 @@ impl<'rcu, C: PageTableConfig, A: InAtomicMode> CursorMut<'rcu, C, A> {
                 proof {
                     owner.map_children_implies(
                         CursorOwner::node_unlocked(guards0),
-                        CursorOwner::node_unlocked_except(*guards, old_node_owner.meta_perm.addr()),
+                        CursorOwner::node_unlocked_except(*guards, meta_addr(old_node_owner.slot_index)),
                     );
                 }
 
                 let ghost guards1 = *guards;
-                let ghost locked_addr = old_node_owner.meta_perm.addr();
+                let ghost locked_addr = meta_addr(old_node_owner.slot_index);
                 let ghost owner_before_dfs = *owner;
 
                 // SAFETY:

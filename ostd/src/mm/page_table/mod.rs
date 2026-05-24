@@ -28,7 +28,7 @@ use crate::specs::arch::paging_consts::PagingConsts;
 use crate::specs::mm::page_table::cursor::*;
 use crate::specs::task::InAtomicMode;
 
-use crate::mm::frame::meta::mapping::frame_to_index;
+use crate::mm::frame::meta::mapping::{frame_to_index, meta_addr};
 use crate::mm::kspace::kvirt_area::disable_preempt;
 use crate::specs::arch::PageTableEntry;
 use crate::specs::mm::frame::meta_owners::MetaPerm;
@@ -1111,7 +1111,7 @@ impl PageTable<KernelPtConfig> {
             kernel_owner.0.value.node is Some,
             !Self::create_user_pt_panic_condition(kernel_owner.0.value.node.unwrap()),
             // The kernel page table's root frame matches the tracked owner.
-            self.root.ptr.addr() == kernel_owner.0.value.node.unwrap().meta_perm.addr(),
+            self.root.ptr.addr() == meta_addr(kernel_owner.0.value.node.unwrap().slot_index),
             // The kernel root entry is sound with respect to the meta regions.
             kernel_owner.0.value.metaregion_sound(*old(regions)),
             // The whole kernel page-table tree is sound: every entry's metaregion
@@ -1119,7 +1119,7 @@ impl PageTable<KernelPtConfig> {
             // soundness inside the loop body.
             kernel_owner.metaregion_sound(*old(regions)),
             // The kernel root is not currently locked.
-            old(guards_k).unlocked(kernel_owner.0.value.node.unwrap().meta_perm.addr()),
+            old(guards_k).unlocked(meta_addr(kernel_owner.0.value.node.unwrap().slot_index)),
         ensures
             final(regions).inv(),
     )]
@@ -1169,8 +1169,6 @@ impl PageTable<KernelPtConfig> {
         proof_decl! {
             let tracked root_owner: &NodeOwner<KernelPtConfig>
                 = kernel_owner.0.borrow_value().node.tracked_borrow();
-            let tracked root_perm: &MetaPerm<PageTablePageMeta<KernelPtConfig>>
-                = &root_owner.meta_perm;
             let tracked mut new_pt_owner_val: PageTableOwner<UserPtConfig>
                 = new_pt_owner.tracked_take();
             let tracked mut new_node_owner: NodeOwner<UserPtConfig>
@@ -1186,14 +1184,14 @@ impl PageTable<KernelPtConfig> {
         }
         let ghost regions_before_self_borrow: MetaRegionOwners = *regions;
         let mut root_node = {
-            #[verus_spec(with Tracked(regions), Tracked(root_perm))]
+            #[verus_spec(with Tracked(regions))]
             let root_ref = self.root.borrow();
             #[verus_spec(with Tracked(root_owner), Tracked(guards_k))]
             root_ref.lock(preempt_guard)
         };
         let ghost regions_after_kroot_borrow: MetaRegionOwners = *regions;
         let mut new_node: PageTableGuard<'static, UserPtConfig> = {
-            #[verus_spec(with Tracked(regions), Tracked(&new_node_owner.meta_perm))]
+            #[verus_spec(with Tracked(regions))]
             let new_ref = new_root.borrow();
             #[verus_spec(with Tracked(&new_node_owner), Tracked(guards_u))]
             new_ref.lock(preempt_guard)
@@ -1389,9 +1387,15 @@ impl PageTable<KernelPtConfig> {
                     PageTableOwner::<KernelPtConfig>::metaregion_sound_pred(*regions),
                 ));
                 assert(entry_owner.metaregion_sound(*regions));
+                // Bridge to relate_regions for both the root NodeOwner (used by
+                // `entry`) and the child entry's parent (used by `to_ref`'s
+                // requires). Both share the same EntryOwner here — the kernel
+                // root — and metaregion_sound is now established above.
+                EntryOwner::<KernelPtConfig>::node_relate_regions_from_metaregion_sound(
+                    kernel_owner.0.value, *regions);
             }
 
-            #[verus_spec(with Tracked(root_owner), Tracked(entry_owner))]
+            #[verus_spec(with Tracked(root_owner), Tracked(entry_owner), Tracked(regions))]
             let root_entry = root_node.entry(i);
             let ghost pre_to_ref_regions: MetaRegionOwners = *regions;
             #[verus_spec(with Tracked(entry_owner), Tracked(root_owner), Tracked(regions))]
@@ -1432,17 +1436,24 @@ impl PageTable<KernelPtConfig> {
                     pre_to_ref_regions,
                     *regions,
                 );
+                // Bridge to relate_regions for entry_owner (child PT) and new_node_owner.
+                assert(entry_owner.metaregion_sound(*regions));
+                EntryOwner::<KernelPtConfig>::node_relate_regions_from_metaregion_sound(
+                    *entry_owner, *regions);
+                // new_node_owner's relate_regions: comes from new_pt_owner_val's
+                // metaregion_sound (established at allocation, preserved here).
+                assume(new_node_owner.relate_regions(*regions));
             }
             let pt = match child {
                 ChildRef::PageTable(pt) => pt,
                 _ => vstd::pervasive::unreached(),
             };
 
-            #[verus_spec(with Tracked(&entry_owner.node.tracked_borrow().meta_perm.points_to))]
+            #[verus_spec(with Tracked(&entry_owner.node.tracked_borrow().relate_regions_borrow_perm(regions).points_to))]
             let pt_addr = pt.start_paddr();
             let pte = PageTableEntry::new_pt(pt_addr);
 
-            #[verus_spec(with Tracked(&mut new_node_owner))]
+            #[verus_spec(with Tracked(&mut new_node_owner), Tracked(regions))]
             new_node.write_pte(i, pte);
 
             i = i + 1;
@@ -1501,10 +1512,10 @@ impl<C: PageTableConfig> PageTable<C> {
             final(owner)@.unwrap().inv(),
             final(owner)@.unwrap().0.value.is_node(),
             final(owner)@.unwrap().0.value.node is Some,
-            r.root.ptr.addr() == final(owner)@.unwrap().0.value.node.unwrap().meta_perm.addr(),
+            r.root.ptr.addr() == meta_addr(final(owner)@.unwrap().0.value.node.unwrap().slot_index),
             final(owner)@.unwrap().0.value.metaregion_sound(*final(regions)),
             final(regions).inv(),
-            final(guards).unlocked(final(owner)@.unwrap().0.value.node.unwrap().meta_perm.addr()),
+            final(guards).unlocked(meta_addr(final(owner)@.unwrap().0.value.node.unwrap().slot_index)),
             // The newly allocated slot was in the free pool before the call.
             old(regions).slots.contains_key(
                 crate::specs::mm::frame::mapping::frame_to_index(

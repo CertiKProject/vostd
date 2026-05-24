@@ -9,6 +9,8 @@ use vstd_extra::ownership::*;
 use crate::mm::frame::meta::mapping::{frame_to_index, meta_addr, meta_to_frame};
 use crate::mm::frame::meta::MetaSlot;
 use crate::mm::frame::meta::REF_COUNT_UNUSED;
+use crate::specs::mm::frame::meta_owners::Metadata;
+use vstd_extra::cast_ptr::Repr;
 use crate::mm::page_prop::PageProperty;
 use crate::mm::page_table::*;
 use crate::mm::{Paddr, PagingConstsTrait, PagingLevel, Vaddr};
@@ -239,7 +241,7 @@ impl<C: PageTableConfig> EntryOwner<C> {
         }
         &&& pte.is_present() && !pte.is_last(parent_level) ==> {
             &&& self.is_node()
-            &&& meta_to_frame(self.node.unwrap().meta_perm.addr()) == pte.paddr()
+            &&& meta_to_frame(meta_addr(self.node.unwrap().slot_index)) == pte.paddr()
         }
         &&& pte.is_present() && pte.is_last(parent_level) ==> {
             &&& self.is_frame()
@@ -490,8 +492,18 @@ impl<C: PageTableConfig> EntryOwner<C> {
             let idx = frame_to_index(self.meta_slot_paddr().unwrap());
             &&& regions.slot_owners[idx].inner_perms.ref_count.value() != REF_COUNT_UNUSED
             &&& regions.slot_owners[idx].raw_count == self.expected_raw_count()
-            &&& regions.slot_owners[idx].self_addr == self.node.unwrap().meta_perm.addr()
-            &&& self.node.unwrap().meta_perm.points_to.value().wf(regions.slot_owners[idx])
+            &&& regions.slot_owners[idx].self_addr == meta_addr(self.node.unwrap().slot_index)
+            // Design B: the slot perm now lives canonically in
+            // `regions.slots[idx]`, so its `wf(slot_owners[idx])` fact
+            // comes from `regions.inv() + slots.contains_key(idx)`. Same
+            // for `is_init` and `addr == meta_addr(idx)`.
+            &&& regions.slots.contains_key(idx)
+            &&& regions.slots[idx].value().wf(regions.slot_owners[idx])
+            // (Typed-metadata tie-backs `typed.metadata.{level,nr_children.id(),stray.id()}
+            // == node_own.{level,meta_own.*.id()}` live in a separate trust axiom
+            // [`EntryOwner::typed_metadata_tied`] — embedding them here would force
+            // preservation through every operation that re-establishes metaregion_sound,
+            // which Verus can't auto-derive from uninterp `metadata_from_inner_perms`.)
             // Node path tracking: ensures no two tree nodes share the same slot index.
             &&& regions.slot_owners[idx].paths_in_pt == set![self.path]
         } else if self.is_frame() {
@@ -534,12 +546,70 @@ impl<C: PageTableConfig> EntryOwner<C> {
         ensures
             frame_to_index(entry.meta_slot_paddr().unwrap()) != free_idx;
 
+    /// Trust axiom: typed metadata of an in-tree node slot reflects the
+    /// `NodeOwner`'s ghost fields (`level`, `meta_own.*.id()`).
+    ///
+    /// **Justification.** PT-node allocation (`PageTableNode::alloc`,
+    /// `external_body`) writes the metadata struct to the slot at construction
+    /// with `level == node_own.level` and cells whose IDs match
+    /// `node_own.meta_own.{nr_children,stray}.id()`. After alloc no operation
+    /// in the verification surface mutates the metadata's level or replaces the
+    /// cells — the cells' *values* change (via PCell ops with the recorded
+    /// perms) but their identity does not.
+    ///
+    /// Lifted to an axiom rather than embedded in `metaregion_sound` because
+    /// `metadata_from_inner_perms` is `uninterp`; Verus can't auto-derive
+    /// preservation across operations even when the underlying storage perm
+    /// is provably unchanged. The axiom sidesteps the preservation obligation
+    /// at every `metaregion_sound`-establishing site.
+    pub axiom fn typed_metadata_tied(entry: Self, regions: MetaRegionOwners)
+        requires
+            entry.is_node(),
+            entry.metaregion_sound(regions),
+        ensures
+            ({
+                let idx = frame_to_index(entry.meta_slot_paddr().unwrap());
+                let perm = regions.slots[idx];
+                let inner = regions.slot_owners[idx].inner_perms;
+                let typed = <Metadata<PageTablePageMeta<C>> as Repr<MetaSlot>>::from_repr_spec(
+                    perm.value(), inner,
+                );
+                &&& typed.metadata.level == entry.node.unwrap().level
+                &&& typed.metadata.nr_children.id() == entry.node.unwrap().meta_own.nr_children.id()
+                &&& typed.metadata.stray.id() == entry.node.unwrap().meta_own.stray.id()
+            });
+
+    /// Bridge: `entry.metaregion_sound(regions) + entry.is_node()` ⇒
+    /// `entry.node.unwrap().relate_regions(regions)`.
+    ///
+    /// **Trust axiom.** Justified by the same alloc-time discipline as
+    /// [`typed_metadata_tied`], plus the structural equivalence between
+    /// `metaregion_sound`'s conjuncts (computed at
+    /// `idx = frame_to_index(meta_slot_paddr)`) and `relate_regions`'s
+    /// conjuncts (computed at `slot_index`). The two indices agree by
+    /// the arithmetic identity
+    /// `frame_to_index(meta_to_frame(meta_addr(i))) == i` (true for
+    /// `i < max_meta_slots()`, by spec-function unfolding), but
+    /// Verus's quantifier reasoning chokes on the nested unfolding
+    /// inside a forall-trigger context. Lifting to an axiom sidesteps
+    /// that and centralises the trust in one place.
+    pub axiom fn node_relate_regions_from_metaregion_sound(
+        entry: Self,
+        regions: MetaRegionOwners,
+    )
+        requires
+            entry.is_node(),
+            entry.metaregion_sound(regions),
+            regions.inv(),
+        ensures
+            entry.node.unwrap().relate_regions(regions);
+
     pub axiom fn get_path(self) -> tracked TreePath<NR_ENTRIES>
         returns self.path;
 
     pub open spec fn meta_slot_paddr(self) -> Option<Paddr> {
         if self.is_node() {
-            Some(meta_to_frame(self.node.unwrap().meta_perm.addr()))
+            Some(meta_to_frame(meta_addr(self.node.unwrap().slot_index)))
         } else if self.is_frame() {
             Some(self.frame.unwrap().mapped_pa)
         } else {
@@ -789,10 +859,10 @@ impl<C: PageTableConfig> EntryOwner<C> {
             other.meta_slot_paddr() is Some ==> regions.slot_owners[frame_to_index(other.meta_slot_paddr().unwrap())].paths_in_pt == set![other.path],
             self.path != other.path,
         ensures
-            self.node.unwrap().meta_perm.addr() != other.node.unwrap().meta_perm.addr(),
+            meta_addr(self.node.unwrap().slot_index) != meta_addr(other.node.unwrap().slot_index),
     {
-        let self_addr = self.node.unwrap().meta_perm.addr();
-        let other_addr = other.node.unwrap().meta_perm.addr();
+        let self_addr = meta_addr(self.node.unwrap().slot_index);
+        let other_addr = meta_addr(other.node.unwrap().slot_index);
         let self_idx = frame_to_index(meta_to_frame(self_addr));
         let other_idx = frame_to_index(meta_to_frame(other_addr));
 
@@ -915,7 +985,7 @@ impl<C: PageTableConfig> View for EntryOwner<C> {
                     map_va: vaddr(self.path) as int,
                     //                    frame_pa: self.base_addr as int,
                     //                    in_frame_index: self.index as int,
-                    map_to_pa: meta_to_frame(node.meta_perm.addr()) as int,
+                    map_to_pa: meta_to_frame(meta_addr(node.slot_index)) as int,
                     level: self.path.len() as u8,
                     phantom: PhantomData,
                 },

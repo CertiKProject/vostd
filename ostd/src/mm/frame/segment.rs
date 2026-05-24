@@ -803,18 +803,15 @@ impl<M: AnyFrameMeta + Repr<MetaSlotStorage> + OwnerOf> Segment<M> {
                 // forgotten with `raw_count == 1`, live refcount).
                 owner.relate_regions_at(*old(regions), 0);
             }
-            // Design B: the slot perm is canonical in `regions.slots`.
-            // Take it out as an owned local and hand it to the (unchanged)
-            // `from_raw`, whose `sync_slot_perm` re-parks it — net no-op on
-            // `slots`, no borrow conflict.
-            let tracked perm = regions.slots.tracked_remove(frame_to_index(self.range.start));
-
+            // Design B: the slot perm is canonical in `regions.slots`, and
+            // `from_raw` reads it in place via `regions.slots[idx]` — no
+            // remove/reinsert ceremony, slots strictly unchanged.
             proof_decl! {
                 let tracked from_raw_debt: crate::specs::mm::frame::frame_specs::BorrowDebt;
             }
 
             let frame = unsafe {
-                #[verus_spec(with Tracked(regions), Tracked(&perm) => Tracked(from_raw_debt))]
+                #[verus_spec(with Tracked(regions) => Tracked(from_raw_debt))]
                 Frame::<M>::from_raw(self.range.start)
             };
 
@@ -1009,7 +1006,6 @@ impl<M: AnyFrameMeta + Repr<MetaSlotStorage>> Segment<M> {
                 old_owner.relate_regions_at(*old(regions), k);
             }
 
-            let tracked slot_perm = regions.slots.tracked_remove(frame_to_index(paddr));
             proof_decl! {
                 let tracked from_raw_debt: crate::specs::mm::frame::frame_specs::BorrowDebt;
             }
@@ -1019,7 +1015,7 @@ impl<M: AnyFrameMeta + Repr<MetaSlotStorage>> Segment<M> {
             // reclaims; the subsequent `frame.drop` decrements `ref_count`
             // and (when last ref) tears down the metadata.
             let frame = unsafe {
-                #[verus_spec(with Tracked(regions), Tracked(&slot_perm) => Tracked(from_raw_debt))]
+                #[verus_spec(with Tracked(regions) => Tracked(from_raw_debt))]
                 Frame::<M>::from_raw(paddr)
             };
 
@@ -1030,10 +1026,11 @@ impl<M: AnyFrameMeta + Repr<MetaSlotStorage>> Segment<M> {
             frame.drop(Tracked(regions));
 
             proof {
-                // Only slot `k` was touched (`from_raw` removed+reinserted
-                // its slot key, `drop` adjusted its owner). Every remaining
-                // `j > k` has a distinct index (`relate_regions` distinctness)
-                // so its slot/owner are untouched.
+                // `from_raw` reads slot `k`'s perm in place (slots map
+                // unchanged); `drop` adjusted only that slot's owner.
+                // Every remaining `j > k` has a distinct index
+                // (`relate_regions` distinctness) so its slot/owner
+                // are untouched.
                 assert forall|j: int|
                     #![trigger frame_to_index((self.range.start + j * PAGE_SIZE) as usize)]
                     (k + 1) <= j < n implies {

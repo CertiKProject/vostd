@@ -31,7 +31,7 @@ use crate::mm::page_table::PageTableGuard;
 use crate::mm::PagingConstsTrait;
 use crate::specs::arch::mm::{MAX_PADDR, NR_LEVELS, PAGE_SIZE as SPEC_PAGE_SIZE};
 use crate::specs::arch::PagingConsts;
-use crate::specs::mm::frame::mapping::{frame_to_index, frame_to_index_spec};
+use crate::specs::mm::frame::mapping::{frame_to_index, frame_to_index_spec, meta_addr};
 use crate::specs::mm::frame::meta_owners::{is_mmio_paddr, MetaSlotStorage, PageUsage, REF_COUNT_MAX};
 use vstd_extra::cast_ptr::Repr;
 use crate::specs::mm::frame::meta_region_owners::MetaRegionOwners;
@@ -202,13 +202,13 @@ pub(crate) fn get_kernel_page_table<'rcu>(
         final(kernel_owner)@ is Some,
         final(kernel_owner)@.unwrap().inv(),
         final(kernel_owner)@.unwrap().0.value.node is Some,
-        r.root.ptr.addr() == final(kernel_owner)@.unwrap().0.value.node.unwrap().meta_perm.addr(),
+        r.root.ptr.addr() == meta_addr(final(kernel_owner)@.unwrap().0.value.node.unwrap().slot_index),
         !PageTable::<KernelPtConfig>::create_user_pt_panic_condition(
             final(kernel_owner)@.unwrap().0.value.node.unwrap(),
         ),
         final(kernel_owner)@.unwrap().0.value.metaregion_sound(*regions),
         final(kernel_owner)@.unwrap().metaregion_sound(*regions),
-        guards_k.unlocked(final(kernel_owner)@.unwrap().0.value.node.unwrap().meta_perm.addr()),
+        guards_k.unlocked(meta_addr(final(kernel_owner)@.unwrap().0.value.node.unwrap().slot_index)),
 {
     KERNEL_PAGE_TABLE.get().unwrap()
 }

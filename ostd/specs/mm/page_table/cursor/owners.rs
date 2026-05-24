@@ -16,7 +16,7 @@ use vstd_extra::seq_extra::{forall_seq, lemma_forall_seq_index};
 use core::marker::PhantomData;
 use core::ops::Range;
 
-use crate::mm::frame::meta::mapping::frame_to_index;
+use crate::mm::frame::meta::mapping::{frame_to_index, meta_addr};
 use crate::mm::page_prop::PageProperty;
 use crate::mm::page_table::*;
 use crate::mm::{nr_subpage_per_huge, Paddr, PagingConstsTrait, PagingLevel, Vaddr};
@@ -694,15 +694,15 @@ impl<'rcu, C: PageTableConfig> CursorOwner<'rcu, C> {
         (spec_fn(EntryOwner<C>, TreePath<NR_ENTRIES>) -> bool) {
         |owner: EntryOwner<C>, path: TreePath<NR_ENTRIES>|
             owner.is_node() ==>
-            guards.unlocked(owner.node.unwrap().meta_perm.addr())
+            guards.unlocked(meta_addr(owner.node.unwrap().slot_index))
     }
 
     pub open spec fn node_unlocked_except(guards: Guards<'rcu, C>, addr: usize) ->
         (spec_fn(EntryOwner<C>, TreePath<NR_ENTRIES>) -> bool) {
         |owner: EntryOwner<C>, path: TreePath<NR_ENTRIES>|
             owner.is_node() ==>
-            owner.node.unwrap().meta_perm.addr() != addr ==>
-            guards.unlocked(owner.node.unwrap().meta_perm.addr())
+            meta_addr(owner.node.unwrap().slot_index) != addr ==>
+            guards.unlocked(meta_addr(owner.node.unwrap().slot_index))
     }
 
     pub open spec fn map_full_tree(self, f: spec_fn(EntryOwner<C>, TreePath<NR_ENTRIES>) -> bool) -> bool {
@@ -725,7 +725,7 @@ impl<'rcu, C: PageTableConfig> CursorOwner<'rcu, C> {
     }
 
     pub open spec fn only_current_locked(self, guards: Guards<'rcu, C>) -> bool {
-        self.map_only_children(Self::node_unlocked_except(guards, self.cur_entry_owner().node.unwrap().meta_perm.addr()))
+        self.map_only_children(Self::node_unlocked_except(guards, meta_addr(self.cur_entry_owner().node.unwrap().slot_index)))
     }
 
     pub proof fn never_drop_restores_children_not_locked(
@@ -741,11 +741,11 @@ impl<'rcu, C: PageTableConfig> CursorOwner<'rcu, C> {
         // The dropped guard is for the current entry's node (from pop_level).
         self.cur_entry_owner().is_node(),
         guard.inner.inner@.ptr.addr()
-            == self.cur_entry_owner().node.unwrap().meta_perm.addr(),
+            == meta_addr(self.cur_entry_owner().node.unwrap().slot_index),
     ensures
         self.children_not_locked(guards1),
     {
-        let current_addr = self.cur_entry_owner().node.unwrap().meta_perm.addr();
+        let current_addr = meta_addr(self.cur_entry_owner().node.unwrap().slot_index);
         let f = Self::node_unlocked_except(guards0, current_addr);
         let g = Self::node_unlocked(guards1);
         assert(OwnerSubtree::implies(f, g));

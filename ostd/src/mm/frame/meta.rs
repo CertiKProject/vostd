@@ -167,11 +167,26 @@ pub tracked struct OnDropArgs {
 /// the slot, not on the instance). Sites that need `Repr<MetaSlotStorage>`
 /// must spell it out — it was previously a supertrait.
 pub trait AnyFrameMeta {
+    /// Per-impl precondition on `on_drop`. The default is `true` (no extra
+    /// constraints beyond what the trait method needs structurally). Impls
+    /// that need richer caller-side invariants (e.g. the PT-node's reader/
+    /// region invariants) override this and the trait method requires it.
+    open spec fn on_drop_pre(
+        &self,
+        reader: VmReader<'_, Infallible>,
+        args: OnDropArgs,
+    ) -> bool {
+        true
+    }
+
     exec fn on_drop(
         &mut self,
         _reader: &mut VmReader<'_, Infallible>,
-        _args: Tracked<&mut OnDropArgs>,
-    ) {
+        Tracked(_args): Tracked<&mut OnDropArgs>,
+    )
+        requires
+            old(self).on_drop_pre(*old(_reader), *old(_args)),
+    {
     }
 
     exec fn is_untyped(&self) -> bool {
