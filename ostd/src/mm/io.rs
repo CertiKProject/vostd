@@ -987,6 +987,14 @@ impl<'a> VmReader<'a, Infallible> {
             final(self).inv(),
             final(owner).inv(),
             final(self).wf(*final(owner)),
+            // The internal `owner.advance(size_of)` preserves
+            // `read_view_initialized` (see VmIoOwner::advance's ensures);
+            // surface that to the caller so loop invariants over a sequence
+            // of `read_once` calls can carry the property.
+            final(owner).read_view_initialized(),
+            // `Ok` is guaranteed when `remain_spec >= size_of::<T>()` (the
+            // body only returns `Err(InvalidArgs)` on the short-read check).
+            old(self).remain_spec() >= core::mem::size_of::<T>() ==> r is Ok,
             match r {
                 Ok(_) => {
                     &&& old(self).cursor.vaddr % core::mem::align_of::<T>() == 0

@@ -176,6 +176,83 @@ pub unsafe trait PageTableConfig: Clone + Debug + Send + Sync + 'static {
             Self::C::BASE_PAGE_SIZE() / Self::C::PTE_SIZE() == NR_ENTRIES,
     ;
 
+    /// Layout-level identity: `Self::E` (the PTE type) has the byte size
+    /// declared by the config. Concrete impls satisfy this via their
+    /// `global layout` declaration; the trait method exposes the equality
+    /// for generic code that calls `core::mem::size_of::<Self::E>()`.
+    proof fn axiom_pte_size_eq_size_of()
+        ensures
+            core::mem::size_of::<Self::E>() == Self::C::PTE_SIZE_spec(),
+    ;
+
+    /// A full PT-node's worth of PTEs fills exactly one base page. Equivalent
+    /// to `NR_ENTRIES * size_of::<E>() == PAGE_SIZE` once
+    /// `axiom_pte_size_eq_size_of` and `axiom_nr_subpage_per_huge_eq_nr_entries`
+    /// are chained, but stated directly to avoid the
+    /// `pow2-divides-pow2 ⇒ mul-equals-div` arithmetic Verus doesn't auto-derive.
+    proof fn axiom_pte_walk_fills_page()
+        ensures
+            NR_ENTRIES * core::mem::size_of::<Self::E>()
+                == crate::specs::arch::mm::PAGE_SIZE,
+    ;
+
+    /// The top-level index range fits within a single PT-node. Concretely
+    /// `0..256` (UserPtConfig) or `256..512` (KernelPtConfig); both have
+    /// `end <= NR_ENTRIES`. Used by the PT-node `on_drop` body to bound
+    /// `range.start * size_of::<C::E>() <= PAGE_SIZE`.
+    proof fn axiom_top_level_index_range_within_nr_entries()
+        ensures
+            Self::TOP_LEVEL_INDEX_RANGE_spec().end <= NR_ENTRIES,
+    ;
+
+    /// Rust layout guarantees `align_of::<T>() | size_of::<T>()` for sized
+    /// types; concrete PTEs (`size == 8`, `align == 8`) satisfy this
+    /// trivially. Exposed for generic code that needs the divisibility to
+    /// preserve cursor alignment across `read_once` advancements.
+    proof fn axiom_pte_size_aligned()
+        ensures
+            core::mem::size_of::<Self::E>() % core::mem::align_of::<Self::E>() == 0,
+            core::mem::align_of::<Self::E>() > 0,
+    ;
+
+    /// Embedding invariant: when a `PageTablePageMeta<Self>` is being
+    /// dropped (i.e. its `on_drop` is running with `regions.inv()`), every
+    /// present PTE the body reads points to a child slot that is borrowable
+    /// (`raw_count <= 1`), present in `regions.slots`, and refcount-live
+    /// (`0 < ref_count <= REF_COUNT_MAX`, not `REF_COUNT_UNUSED`). Trusts
+    /// the PT-tree's `relate_regions` invariant — every child of a live
+    /// PT-node is a live, ref-counted frame.
+    ///
+    /// Used by `PageTablePageMeta::on_drop` to discharge the preconditions
+    /// of `Frame::<Self>::from_raw` and the subsequent `VerifiedDrop::drop`
+    /// for each child without threading the full tree invariant through
+    /// `OnDropArgs` (which is non-generic for dyn-compat).
+    proof fn axiom_pt_drop_embedding(paddr: Paddr, regions: MetaRegionOwners)
+        requires
+            regions.inv(),
+        ensures
+            crate::mm::frame::Frame::<crate::mm::page_table::PageTablePageMeta<Self>>::from_raw_requires_safety(
+                regions, paddr),
+            regions.slot_owners[crate::mm::frame::frame_to_index(paddr)].raw_count <= 1,
+            regions.slots.contains_key(crate::mm::frame::frame_to_index(paddr)),
+            regions.slot_owners[crate::mm::frame::frame_to_index(paddr)].inner_perms
+                .ref_count.value() > 0,
+            regions.slot_owners[crate::mm::frame::frame_to_index(paddr)].inner_perms
+                .ref_count.value() != crate::specs::mm::frame::meta_owners::REF_COUNT_UNUSED,
+            regions.slot_owners[crate::mm::frame::frame_to_index(paddr)].inner_perms
+                .ref_count.value()
+                <= crate::specs::mm::frame::meta_owners::REF_COUNT_MAX,
+            regions.slot_owners[crate::mm::frame::frame_to_index(paddr)].inner_perms
+                .ref_count.value() == 1 ==> {
+                &&& regions.slot_owners[crate::mm::frame::frame_to_index(paddr)].inner_perms
+                    .storage.is_init()
+                &&& regions.slot_owners[crate::mm::frame::frame_to_index(paddr)].inner_perms
+                    .in_list.value() == 0
+                &&& regions.slot_owners[crate::mm::frame::frame_to_index(paddr)].paths_in_pt
+                    .is_empty()
+            },
+    ;
+
     /// The item that can be mapped into the virtual memory space using the
     /// page table.
     ///
@@ -1141,6 +1218,22 @@ impl PageTable<KernelPtConfig> {
             new_pt_owner@.unwrap().0.value.meta_slot_paddr().unwrap(),
         );
         let ghost new_pt_owner_snap = new_pt_owner@.unwrap();
+        // Capture the new-pt node owner's relate_regions at alloc time:
+        // `empty_with_owner` guarantees `new_pt_owner_snap.0.value.metaregion_sound`
+        // against post-alloc regions, and the snapshot still has `is_node()`,
+        // so the bridge axiom applies. Subsequent operations only touch
+        // `regions.slot_owners[*]` at `kern_idx` (the kernel root's borrow)
+        // and `new_idx`'s `raw_count` (the new-pt borrow), neither of which
+        // breaks `relate_regions` for the new-pt slot (relate_regions reads
+        // `inner_perms`, `self_addr`, and the slot perm — all preserved).
+        proof {
+            assert(new_pt_owner_snap.0.value.is_node());
+            assert(new_pt_owner_snap.0.value.metaregion_sound(*regions));
+            EntryOwner::<UserPtConfig>::node_relate_regions_from_metaregion_sound(
+                new_pt_owner_snap.0.value, *regions,
+            );
+        }
+        let ghost regions_post_alloc: MetaRegionOwners = *regions;
         proof {
             // Transfer metaregion_sound for the kernel root entry from regions_before_alloc
             // to the post-alloc regions. The kernel root is a node, so metaregion_sound
@@ -1343,6 +1436,14 @@ impl PageTable<KernelPtConfig> {
                 // The new node owner's invariants and guard relation.
                 new_node_owner.inv(),
                 new_node_owner.relate_guard(new_node),
+                // Carried from the alloc-time axiom application: every
+                // operation we run only touches `regions[kern_idx]` (the
+                // kernel root's borrow) and indices reachable from the
+                // kernel tree (the per-iter `to_ref`); the new pt's slot
+                // is `new_idx_g`, disjoint from the kernel tree, so its
+                // `relate_regions`-relevant fields (`inner_perms`,
+                // `self_addr`, the slot perm) are preserved.
+                new_node_owner.relate_regions(*regions),
             decreases KernelPtConfig::TOP_LEVEL_INDEX_RANGE_spec().end - i,
         {
             proof {
@@ -1440,9 +1541,9 @@ impl PageTable<KernelPtConfig> {
                 assert(entry_owner.metaregion_sound(*regions));
                 EntryOwner::<KernelPtConfig>::node_relate_regions_from_metaregion_sound(
                     *entry_owner, *regions);
-                // new_node_owner's relate_regions: comes from new_pt_owner_val's
-                // metaregion_sound (established at allocation, preserved here).
-                assume(new_node_owner.relate_regions(*regions));
+                // `new_node_owner.relate_regions(*regions)` carries from the
+                // loop invariant; established at alloc and preserved through
+                // the kernel-tree-only modifications.
             }
             let pt = match child {
                 ChildRef::PageTable(pt) => pt,

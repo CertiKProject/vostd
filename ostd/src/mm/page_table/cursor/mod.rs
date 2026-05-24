@@ -2927,6 +2927,7 @@ impl<'rcu, C: PageTableConfig, A: InAtomicMode> CursorMut<'rcu, C, A> {
             final(self).0.barrier_va == old(self).0.barrier_va,
     )]
     #[verifier::rlimit(2400)]
+    #[verifier::spinoff_prover]
     pub fn map(&mut self, item: C::Item) -> (res: Result<(), PageTableFrag<C>>) {
         let ghost self0 = *self;
         let ghost owner0 = *owner;
@@ -3815,6 +3816,7 @@ impl<'rcu, C: PageTableConfig, A: InAtomicMode> CursorMut<'rcu, C, A> {
             Tracked(guards): Tracked<&mut Guards<'rcu, C>>
     )]
     #[verifier::rlimit(20000)]
+    #[verifier::spinoff_prover]
     fn replace_cur_entry(&mut self, new_child: Child<C>) -> (res: Option<PageTableFrag<C>>)
         requires
     // Diverges *precisely* in the `Child::PageTable` arm when the
