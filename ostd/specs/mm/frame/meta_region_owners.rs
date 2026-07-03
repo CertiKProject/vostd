@@ -1,5 +1,5 @@
 use vstd::atomic::*;
-use vstd::cell;
+
 use vstd::prelude::*;
 use vstd::simple_pptr::{self, *};
 
@@ -7,7 +7,7 @@ use core::ops::Range;
 
 use vstd_extra::cast_ptr::{self, Repr};
 use vstd_extra::drop_tracking::DropObligation;
-use vstd_extra::ghost_tree::TreePath;
+
 use vstd_extra::ownership::*;
 
 use super::meta_owners::{MetaPerm, MetaSlotModel, MetaSlotOwner, MetaSlotStorage};
@@ -18,8 +18,8 @@ use crate::mm::frame::meta::{
     AnyFrameMeta, META_SLOT_SIZE, MetaSlot, REF_COUNT_MAX, mapping::frame_to_meta,
 };
 use crate::mm::kspace::FRAME_METADATA_RANGE;
-use crate::specs::arch::{MAX_PADDR, NR_ENTRIES, PAGE_SIZE};
-use crate::specs::mm::frame::linked_list::linked_list_owners::MetaSlotSmall;
+use crate::specs::arch::{MAX_PADDR, PAGE_SIZE};
+
 use crate::specs::mm::frame::{
     mapping::{frame_to_index, max_meta_slots, meta_addr},
     meta_owners::Metadata,
@@ -281,6 +281,7 @@ impl MetaRegionOwners {
         Self { frame_obligations: self.frame_obligations.remove(slot_idx), ..self }
     }
 
+    // FIXME: use authorative monoid instead of current unsound implementations
     /// Pairs the production of a per-Frame [`DropObligation`] with a
     /// `+1` on the `frame_obligations[slot_idx]` count. Called by Frame's
     /// `constructor_spec` (i.e. `ManuallyDrop::new(frame, ..)`).
