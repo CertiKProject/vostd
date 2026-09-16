@@ -5,25 +5,25 @@
 //!
 //! [`Child`] and [`ChildRef`] are the *typed* views of a PTE: instead of a raw
 //! word, a tagged union saying whether the entry holds a child node, a mapped
-//! frame, or nothing. The two conversions are the interesting part:
+//! frame, or nothing.
 //!
-//! * [`Child::into_pte`] consumes a child and hands its ownership to the PTE;
-//! * [`Child::from_pte`] takes ownership back out of a PTE.
+//! The owning/borrowing distinction is now visible in what each conversion
+//! needs from the entry's owner:
 //!
-//! `ChildRef` is the borrowing counterpart: it looks at a PTE without taking
-//! anything out of it, which is why its `from_pte` provably leaves the region
-//! unchanged.
+//! * [`Child::from_pte`] rebuilds an *owning* handle, which under fractional
+//!   ownership is a bare address — so a shared `&EntryOwner` suffices.
+//! * [`ChildRef::from_pte`] rebuilds a *borrowing* handle, which must carry a
+//!   fraction — so it takes `&mut EntryOwner` and lends one out of the child's
+//!   authority.
 use vstd::prelude::*;
 
 use vstd_extra::ownership::*;
 
 use crate::arch::*;
-use crate::frame::Frame;
 use crate::frame::mapping::*;
-use crate::frame::owners::*;
 use crate::node::entry_owners::*;
-use crate::node::owners::*;
-use crate::node::{PageTableNode, PageTableNodeRef, PageTablePageMeta, Regions};
+use crate::node::frac::*;
+use crate::node::{PageTableNode, PageTableNodeRef};
 use crate::page_prop::PageProperty;
 use crate::pte::Pte;
 
@@ -60,11 +60,9 @@ impl OwnerOf for Child {
 }
 
 impl Child {
-    pub open spec fn invariants(self, owner: EntryOwner, regions: Regions) -> bool {
+    pub open spec fn invariants(self, owner: EntryOwner) -> bool {
         &&& owner.inv_base()
-        &&& regions.inv()
         &&& self.wf(owner)
-        &&& owner.metaregion_sound(regions)
     }
 }
 
@@ -81,19 +79,17 @@ impl Child {
 
     /// Converts the child into a raw PTE value.
     ///
-    /// Ownership of the child is transferred *into* the PTE: after this call
-    /// the `Child` is gone and the page table node is the sole owner. In the
-    /// real code this is where the reference-count bookkeeping happens (the
-    /// node handle is `ManuallyDrop`ped so its `Drop` does not run); the model
-    /// has no `Drop`, so the region is provably untouched.
+    /// Ownership of the child is transferred *into* the PTE. In the real code
+    /// this is where reference-count bookkeeping happens; here the child's
+    /// authority simply stays in the `EntryOwner`, which is why this needs
+    /// only a shared borrow and can promise it disturbs nothing.
     #[verus_spec(res =>
         with Tracked(owner): Tracked<&EntryOwner>,
-             Tracked(regions): Tracked<&Regions>,
         requires
-            self.invariants(*owner, *regions),
+            self.invariants(*owner),
             owner.inv(),
         ensures
-            owner.pte_invariants(res, *regions),
+            owner.pte_invariants(res),
             owner.is_node() ==> res == Pte::new_pt_spec(owner.node().paddr()),
             owner.is_absent() ==> res == Pte::new_absent_spec(),
             res.is_present() <==> !owner.is_absent(),
@@ -106,12 +102,11 @@ impl Child {
         }
         match self {
             Child::PageTable(node) => {
-                let tracked slot = regions.tracked_borrow_slot(owner.node().slot_index);
                 proof {
-                    lemma_index_to_meta_biinjective(owner.node().slot_index);
-                    lemma_index_to_frame_biinjective(owner.node().slot_index);
+                    owner.node().lemma_identity();
+                    lemma_index_to_meta_biinjective(owner.node().slot_index());
+                    lemma_index_to_frame_biinjective(owner.node().slot_index());
                 }
-                #[verus_spec(with Tracked(slot))]
                 let paddr = node.start_paddr();
                 Pte::new_pt(paddr)
             },
@@ -124,17 +119,15 @@ impl Child {
     ///
     /// # Safety
     ///
-    /// The PTE must have been produced by [`Self::into_pte`] (or an equivalent
-    /// that forgot the original handle), and `level` must be the level of the
-    /// node that holds it. Ownership moves out of the PTE into the result.
+    /// The PTE must have been produced by [`Self::into_pte`], and `level` must
+    /// be the level of the node that holds it.
     #[verus_spec(res =>
-        with Tracked(regions): Tracked<&Regions>,
-             Tracked(entry_own): Tracked<&EntryOwner>,
+        with Tracked(entry_own): Tracked<&EntryOwner>,
         requires
-            entry_own.pte_invariants(pte, *regions),
+            entry_own.pte_invariants(pte),
             level == entry_own.parent_level,
         ensures
-            res.invariants(*entry_own, *regions),
+            res.invariants(*entry_own),
             res is None <==> entry_own.is_absent(),
             res is PageTable <==> entry_own.is_node(),
     )]
@@ -148,13 +141,13 @@ impl Child {
             proof {
                 broadcast use group_page_meta;
 
-                regions.lemma_contains_valid_frame_paddr(paddr);
-                lemma_index_to_meta_biinjective(entry_own.node().slot_index);
+                entry_own.node().lemma_identity();
+                lemma_index_to_frame_biinjective(entry_own.node().slot_index());
+                lemma_index_to_meta_biinjective(entry_own.node().slot_index());
             }
-            let node = unsafe {
-                #[verus_spec(with Tracked(regions))]
-                PageTableNode::from_raw(paddr)
-            };
+            // SAFETY: the entry's authority is the entitlement to name this
+            // frame; the handle itself carries none.
+            let node = unsafe { PageTableNode::from_raw(paddr) };
             return Child::PageTable(node);
         }
         Child::Frame(paddr, level, pte.prop())
@@ -163,9 +156,9 @@ impl Child {
 
 /// A *borrowed* reference to the child of a page table node.
 ///
-/// A child node must be represented by a [`PageTableNodeRef`], because a
-/// reference to it is potentially shared and needs a lifetime. A mapped frame,
-/// by contrast, can be described by value, and an absent entry is just a tag.
+/// A child node must be represented by a [`PageTableNodeRef`], which carries a
+/// fraction of that node's ownership. A mapped frame can be described by
+/// value, and an absent entry is just a tag.
 pub enum ChildRef<'a> {
     /// A child page table node.
     PageTable(PageTableNodeRef<'a>),
@@ -181,7 +174,10 @@ impl<'a> OwnerOf for ChildRef<'a> {
         match self {
             Self::PageTable(node) => {
                 &&& owner.is_node()
-                &&& node.inner.ptr.addr() == owner.node().meta_vaddr()
+                &&& node.wf()
+                &&& node.id() == owner.node().id()
+                &&& node@.slot_index == owner.node().slot_index()
+                &&& node@.level == owner.node().level()
             },
             Self::Frame(paddr, level, prop) => {
                 &&& owner.is_frame()
@@ -194,11 +190,9 @@ impl<'a> OwnerOf for ChildRef<'a> {
 }
 
 impl ChildRef<'_> {
-    pub open spec fn invariants(self, owner: EntryOwner, regions: Regions) -> bool {
+    pub open spec fn invariants(self, owner: EntryOwner) -> bool {
         &&& owner.inv()
-        &&& regions.inv()
         &&& self.wf(owner)
-        &&& owner.metaregion_sound(regions)
     }
 }
 
@@ -206,20 +200,34 @@ impl ChildRef<'_> {
 impl ChildRef<'_> {
     /// Converts a PTE to a *reference* to its child.
     ///
+    /// Takes `&mut EntryOwner` because producing a reference means lending a
+    /// fraction out of the child's authority — a mutation. Under the central
+    /// region this was a shared read of a global map; making it a mutation is
+    /// the honest accounting, and it is what stops an unbounded number of
+    /// references appearing from nowhere.
+    ///
     /// # Safety
     ///
-    /// The PTE must outlive the reference (guaranteed here by taking `&Pte`),
-    /// and `level` must match the containing node.
+    /// The PTE must outlive the reference, and `level` must match the
+    /// containing node.
     #[verus_spec(res =>
-        with Tracked(regions): Tracked<&Regions>,
-             Tracked(entry_owner): Tracked<&EntryOwner>,
+        with Tracked(entry_owner): Tracked<&mut EntryOwner>,
         requires
-            entry_owner.pte_invariants(*pte, *regions),
-            level == entry_owner.parent_level,
+            old(entry_owner).pte_invariants(*pte),
+            old(entry_owner).is_node() ==> {
+                &&& !old(entry_owner).node().is_lent_out()
+                &&& old(entry_owner).node().frac() > 1
+            },
+            level == old(entry_owner).parent_level,
         ensures
-            res.invariants(*entry_owner, *regions),
-            res is None <==> entry_owner.is_absent(),
-            res is PageTable <==> entry_owner.is_node(),
+            res.invariants(*final(entry_owner)),
+            final(entry_owner).parent_level == old(entry_owner).parent_level,
+            final(entry_owner).is_node() == old(entry_owner).is_node(),
+            final(entry_owner).is_absent() == old(entry_owner).is_absent(),
+            final(entry_owner).is_frame() == old(entry_owner).is_frame(),
+            final(entry_owner).match_pte(*pte, final(entry_owner).parent_level),
+            res is None <==> final(entry_owner).is_absent(),
+            res is PageTable <==> final(entry_owner).is_node(),
     )]
     pub unsafe fn from_pte(pte: &Pte, level: PagingLevel) -> Self {
         if !pte.is_present() {
@@ -231,12 +239,25 @@ impl ChildRef<'_> {
             proof {
                 broadcast use group_page_meta;
 
-                regions.lemma_contains_valid_frame_paddr(paddr);
-                lemma_index_to_meta_biinjective(entry_owner.node().slot_index);
+                entry_owner.node().lemma_identity();
+                lemma_index_to_frame_biinjective(entry_owner.node().slot_index());
+                lemma_index_to_meta_biinjective(entry_owner.node().slot_index());
             }
-            let node = unsafe {
-                #[verus_spec(with Tracked(regions))]
-                PageTableNodeRef::borrow_paddr(paddr)
+            // Take the child's authority out, lend a fraction, put it back.
+            // Going through `take`/`put` rather than a `&mut` borrow keeps the
+            // effect on the `EntryOwner` fully specified.
+            proof_decl! {
+                let tracked frac: NodeFrac;
+            }
+            proof {
+                let tracked mut auth = entry_owner.tracked_take_node();
+                frac = auth.lend();
+                entry_owner.tracked_put_node(auth);
+                frac.validate();
+            }
+            let node = {
+                #[verus_spec(with Tracked(frac))]
+                PageTableNodeRef::from_frac(paddr)
             };
             return ChildRef::PageTable(node);
         }

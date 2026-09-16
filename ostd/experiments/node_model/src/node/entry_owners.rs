@@ -8,21 +8,26 @@
 //! concrete PTE value, and is the single place where the PTE encoding meets
 //! the ownership story.
 //!
+//! # Where the decentralisation happens
+//!
+//! For a child node the entry owns a [`NodeAuth`] — the child's *authority*.
+//! That is the structural change: a node's ownership lives in its parent's
+//! entry, so the page table tree carries the ownership, instead of every node
+//! being registered in one flat `MetaRegionOwners`. Handing out a
+//! [`PageTableNodeRef`](crate::node::PageTableNodeRef) is then literally
+//! lending a fraction out of that authority.
+//!
 //! Relative to the real type, the model drops the `path: TreePath<NR_ENTRIES>`
-//! field (there is no ghost tree here, so there are no paths and no
-//! `paths_in_pt` bookkeeping) and the `Borrowed` variant (used for a user page
-//! table's kernel-half slots, which point at a sub-tree owned by a *different*
-//! page table configuration — and the model has only one configuration).
+//! field (there is no ghost tree here) and the `Borrowed` variant (used for a
+//! user page table's kernel-half slots, which point at a sub-tree owned by a
+//! *different* page table configuration — and the model has only one).
 use vstd::modes::tracked_swap;
 use vstd::prelude::*;
 
 use vstd_extra::ownership::*;
 
 use crate::arch::*;
-use crate::frame::mapping::*;
-use crate::frame::owners::*;
-use crate::node::Regions;
-use crate::node::owners::*;
+use crate::node::frac::*;
 use crate::page_prop::PageProperty;
 use crate::pte::Pte;
 
@@ -36,7 +41,9 @@ pub ghost struct FrameEntryState {
 }
 
 pub tracked enum EntryOwnerKind {
-    Node(NodeOwner),
+    /// The child node's authority. Lending from it produces the fractions that
+    /// `PageTableNodeRef`s carry.
+    Node(NodeAuth),
     Frame(ghost FrameEntryState),
     Absent,
 }
@@ -63,7 +70,8 @@ impl EntryOwner {
         self.kind is Absent
     }
 
-    pub open spec fn node(self) -> NodeOwner {
+    /// The child node's authority.
+    pub open spec fn node(self) -> NodeAuth {
         self.kind->Node_0
     }
 
@@ -87,10 +95,10 @@ impl EntryOwner {
         }
     }
 
-    pub open spec fn new_node(node: NodeOwner) -> Self {
+    pub open spec fn new_node(auth: NodeAuth) -> Self {
         EntryOwner {
-            kind: EntryOwnerKind::Node(node),
-            parent_level: (node.level + 1) as PagingLevel,
+            kind: EntryOwnerKind::Node(auth),
+            parent_level: (auth.level() + 1) as PagingLevel,
         }
     }
 
@@ -101,19 +109,19 @@ impl EntryOwner {
         Self { kind: EntryOwnerKind::Absent, parent_level }
     }
 
-    pub proof fn tracked_new_node(tracked node: NodeOwner) -> (tracked res: Self)
+    pub proof fn tracked_new_node(tracked auth: NodeAuth) -> (tracked res: Self)
         returns
-            Self::new_node(node),
+            Self::new_node(auth),
     {
-        Self { kind: EntryOwnerKind::Node(node), parent_level: (node.level + 1) as PagingLevel }
+        Self { kind: EntryOwnerKind::Node(auth), parent_level: (auth.level() + 1) as PagingLevel }
     }
 
-    // ─── Moving the node owner in and out ──────────────────────────────────
+    // ─── Moving the authority in and out ───────────────────────────────────
     //
-    // A `NodeOwner` is tracked, so it cannot be copied: descending into a
-    // child means *taking* the owner out of the entry, and coming back up
-    // means putting it back.
-    pub proof fn tracked_take_node(tracked &mut self) -> (tracked res: NodeOwner)
+    // A `NodeAuth` is tracked, so it cannot be copied: descending into a child
+    // means *taking* the authority out of the entry, and coming back up means
+    // putting it back.
+    pub proof fn tracked_take_node(tracked &mut self) -> (tracked res: NodeAuth)
         requires
             old(self).kind is Node,
         ensures
@@ -123,26 +131,44 @@ impl EntryOwner {
         let tracked mut tmp = EntryOwnerKind::Absent;
         tracked_swap(&mut self.kind, &mut tmp);
         match tmp {
-            EntryOwnerKind::Node(node) => node,
+            EntryOwnerKind::Node(auth) => auth,
             _ => { proof_from_false() },
         }
     }
 
-    pub proof fn tracked_put_node(tracked &mut self, tracked node: NodeOwner)
+    pub proof fn tracked_put_node(tracked &mut self, tracked auth: NodeAuth)
         ensures
-            *final(self) == (EntryOwner { kind: EntryOwnerKind::Node(node), ..*old(self) }),
+            *final(self) == (EntryOwner { kind: EntryOwnerKind::Node(auth), ..*old(self) }),
     {
-        self.kind = EntryOwnerKind::Node(node);
+        self.kind = EntryOwnerKind::Node(auth);
     }
 
-    pub proof fn tracked_borrow_node(tracked &self) -> (tracked res: &NodeOwner)
+    pub proof fn tracked_borrow_node(tracked &self) -> (tracked res: &NodeAuth)
         requires
             self.kind is Node,
         ensures
             *res == self.node(),
     {
         match self.kind {
-            EntryOwnerKind::Node(ref node) => node,
+            EntryOwnerKind::Node(ref auth) => auth,
+            _ => { proof_from_false() },
+        }
+    }
+
+    /// Mutable access to the child's authority, which is what lending a
+    /// fraction requires. This is why `to_ref` and `ChildRef::from_pte` take
+    /// `&mut EntryOwner` where they used to take `&EntryOwner`: handing out a
+    /// reference is a mutation of the authority, not a read of a global map.
+    pub proof fn tracked_borrow_mut_node(tracked &mut self) -> (tracked res: &mut NodeAuth)
+        requires
+            old(self).kind is Node,
+        ensures
+            *res == old(self).node(),
+            final(self).parent_level == old(self).parent_level,
+            final(self).kind is Node,
+    {
+        match self.kind {
+            EntryOwnerKind::Node(ref mut auth) => auth,
             _ => { proof_from_false() },
         }
     }
@@ -202,12 +228,19 @@ impl EntryOwner {
     }
 
     // ─── Invariants ────────────────────────────────────────────────────────
-    /// The structural invariant, independent of the region.
+    /// The structural invariant.
+    ///
+    /// Note what is *absent* compared with the central-region design: there is
+    /// no `metaregion_sound` companion predicate threading a `Regions`
+    /// argument. For a child node, `NodeAuth::wf()` is the whole story, and it
+    /// is self-contained.
     pub open spec fn inv_base(self) -> bool {
         &&& self.is_node() ==> {
-            &&& self.node().inv()
-            // A child node is exactly one level below its parent.
-            &&& self.parent_level == self.node().level + 1
+            &&& self.node().wf()
+            // A child node is exactly one level below its parent. Stated
+            // against `NodeAuth::level()`, which survives the node being lent
+            // out to a guard.
+            &&& self.parent_level == self.node().level() + 1
         }
         &&& self.is_frame() ==> {
             // Frames only exist at levels the ISA supports as leaves. A frame
@@ -229,48 +262,14 @@ impl EntryOwner {
         }
     }
 
-    /// The region-dependent invariant: whatever this entry owns has a live
-    /// metadata slot, tagged consistently with what the entry claims it is.
-    pub open spec fn metaregion_sound(self, regions: Regions) -> bool {
-        if self.is_node() {
-            self.node().metaregion_sound_node(regions)
-        } else if self.is_frame() {
-            let idx = frame_to_index(self.frame().mapped_pa);
-            &&& regions.contains(idx)
-            &&& regions.slots[idx].inv()
-            &&& regions.slots[idx].index == idx
-            &&& regions.slots[idx].is_live()
-            // A mapped data frame is *not* tagged `PageTable`. This is the
-            // discriminator that keeps node slots and frame slots apart.
-            &&& !(regions.slots[idx].usage is PageTable)
-        } else {
-            true
-        }
-    }
-
     /// Everything an owner and its PTE must jointly satisfy.
-    pub open spec fn pte_invariants(self, pte: Pte, regions: Regions) -> bool {
-        &&& self.inv()
-        &&& regions.inv()
-        &&& self.match_pte(pte, self.parent_level)
-        &&& self.metaregion_sound(regions)
-    }
-
-    /// An entry that owns a live node cannot sit in a slot that is still free.
     ///
-    /// This is what rules out "the newly allocated node collides with an
-    /// existing entry" in `alloc_if_none`.
-    pub proof fn lemma_active_entry_not_in_free_pool(entry: Self, regions: Regions, free_idx: int)
-        requires
-            regions.inv(),
-            entry.inv(),
-            entry.is_node(),
-            entry.metaregion_sound(regions),
-            regions.contains(free_idx),
-            !regions.slots[free_idx].is_live(),
-        ensures
-            entry.node().slot_index != free_idx,
-    {
+    /// Compare the old signature, `pte_invariants(self, pte, regions)`: the
+    /// region argument is gone because nothing outside this entry is needed to
+    /// know the entry is sound.
+    pub open spec fn pte_invariants(self, pte: Pte) -> bool {
+        &&& self.inv()
+        &&& self.match_pte(pte, self.parent_level)
     }
 }
 

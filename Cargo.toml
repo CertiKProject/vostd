@@ -5,6 +5,7 @@ members = [
     "verified_libs/vstd_extra",
     "verified_libs/ostd-pod",
     "ostd",
+    "ostd/experiments/node_model",
     "ostd/libs/align_ext",
     # "ostd/libs/ostd-macros",
     # "ostd/libs/ostd-test",

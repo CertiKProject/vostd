@@ -4,43 +4,35 @@
 //! modelled faithfully, everything here is the smallest thing the node layer
 //! can be built on.
 //!
-//! What survives from the real `ostd::mm::frame`:
+//! Under fractional ownership this layer is *much* thinner than it used to be.
+//! A `Frame<M>` is now nothing but a typed address: all of the ownership that
+//! used to be parked in a central `MetaRegionOwners` has moved into the node's
+//! own resource (`crate::node::NodeOwner`, lent out as
+//! `crate::node::NodeFrac`). Consequently:
 //!
-//! * a `Frame<M>` is an owning handle that stores the **metadata slot
-//!   address**, not the frame address (`Frame::start_paddr` converts);
-//! * a `FrameRef<'a, M>` is a borrow of one, with a lifetime but no refcount
-//!   change;
-//! * the metadata for every frame lives in a global region, whose permissions
-//!   are held in one tracked `MetaRegionOwners` that callers thread through;
-//! * a slot has a reference count with the `UNUSED` sentinel, and a `usage`
-//!   tag that discriminates page-table frames from data frames.
-//!
-//! What is dropped: `MetaSlot`'s type erasure (`MetaSlotStorage` + the `Repr`
-//! cast, so `MetaRegionOwners` here is generic in `M` instead), the atomic
-//! refcount and its `PermissionU64`, `UniqueFrame`, segments, linked lists, the
-//! allocator, and all of `vstd_extra::drop_tracking` (`Frame` has no `Drop`
-//! here, so there is no obligation ledger).
+//! * `Frame::start_paddr` needs no permission at all, only a well-formed
+//!   address;
+//! * `Frame::from_raw` is no longer an axiom — reconstructing a *handle* from
+//!   a physical address is pure arithmetic once the handle carries no
+//!   authority of its own;
+//! * `MetaSlotOwner` / `MetaRegionOwners` / `PageUsage` / `REF_COUNT_*` are
+//!   gone entirely.
 pub mod mapping;
-pub mod owners;
-
-use core::marker::PhantomData;
 
 use vstd::prelude::*;
 use vstd::simple_pptr::{PPtr, PointsTo};
 
-use vstd_extra::ownership::*;
-
 use crate::arch::*;
 use crate::frame::mapping::*;
-use crate::frame::owners::*;
 
 verus! {
 
-/// An owning handle to a frame, addressed by its metadata slot.
+/// A handle to a frame, addressed by its metadata slot.
 ///
-/// Unlike the real `Frame`, this one does not implement `Drop`: modelling the
-/// recursive teardown of a page table is out of scope, so nothing in the model
-/// ever decrements a reference count.
+/// The real `Frame` is a reference-counted owning pointer whose `Drop`
+/// decrements the count. Here it is a bare address; whether the holder may
+/// *do* anything with the frame is decided by the resource they hold
+/// alongside it, not by the handle.
 pub struct Frame<M> {
     /// Points at the frame's metadata slot, i.e. `frame_to_meta(paddr)`.
     pub ptr: PPtr<M>,
@@ -57,7 +49,7 @@ impl<M> Frame<M> {
         valid_meta_vaddr(self.ptr.addr())
     }
 
-    /// The physical address of the frame this handle owns.
+    /// The physical address of the frame this handle names.
     pub open spec fn start_paddr_spec(self) -> Paddr {
         meta_to_frame_spec(self.ptr.addr())
     }
@@ -67,14 +59,12 @@ impl<M> Frame<M> {
 impl<M> Frame<M> {
     /// Returns the physical address of the frame.
     ///
-    /// The real signature takes the slot permission to witness that the handle
-    /// addresses a live slot; the model takes the slot owner for the same
-    /// reason.
+    /// Previously this took the slot's permission as a witness that the handle
+    /// named a live slot. It no longer needs one: the address alone determines
+    /// the answer, and liveness is the business of whoever holds the fraction.
     #[verus_spec(res =>
-        with Tracked(slot): Tracked<&MetaSlotOwner<M>>,
         requires
-            slot.inv(),
-            slot.meta_perm.addr() == self.ptr.addr(),
+            self.wf_addr(),
         ensures
             res == self.start_paddr_spec(),
             valid_frame_paddr(res),
@@ -83,12 +73,14 @@ impl<M> Frame<M> {
         proof {
             broadcast use group_page_meta;
 
-            lemma_index_to_meta_biinjective(slot.index);
         }
         meta_to_frame(self.ptr.addr())
     }
 
     /// Borrows the frame's metadata.
+    ///
+    /// The permission comes from the caller's `NodeOwner`/`NodeFrac`, which is
+    /// where the slot's `PointsTo` now lives.
     #[verus_spec(res =>
         with Tracked(perm): Tracked<&'a PointsTo<M>>,
         requires
@@ -101,78 +93,30 @@ impl<M> Frame<M> {
         self.ptr.borrow(Tracked(perm))
     }
 
-    /// Restores an owning handle from a raw physical address.
+    /// Reconstructs a handle from a raw physical address.
     ///
     /// # Safety
     ///
-    /// The caller must ensure the address names a live frame whose ownership
-    /// is being transferred into the returned handle.
+    /// The caller must ensure the address names a frame they are entitled to
+    /// refer to. That entitlement is the fraction they hold, not this call.
     ///
-    /// Axiomatised: the real body manipulates the atomic reference count. The
-    /// model has no `Drop`, so the handle is pure address arithmetic and the
-    /// region is untouched.
-    #[verifier::external_body]
+    /// No longer axiomatised: with the authority moved out of the handle, this
+    /// is just `frame_to_meta` plus a pointer construction.
     #[verus_spec(res =>
-        with Tracked(regions): Tracked<&MetaRegionOwners<M>>,
         requires
-            regions.inv(),
             valid_frame_paddr(paddr),
-            regions.slot_of(paddr).ref_count != REF_COUNT_UNUSED,
         ensures
             res.ptr.addr() == frame_to_meta_spec(paddr),
             res.wf_addr(),
             res.index() == frame_to_index(paddr),
+            res.start_paddr_spec() == paddr,
     )]
     pub unsafe fn from_raw(paddr: Paddr) -> Self {
-        unimplemented!()
-    }
-}
+        proof {
+            broadcast use group_page_meta;
 
-/// A struct that can work as `&'a Frame<M>`.
-///
-/// The real type wraps `ManuallyDrop<Frame<M>>` to suppress the owning
-/// handle's `Drop`; the model's `Frame` has no `Drop`, so it holds the handle
-/// directly.
-pub struct FrameRef<'a, M> {
-    pub inner: Frame<M>,
-    pub _marker: PhantomData<&'a Frame<M>>,
-}
-
-#[verus_verify]
-impl<'a, M> FrameRef<'a, M> {
-    /// Borrows the frame at the physical address.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure the borrow does not outlive an owning handle to
-    /// the same frame.
-    ///
-    /// Axiomatised for the same reason as [`Frame::from_raw`]; note the region
-    /// is provably unchanged, which is what lets `ChildRef::from_pte` promise
-    /// its caller that no other entry was disturbed.
-    #[verifier::external_body]
-    #[verus_spec(res =>
-        with Tracked(regions): Tracked<&MetaRegionOwners<M>>,
-        requires
-            regions.inv(),
-            valid_frame_paddr(paddr),
-            regions.slot_of(paddr).ref_count != REF_COUNT_UNUSED,
-        ensures
-            res.inner.ptr.addr() == frame_to_meta_spec(paddr),
-            res.inner.wf_addr(),
-            res.inner.index() == frame_to_index(paddr),
-    )]
-    pub unsafe fn borrow_paddr(paddr: Paddr) -> Self {
-        unimplemented!()
-    }
-}
-
-impl<M> core::ops::Deref for FrameRef<'_, M> {
-    type Target = Frame<M>;
-
-    #[verus_spec(ensures returns self.inner)]
-    fn deref(&self) -> &Self::Target {
-        &self.inner
+        }
+        Frame { ptr: PPtr::from_addr(frame_to_meta(paddr)) }
     }
 }
 

@@ -2,22 +2,27 @@
 //!
 //! Model of `ostd::specs::mm::page_table::node::owners`.
 //!
-//! The central object is [`NodeOwner`]. Note how the permissions for one node
-//! are split across two places, exactly as in the real code:
+//! The central object is [`NodeOwner`], which holds **everything** there is to
+//! own about one page table node:
 //!
-//! * the node's **metadata** (`nr_children`, `stray`) lives in the metadata
-//!   slot, so its `PCell` permissions travel in the [`PageMetaOwner`] held by
-//!   the `NodeOwner`, while the permission for the slot's *storage* stays
-//!   parked in the region (`MetaRegionOwners`);
-//! * the node's **page** — the array of 512 PTEs — is a separate mapping at
-//!   `paddr_to_vaddr(paddr)`, whose permission is `NodeOwner::children_perm`.
+//! * `meta_perm` — the slot's storage. In the central-region design this was
+//!   parked in `MetaRegionOwners` and a `meta_bridge` predicate had to tie it
+//!   back to the node; now it simply lives here, and the tie is part of
+//!   `inv()`.
+//! * `meta_own` — the `PCell` permissions for the mutable metadata fields
+//!   (`nr_children`, `stray`).
+//! * `children_perm` — the node's page, an array of `NR_ENTRIES` PTEs mapped
+//!   at `paddr_to_vaddr(paddr)`.
 //!
-//! `metaregion_sound_node` is the bridge that ties a `NodeOwner` back to the
-//! slot parked in the region.
+//! A `NodeOwner` is never passed around directly by the node API. It is stored
+//! inside a [`NodeAuth`](crate::node::NodeAuth) and lent out as
+//! [`NodeFrac`](crate::node::NodeFrac) fractions; only a `PageTableGuard`,
+//! which has gathered every fraction, holds one outright.
 use core::marker::PhantomData;
 
 use vstd::cell::pcell_maybe_uninit;
 use vstd::prelude::*;
+use vstd::simple_pptr::PointsTo;
 
 use vstd_extra::array_ptr;
 use vstd_extra::ownership::*;
@@ -25,8 +30,7 @@ use vstd_extra::ownership::*;
 use crate::arch::*;
 use crate::frame::Frame;
 use crate::frame::mapping::*;
-use crate::frame::owners::*;
-use crate::node::{PageTableGuard, PageTablePageMeta, Regions};
+use crate::node::PageTablePageMeta;
 use crate::pte::Pte;
 
 verus! {
@@ -34,8 +38,8 @@ verus! {
 // ─── Present-PTE counting ──────────────────────────────────────────────────
 //
 // The intended meaning of `nr_children` is "the number of present PTEs in this
-// node". `metaregion_sound_node` pins it to `count_present(children_perm)`,
-// which is what lets `replace` prove its `nr_children +/- 1` bookkeeping never
+// node". `NodeOwner::settled` pins it to `count_present(children_perm)`, which
+// is what lets `replace` prove its `nr_children +/- 1` bookkeeping never
 // underflows or overflows, instead of assuming it.
 /// Number of present PTEs among the first `n` entries of `s`.
 pub open spec fn count_present_upto(s: Seq<Pte>, n: int) -> int
@@ -192,17 +196,15 @@ impl OwnerOf for PageTablePageMeta {
 }
 
 // ─── The node ──────────────────────────────────────────────────────────────
-/// The owner of a page table node.
+/// Everything there is to own about one page table node.
 ///
-/// * `meta_own` holds the permissions for the node's mutable metadata;
-/// * `children_perm` is the permission for the node's page, viewed as an array
-///   of `NR_ENTRIES` PTEs;
-/// * `slot_index` identifies the node's frame in the metadata region;
-/// * `level` is the node's paging level, between 1 and `NR_LEVELS`.
-///
-/// The real type also carries `tree_level`, the level of the `ghost_tree`
-/// node that holds this owner. The model has no ghost tree, so it is dropped.
+/// The real type also carries `tree_level`, the level of the `ghost_tree` node
+/// that holds this owner. The model has no ghost tree, so it is dropped.
 pub tracked struct NodeOwner {
+    /// The node's metadata slot storage. Previously parked in
+    /// `MetaRegionOwners`; holding it here is what lets the node certify
+    /// itself.
+    pub meta_perm: PointsTo<PageTablePageMeta>,
     pub meta_own: PageMetaOwner,
     pub children_perm: array_ptr::PointsTo<Pte, NR_ENTRIES>,
     pub ghost level: PagingLevel,
@@ -221,7 +223,18 @@ impl Inv for NodeOwner {
         // The node's PTE array lives at the linear-mapping address of the
         // node's own frame. This is what makes two distinct nodes hold
         // disjoint `children_perm`s.
-        &&& self.children_perm.addr() == paddr_to_vaddr_spec(index_to_frame(self.slot_index))
+        &&& self.children_perm.addr() == paddr_to_vaddr_spec(
+            index_to_frame(self.slot_index),
+        )
+        // The former `meta_bridge`: the slot permission this owner holds is
+        // the right slot, is initialised, and agrees with the `PCell`
+        // permissions in `meta_own`. In the central-region design these four
+        // clauses had to be re-established against the region after every
+        // change; now they are simply part of being a `NodeOwner`.
+        &&& self.meta_perm.addr() == index_to_meta(self.slot_index)
+        &&& self.meta_perm.is_init()
+        &&& self.meta_perm.value().wf(self.meta_own)
+        &&& self.level == self.meta_perm.value().level
     }
 }
 
@@ -238,45 +251,21 @@ impl NodeOwner {
         index_to_frame(self.slot_index)
     }
 
-    /// The metadata value parked in the region for this node.
-    pub open spec fn meta_value(self, regions: Regions) -> PageTablePageMeta {
-        regions.slots[self.slot_index].meta_perm.value()
+    /// The metadata value this owner's slot permission holds.
+    pub open spec fn meta_value(self) -> PageTablePageMeta {
+        self.meta_perm.value()
     }
 
-    /// The bridge between a `NodeOwner` and the *slot* parked in the region:
-    /// the slot exists, is the right one, and its contents agree with the
-    /// permissions this owner holds.
+    /// A *settled* node additionally has `nr_children` equal to the number of
+    /// present PTEs.
     ///
-    /// Split out of [`Self::metaregion_sound_node`] because it is the weaker
-    /// fact that survives mid-`replace`: reading or writing a PTE, or bumping
-    /// `nr_children`, needs only this, not the full node invariant.
-    pub open spec fn meta_bridge(self, regions: Regions) -> bool {
-        let slot = regions.slots[self.slot_index];
-        &&& regions.contains(self.slot_index)
-        &&& slot.inv()
-        &&& slot.index == self.slot_index
-        &&& self.meta_value(regions).wf(self.meta_own)
-        &&& self.level == self.meta_value(regions).level
-    }
-
-    /// The full region-dependent invariant of a *settled* node.
-    ///
-    /// Everything here is region-dependent, so it cannot live in `inv()`: it
-    /// is stated separately and re-established after each region change.
-    pub open spec fn metaregion_sound_node(self, regions: Regions) -> bool {
-        let slot = regions.slots[self.slot_index];
-        &&& self.meta_bridge(
-            regions,
-        )
-        // A node's slot is tagged `PageTable` at allocation. This single tag
-        // is what discriminates node slots from data-frame slots, which is how
-        // a freshly allocated node is known not to collide with a live one.
-        &&& slot.usage is PageTable
-        &&& slot.is_live()
-        // `nr_children` counts the present PTEs. A *settled-node* invariant:
-        // it is momentarily broken inside `replace`, between the PTE write and
-        // the counter update, which is why it is not part of `inv()`.
-        &&& self.count_consistent()
+    /// This is deliberately not part of `inv()`: it is momentarily false
+    /// inside `replace`, between the counter update and the PTE write. Since
+    /// `inv()` is what a [`NodeFrac`](crate::node::NodeFrac) carries, keeping
+    /// it out means a fraction never promises something a mid-flight node
+    /// cannot deliver.
+    pub open spec fn settled(self) -> bool {
+        self.count_consistent()
     }
 
     /// `nr_children` equals the number of present PTEs in `children_perm`.
@@ -310,14 +299,6 @@ impl NodeOwner {
             self.meta_own.nr_children.value() > 0,
     {
         lemma_count_present_upto_present(self.children_perm.value(), NR_ENTRIES as int, idx as int);
-    }
-}
-
-impl<'rcu> NodeOwner {
-    /// The guard holds the lock of *this* node.
-    pub open spec fn relate_guard(self, guard: PageTableGuard<'rcu>) -> bool {
-        &&& guard.inner.inner.ptr.addr() == self.meta_vaddr()
-        &&& guard.inner.inner.wf(self)
     }
 }
 
@@ -356,27 +337,6 @@ impl Frame<PageTablePageMeta> {
     pub open spec fn invariants(self, owner: NodeOwner) -> bool {
         &&& owner.inv()
         &&& self.wf(owner)
-    }
-}
-
-// ─── The lock ledger ───────────────────────────────────────────────────────
-/// The set of node metadata addresses whose locks are currently held.
-///
-/// The model has no spin lock implementation, exactly as the real development
-/// does not: `PageTableNodeRef::lock` is axiomatised, and this ghost set is
-/// the only record that a lock was taken.
-pub tracked struct Guards<'rcu> {
-    pub ghost guards: Set<Vaddr>,
-    pub _phantom: PhantomData<&'rcu ()>,
-}
-
-impl<'rcu> Guards<'rcu> {
-    pub open spec fn unlocked(self, addr: Vaddr) -> bool {
-        !self.guards.contains(addr)
-    }
-
-    pub open spec fn lock_held(self, addr: Vaddr) -> bool {
-        self.guards.contains(addr)
     }
 }
 
