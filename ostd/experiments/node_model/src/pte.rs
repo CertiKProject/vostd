@@ -208,8 +208,13 @@ impl Pte {
 // real ones compile to relaxed/release atomics, which Verus cannot see
 // through, so both are axiomatised as an indexed read/write against the
 // node's array permission.
+//
+// Both are `#[verifier::atomic]`: the array permission lives in an
+// `AtomicInvariant` (see `node::owners::PteArray`), and a single atomic
+// instruction is exactly what may run while that invariant is open.
 /// Loads a page table entry with an atomic instruction.
 #[verifier::external_body]
+#[verifier::atomic]
 #[verus_spec(pte =>
     with Tracked(perm): Tracked<&vstd_extra::array_ptr::PointsTo<Pte, NR_ENTRIES>>
     requires
@@ -218,6 +223,8 @@ impl Pte {
         perm.is_init_all(),
     ensures
         pte == perm.value()[ptr.index as int],
+    opens_invariants none
+    no_unwind
 )]
 pub unsafe fn load_pte(
     ptr: vstd_extra::array_ptr::ArrayPtr<Pte, NR_ENTRIES>,
@@ -228,6 +235,7 @@ pub unsafe fn load_pte(
 
 /// Stores a page table entry with an atomic instruction.
 #[verifier::external_body]
+#[verifier::atomic]
 #[verus_spec(
     with Tracked(perm): Tracked<&mut vstd_extra::array_ptr::PointsTo<Pte, NR_ENTRIES>>
     requires
@@ -239,6 +247,8 @@ pub unsafe fn load_pte(
         final(perm).addr() == old(perm).addr(),
         final(perm).is_init_all(),
         final(perm).value() == old(perm).value().update(ptr.index as int, new_val),
+    opens_invariants none
+    no_unwind
 )]
 pub unsafe fn store_pte(
     ptr: vstd_extra::array_ptr::ArrayPtr<Pte, NR_ENTRIES>,

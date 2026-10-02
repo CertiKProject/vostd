@@ -2,26 +2,35 @@
 //!
 //! Model of `ostd::specs::mm::page_table::node::owners`.
 //!
-//! The central object is [`NodeOwner`], which holds **everything** there is to
-//! own about one page table node:
+//! A node's ownership is split three ways, by *how each part changes*:
 //!
-//! * `meta_perm` — the slot's storage. In the central-region design this was
-//!   parked in `MetaRegionOwners` and a `meta_bridge` predicate had to tie it
-//!   back to the node; now it simply lives here, and the tie is part of
-//!   `inv()`.
-//! * `meta_own` — the `PCell` permissions for the mutable metadata fields
-//!   (`nr_children`, `stray`).
-//! * `children_perm` — the node's page, an array of `NR_ENTRIES` PTEs mapped
-//!   at `paddr_to_vaddr(paddr)`.
+//! * [`NodeIdentity`] — what never changes once the node exists: the slot's
+//!   storage permission `meta_perm`, the level, the slot index, and the
+//!   [`AtomicInvariant`] that guards the PTE array. This is what every
+//!   reader agrees on, so it is the resource inside a
+//!   [`NodeFrac`](crate::node::NodeFrac). Because it is immutable, nothing a
+//!   writer does ever has to be propagated to the readers.
+//! * [`PteArray`], stored *inside* that invariant — the PTE array permission
+//!   itself. Readers and the writer alike open the invariant around a single
+//!   atomic `load_pte` / `store_pte`; what a reader learns is only the
+//!   invariant's weak predicate [`pte_wf`], which is exactly the guarantee an
+//!   unlocked reader in the real code has.
+//! * [`NodeWriter`] — the unique write token: the `PCell` permissions for the
+//!   lock-protected metadata (`nr_children`, `stray`), and the authoritative
+//!   half of a ghost variable that pins the *exact* PTE array. A
+//!   `PageTableGuard` holds it, which is why a guard knows precisely what the
+//!   node contains while a reader does not.
 //!
-//! A `NodeOwner` is never passed around directly by the node API. It is stored
-//! inside a [`NodeAuth`](crate::node::NodeAuth) and lent out as
-//! [`NodeFrac`](crate::node::NodeFrac) fractions; only a `PageTableGuard`,
-//! which has gathered every fraction, holds one outright.
+//! [`NodeOwner`] remains as the *unpacked* form of all of this — what the frame
+//! allocator hands back for a fresh node, before
+//! [`NodeAuth::alloc`](crate::node::NodeAuth::alloc) packs it.
 use core::marker::PhantomData;
 
 use vstd::cell::pcell_maybe_uninit;
+use vstd::invariant::{AtomicInvariant, InvariantPredicate};
 use vstd::prelude::*;
+use vstd::resource::Loc;
+use vstd::resource::ghost_var::{GhostVar, GhostVarAuth};
 use vstd::simple_pptr::PointsTo;
 
 use vstd_extra::array_ptr;
@@ -195,8 +204,14 @@ impl OwnerOf for PageTablePageMeta {
     }
 }
 
-// ─── The node ──────────────────────────────────────────────────────────────
-/// Everything there is to own about one page table node.
+// ─── The node, unpacked ────────────────────────────────────────────────────
+/// Everything there is to own about one page table node, in one bundle.
+///
+/// This is the form in which [`PageTableNode::alloc`](crate::node::PageTableNode::alloc)
+/// returns a fresh node. It is immediately packed by
+/// [`NodeAuth::alloc`](crate::node::NodeAuth::alloc) into a [`NodeIdentity`]
+/// (shared by readers), a [`PteArray`] (inside an atomic invariant) and a
+/// [`NodeWriter`] (held by whoever holds the lock).
 ///
 /// The real type also carries `tree_level`, the level of the `ghost_tree` node
 /// that holds this owner. The model has no ghost tree, so it is dropped.
@@ -221,16 +236,13 @@ impl Inv for NodeOwner {
         &&& 0 <= self.slot_index
             < max_meta_slots()
         // The node's PTE array lives at the linear-mapping address of the
-        // node's own frame. This is what makes two distinct nodes hold
-        // disjoint `children_perm`s.
+        // node's own frame.
         &&& self.children_perm.addr() == paddr_to_vaddr_spec(
             index_to_frame(self.slot_index),
         )
         // The former `meta_bridge`: the slot permission this owner holds is
         // the right slot, is initialised, and agrees with the `PCell`
-        // permissions in `meta_own`. In the central-region design these four
-        // clauses had to be re-established against the region after every
-        // change; now they are simply part of being a `NodeOwner`.
+        // permissions in `meta_own`.
         &&& self.meta_perm.addr() == index_to_meta(self.slot_index)
         &&& self.meta_perm.is_init()
         &&& self.meta_perm.value().wf(self.meta_own)
@@ -251,54 +263,9 @@ impl NodeOwner {
         index_to_frame(self.slot_index)
     }
 
-    /// The metadata value this owner's slot permission holds.
-    pub open spec fn meta_value(self) -> PageTablePageMeta {
-        self.meta_perm.value()
-    }
-
-    /// A *settled* node additionally has `nr_children` equal to the number of
-    /// present PTEs.
-    ///
-    /// This is deliberately not part of `inv()`: it is momentarily false
-    /// inside `replace`, between the counter update and the PTE write. Since
-    /// `inv()` is what a [`NodeFrac`](crate::node::NodeFrac) carries, keeping
-    /// it out means a fraction never promises something a mid-flight node
-    /// cannot deliver.
+    /// `nr_children` equals the number of present PTEs.
     pub open spec fn settled(self) -> bool {
-        self.count_consistent()
-    }
-
-    /// `nr_children` equals the number of present PTEs in `children_perm`.
-    pub open spec fn count_consistent(self) -> bool {
         self.meta_own.nr_children.value() == count_present(self.children_perm.value())
-    }
-
-    /// An absent slot means the node is not full, so `nr_children` can be
-    /// incremented. Proven from `count_consistent`, not assumed.
-    pub proof fn nr_children_absent_slot_bound(self, idx: usize)
-        requires
-            self.inv(),
-            self.count_consistent(),
-            idx < NR_ENTRIES,
-            !self.children_perm.value()[idx as int].is_present(),
-        ensures
-            self.meta_own.nr_children.value() < NR_ENTRIES,
-    {
-        lemma_count_present_upto_absent(self.children_perm.value(), NR_ENTRIES as int, idx as int);
-    }
-
-    /// A present slot means `nr_children` is non-zero, so it can be
-    /// decremented. Dual of [`Self::nr_children_absent_slot_bound`].
-    pub proof fn nr_children_present_slot_bound(self, idx: usize)
-        requires
-            self.inv(),
-            self.count_consistent(),
-            idx < NR_ENTRIES,
-            self.children_perm.value()[idx as int].is_present(),
-        ensures
-            self.meta_own.nr_children.value() > 0,
-    {
-        lemma_count_present_upto_present(self.children_perm.value(), NR_ENTRIES as int, idx as int);
     }
 }
 
@@ -337,6 +304,205 @@ impl Frame<PageTablePageMeta> {
     pub open spec fn invariants(self, owner: NodeOwner) -> bool {
         &&& owner.inv()
         &&& self.wf(owner)
+    }
+}
+
+// ─── What a reader may assume about a PTE ──────────────────────────────────
+/// The weak, level-local well-formedness of one PTE in a node at `level`.
+///
+/// This is the predicate of the PTE array's atomic invariant, and therefore
+/// *everything* a reader without the lock learns from `read_pte`. It is the
+/// part of [`EntryOwner::match_pte`](crate::node::EntryOwner::match_pte) that
+/// can be stated without knowing what the entry owns:
+///
+/// * every PTE carries a valid frame address;
+/// * an absent PTE above level 1 does not claim to terminate the walk;
+/// * a terminating PTE is not at the top level (no 512 GiB pages).
+pub open spec fn pte_wf(pte: Pte, level: PagingLevel) -> bool {
+    &&& valid_frame_paddr(pte.paddr())
+    &&& !pte.is_present() && level > 1 ==> !pte.is_last(level)
+    &&& pte.is_present() && pte.is_last(level) ==> level < NR_LEVELS
+}
+
+/// Every PTE in `ptes` is well formed at `level`.
+pub open spec fn ptes_wf(ptes: Seq<Pte>, level: PagingLevel) -> bool {
+    &&& ptes.len() == NR_ENTRIES
+    &&& forall|i: int| 0 <= i < NR_ENTRIES ==> #[trigger] pte_wf(ptes[i], level)
+}
+
+/// The absent PTE is well formed at any level.
+pub proof fn lemma_absent_pte_wf(level: PagingLevel)
+    ensures
+        pte_wf(Pte::new_absent_spec(), level),
+{
+    assert(valid_frame_paddr(0)) by (compute_only);
+}
+
+// ─── The PTE array and its invariant ───────────────────────────────────────
+/// What lives inside a node's atomic invariant: the PTE array permission, and
+/// the invariant's half of the ghost variable mirroring the array's contents.
+pub tracked struct PteArray {
+    pub perm: array_ptr::PointsTo<Pte, NR_ENTRIES>,
+    /// Always equal to `perm.value()`. The writer holds the authoritative
+    /// half, which is how it knows the exact contents between invariant
+    /// openings.
+    pub contents: GhostVar<Seq<Pte>>,
+}
+
+/// The constants a node's PTE invariant is configured with.
+pub ghost struct PteArrayParams {
+    /// The virtual address of the node's PTE array.
+    pub addr: usize,
+    /// The node's level; [`pte_wf`] depends on it.
+    pub level: PagingLevel,
+    /// The ghost variable the writer's [`NodeWriter::contents`] must match.
+    pub contents_id: Loc,
+}
+
+pub struct PteArrayPred;
+
+impl InvariantPredicate<PteArrayParams, PteArray> for PteArrayPred {
+    open spec fn inv(k: PteArrayParams, v: PteArray) -> bool {
+        &&& v.perm.wf()
+        &&& v.perm.addr() == k.addr
+        &&& v.perm.is_init_all()
+        &&& v.contents.id() == k.contents_id
+        &&& v.contents@ == v.perm.value()
+        &&& ptes_wf(v.perm.value(), k.level)
+    }
+}
+
+/// The namespace of every node's PTE invariant. No code path opens two of
+/// them at once, so they can share one.
+pub open spec fn pte_array_ns() -> int {
+    0
+}
+
+// ─── The identity: what readers share ──────────────────────────────────────
+/// The immutable part of a node, shared by every reader.
+///
+/// Nothing in here changes for the lifetime of the node, which is what makes
+/// it safe to replicate across [`NodeFrac`](crate::node::NodeFrac)s: the
+/// agreement that `Count` enforces never has to be re-established after a
+/// write.
+pub tracked struct NodeIdentity {
+    /// The node's metadata slot. Read-only: the mutable metadata fields are
+    /// `PCell`s whose permissions live in the [`NodeWriter`].
+    pub meta_perm: PointsTo<PageTablePageMeta>,
+    /// Guards the PTE array.
+    pub ptes: AtomicInvariant<PteArrayParams, PteArray, PteArrayPred>,
+    pub ghost level: PagingLevel,
+    pub ghost slot_index: int,
+}
+
+impl Inv for NodeIdentity {
+    open spec fn inv(self) -> bool {
+        &&& 1 <= self.level <= NR_LEVELS
+        &&& 0 <= self.slot_index < max_meta_slots()
+        &&& self.meta_perm.addr() == index_to_meta(self.slot_index)
+        &&& self.meta_perm.is_init()
+        &&& self.level == self.meta_perm.value().level
+        &&& self.ptes.constant().addr == paddr_to_vaddr_spec(index_to_frame(self.slot_index))
+        &&& self.ptes.constant().level == self.level
+        &&& self.ptes.namespace() == pte_array_ns()
+    }
+}
+
+impl NodeIdentity {
+    pub open spec fn meta_vaddr(self) -> Vaddr {
+        index_to_meta(self.slot_index)
+    }
+
+    pub open spec fn paddr(self) -> Paddr {
+        index_to_frame(self.slot_index)
+    }
+}
+
+// ─── The writer ────────────────────────────────────────────────────────────
+/// The unique permission to write a node: what a `PageTableGuard` holds.
+///
+/// Mutual exclusion between writers is simply the uniqueness of this token —
+/// readers may coexist with it.
+pub tracked struct NodeWriter {
+    /// The `PCell` permissions for `nr_children` and `stray`.
+    pub meta_own: PageMetaOwner,
+    /// The authoritative half of the ghost variable mirroring the PTE array:
+    /// the exact contents, as of the writer's last write.
+    pub contents: GhostVarAuth<Seq<Pte>>,
+}
+
+impl NodeWriter {
+    /// This is a writer for the node `id`.
+    pub open spec fn wf_for(self, id: NodeIdentity) -> bool {
+        &&& self.meta_own.inv()
+        &&& id.meta_perm.value().wf(self.meta_own)
+        &&& self.contents.id() == id.ptes.constant().contents_id
+        &&& self.contents@.len() == NR_ENTRIES
+    }
+
+    /// `nr_children` equals the number of present PTEs.
+    ///
+    /// Deliberately not part of [`Self::wf_for`]: it is momentarily false
+    /// inside `replace`, between the counter update and the PTE write.
+    pub open spec fn settled(self) -> bool {
+        self.meta_own.nr_children.value() == count_present(self.contents@)
+    }
+}
+
+// ─── The writer's view ─────────────────────────────────────────────────────
+/// Everything a writer knows about its node, as plain values.
+///
+/// The view of a `PageTableGuard`. Ghost, so specifications can compare a
+/// guard before and after an operation without touching tracked state.
+pub ghost struct NodeView {
+    pub level: PagingLevel,
+    pub slot_index: int,
+    /// The exact PTE array.
+    pub ptes: Seq<Pte>,
+    pub nr_children: u16,
+    pub stray: bool,
+}
+
+impl NodeView {
+    pub open spec fn meta_vaddr(self) -> Vaddr {
+        index_to_meta(self.slot_index)
+    }
+
+    pub open spec fn paddr(self) -> Paddr {
+        index_to_frame(self.slot_index)
+    }
+
+    /// A *settled* node has `nr_children` equal to the number of present PTEs.
+    pub open spec fn settled(self) -> bool {
+        self.nr_children == count_present(self.ptes)
+    }
+
+    /// An absent slot means the node is not full, so `nr_children` can be
+    /// incremented. Proven from `settled`, not assumed.
+    pub proof fn nr_children_absent_slot_bound(self, idx: usize)
+        requires
+            self.ptes.len() == NR_ENTRIES,
+            self.settled(),
+            idx < NR_ENTRIES,
+            !self.ptes[idx as int].is_present(),
+        ensures
+            self.nr_children < NR_ENTRIES,
+    {
+        lemma_count_present_upto_absent(self.ptes, NR_ENTRIES as int, idx as int);
+    }
+
+    /// A present slot means `nr_children` is non-zero, so it can be
+    /// decremented. Dual of [`Self::nr_children_absent_slot_bound`].
+    pub proof fn nr_children_present_slot_bound(self, idx: usize)
+        requires
+            self.ptes.len() == NR_ENTRIES,
+            self.settled(),
+            idx < NR_ENTRIES,
+            self.ptes[idx as int].is_present(),
+        ensures
+            self.nr_children > 0,
+    {
+        lemma_count_present_upto_present(self.ptes, NR_ENTRIES as int, idx as int);
     }
 }
 

@@ -33,8 +33,8 @@ pub struct Entry<'a, 'rcu> {
     pub pte: Pte,
     /// The index of the entry in the node.
     pub idx: usize,
-    /// The node that contains the entry — and, via its `Tracked<NodeOwner>`,
-    /// the parent's ownership.
+    /// The node that contains the entry — and, via its `NodeWriter`, the
+    /// right to write it.
     pub node: &'a mut PageTableGuard<'rcu>,
 }
 
@@ -42,21 +42,21 @@ impl<'a, 'rcu> Entry<'a, 'rcu> {
     /// Everything that must hold of an entry and its owner.
     ///
     /// This merges what used to be `invariants` + `node_matching`: since the
-    /// guard now carries the parent's `NodeOwner`, the two are no longer
+    /// guard now carries the parent's writer, the two are no longer
     /// separable.
     pub open spec fn invariants(self, owner: EntryOwner) -> bool {
         &&& self.idx < NR_ENTRIES
         &&& self.node.wf()
         &&& owner.inv()
-        &&& owner.parent_level == self.node.owner@.level
-        &&& self.pte == self.node.owner@.children_perm.value()[self.idx as int]
+        &&& owner.parent_level == self.node@.level
+        &&& self.pte == self.node@.ptes[self.idx as int]
         &&& owner.match_pte(self.pte, owner.parent_level)
     }
 
     /// What `replace` would have asserted at runtime under `allow_panic`: a
     /// child node must be exactly one level below its parent, and a mapped
     /// frame must be at the parent's level.
-    pub open spec fn replace_nonpanic_condition(parent: NodeOwner, new_owner: EntryOwner) -> bool {
+    pub open spec fn replace_nonpanic_condition(parent: NodeView, new_owner: EntryOwner) -> bool {
         if new_owner.is_node() {
             parent.level - 1 == new_owner.node().level()
         } else if new_owner.is_frame() {
@@ -67,15 +67,19 @@ impl<'a, 'rcu> Entry<'a, 'rcu> {
     }
 
     /// Everything about the parent that an operation on *one* entry must
-    /// leave alone: the other `NR_ENTRIES - 1` PTEs, and the node's identity.
-    pub open spec fn parent_perms_preserved(self, p0: NodeOwner, p1: NodeOwner) -> bool {
+    /// leave alone: the node's identity, and the other `NR_ENTRIES - 1` PTEs.
+    pub open spec fn parent_preserved(
+        self,
+        p0: PageTableGuard<'rcu>,
+        p1: PageTableGuard<'rcu>,
+    ) -> bool {
+        &&& p1.id() == p0.id()
+        &&& p1.identity() == p0.identity()
         &&& forall|i: int|
-            0 <= i < NR_ENTRIES && i != self.idx ==> #[trigger] p0.children_perm.value()[i]
-                == p1.children_perm.value()[i]
-        &&& p1.slot_index == p0.slot_index
-        &&& p1.level == p0.level
-        &&& p1.meta_own.nr_children.id() == p0.meta_own.nr_children.id()
-        &&& p1.meta_own.stray == p0.meta_own.stray
+            0 <= i < NR_ENTRIES && i != self.idx ==> #[trigger] p0@.ptes[i] == p1@.ptes[i]
+        &&& p1@.slot_index == p0@.slot_index
+        &&& p1@.level == p0@.level
+        &&& p1@.stray == p0@.stray
     }
 }
 
@@ -119,17 +123,17 @@ impl<'a, 'rcu> Entry<'a, 'rcu> {
     /// Gets a *reference* to the child.
     ///
     /// Takes `&mut EntryOwner` because producing a `ChildRef` means lending a
-    /// fraction out of the child's authority. The child must therefore have a
-    /// spare fraction — expressed as `frac() > 1`, the fractional analogue of
+    /// reader fraction out of the child's core. The child must therefore have a
+    /// spare fraction — expressed as `frac() > 0`, the fractional analogue of
     /// "the reference count has not saturated".
+    ///
+    /// The child may be locked by a guard elsewhere: readers coexist with the
+    /// writer.
     #[verus_spec(res =>
         with Tracked(owner): Tracked<&mut EntryOwner>,
         requires
             self.invariants(*old(owner)),
-            old(owner).is_node() ==> {
-                &&& !old(owner).node().is_lent_out()
-                &&& old(owner).node().frac() > 1
-            },
+            old(owner).is_node() ==> old(owner).node().frac() > 0,
         ensures
             res.invariants(*final(owner)),
             final(owner).parent_level == old(owner).parent_level,
@@ -153,33 +157,33 @@ impl<'a, 'rcu> Entry<'a, 'rcu> {
     /// This is where the node's `nr_children` bookkeeping happens. Note the
     /// order: the counter is adjusted *before* the PTE is written, so between
     /// the two the node's `settled()` invariant is momentarily false — which
-    /// is exactly why that clause lives in [`NodeOwner::settled`] rather than
-    /// in `NodeOwner::inv()`, and hence why a [`NodeFrac`] never promises it.
+    /// is exactly why that clause lives in [`NodeWriter::settled`] rather than
+    /// in `NodeWriter::wf_for`.
     #[verus_spec(res =>
         with Tracked(owner): Tracked<&mut EntryOwner>,
              Tracked(new_owner): Tracked<EntryOwner>,
                  -> old_owner: Tracked<EntryOwner>,
         requires
             old(self).invariants(*old(owner)),
-            old(self).node.owner@.settled(),
+            old(self).node@.settled(),
             new_child.invariants(new_owner),
             new_owner.inv(),
             new_owner.parent_level == old(owner).parent_level,
-            Self::replace_nonpanic_condition(old(self).node.owner@, new_owner),
+            Self::replace_nonpanic_condition(old(self).node@, new_owner),
         ensures
             final(self).invariants(*final(owner)),
-            final(self).node.owner@.settled(),
+            final(self).node@.settled(),
             *final(owner) == new_owner,
             old_owner@ == *old(owner),
             res.invariants(old_owner@),
             final(self).idx == old(self).idx,
-            final(self).parent_perms_preserved(old(self).node.owner@, final(self).node.owner@),
+            final(self).parent_preserved(*old(self).node, *final(self).node),
             res is None <==> old(owner).is_absent(),
     )]
     pub fn replace(&mut self, new_child: Child) -> Child {
         // Snapshot the parent's PTE array before the counter update and the
         // PTE write, for restoring `settled()` at the end.
-        let ghost cp0 = self.node.owner@.children_perm.value();
+        let ghost cp0 = self.node@.ptes;
 
         let level = self.node.level();
 
@@ -197,12 +201,12 @@ impl<'a, 'rcu> Entry<'a, 'rcu> {
 
         if old_is_none && !new_is_none {
             proof {
-                self.node.owner@.nr_children_absent_slot_bound(self.idx);
+                self.node@.nr_children_absent_slot_bound(self.idx);
             }
             self.node.set_nr_children(cur + 1);
         } else if !old_is_none && new_is_none {
             proof {
-                self.node.owner@.nr_children_present_slot_bound(self.idx);
+                self.node@.nr_children_present_slot_bound(self.idx);
             }
             self.node.set_nr_children(cur - 1);
         }
@@ -241,51 +245,52 @@ impl<'a, 'rcu> Entry<'a, 'rcu> {
     ///
     /// # No lock axiom
     ///
-    /// The guard is produced by [`NodeAuth::into_exclusive`], which is
-    /// **proved**, not assumed: a node that has just been allocated has every
-    /// one of its fractions still at home, so exclusive access follows from
-    /// the ownership algebra. The old model reached for the axiomatised
-    /// `lock()` here.
+    /// The guard's writer comes straight from [`NodeAuth::alloc`], which is
+    /// **proved**, not assumed: a node that has just been allocated has no
+    /// other writer. The old model reached for the axiomatised `lock()` here.
     #[verus_spec(res =>
         with Tracked(owner): Tracked<&mut EntryOwner>,
         requires
             old(self).invariants(*old(owner)),
-            old(self).node.owner@.settled(),
+            old(self).node@.settled(),
         ensures
             final(self).invariants(*final(owner)),
-            final(self).node.owner@.settled(),
+            final(self).node@.settled(),
             final(self).idx == old(self).idx,
-            final(self).parent_perms_preserved(old(self).node.owner@, final(self).node.owner@),
-            res is Some <==> (old(owner).is_absent() && old(self).node.owner@.level > 1),
-            old(owner).is_absent() && old(self).node.owner@.level > 1 ==> {
+            final(self).parent_preserved(*old(self).node, *final(self).node),
+            res is Some <==> (old(owner).is_absent() && old(self).node@.level > 1),
+            old(owner).is_absent() && old(self).node@.level > 1 ==> {
                 &&& final(owner).is_node()
                 &&& final(owner).parent_level == old(owner).parent_level
-                &&& final(owner).node().level() == old(self).node.owner@.level - 1
+                &&& final(owner).node().level() == old(self).node@.level - 1
                 &&& final(owner).node().is_lent_out()
+                &&& final(owner).node().frac() == MAX_REFS - 1
                 &&& res->0.wf()
+                &&& res->0.id() == final(owner).node().id()
                 &&& res->0@.settled()
-                &&& res->0@.level == old(self).node.owner@.level - 1
-                &&& res->0@.meta_own.nr_children.value() == 0
+                &&& res->0@.level == old(self).node@.level - 1
+                &&& res->0@.nr_children == 0
                 // Every PTE of the fresh node is absent.
                 &&& forall|i: int| 0 <= i < NR_ENTRIES
-                    ==> #[trigger] res->0@.children_perm.value()[i] == Pte::new_absent_spec()
+                    ==> #[trigger] res->0@.ptes[i] == Pte::new_absent_spec()
             },
-            !(old(owner).is_absent() && old(self).node.owner@.level > 1) ==> {
+            !(old(owner).is_absent() && old(self).node@.level > 1) ==> {
                 &&& *final(owner) == *old(owner)
                 &&& final(self).pte == old(self).pte
-                &&& final(self).node.owner@ == old(self).node.owner@
+                &&& final(self).node@ == old(self).node@
             },
     )]
     pub fn alloc_if_none(&mut self) -> Option<PageTableGuard<'rcu>> {
         let entry_is_present = self.pte.is_present();
-        let ghost cp0 = self.node.owner@.children_perm.value();
+        let ghost cp0 = self.node@.ptes;
         let level = self.node.level();
 
         if entry_is_present || level <= 1 {
             None
         } else {
             proof {
-                self.node.owner@.nr_children_absent_slot_bound(self.idx);
+                self.node.tracked_frac.borrow().validate();
+                self.node@.nr_children_absent_slot_bound(self.idx);
             }
 
             let (new_page, Tracked(new_node_owner)) = PageTableNode::alloc(level - 1);
@@ -298,17 +303,30 @@ impl<'a, 'rcu> Entry<'a, 'rcu> {
                 lemma_index_to_frame_biinjective(new_node_owner.slot_index);
             }
 
-            // Take the authority, then immediately take exclusive ownership.
-            // Proved, not axiomatised: nothing else holds a fraction yet.
-            let tracked mut auth = NodeAuth::alloc(new_node_owner);
-            let tracked exclusive = auth.into_exclusive();
+            // Pack the node into its core, which hands back the writer, and
+            // lend a reader. Proved, not axiomatised: nobody else can have
+            // the writer of a node that did not exist a moment ago.
+            proof {
+                assert forall|i: int| 0 <= i < NR_ENTRIES implies #[trigger] pte_wf(
+                    new_node_owner.children_perm.value()[i],
+                    new_node_owner.level,
+                ) by {
+                    lemma_absent_pte_wf(new_node_owner.level);
+                }
+            }
+            let tracked (mut auth, writer) = NodeAuth::alloc(new_node_owner);
+            proof {
+                auth.lemma_full_frac();
+            }
+            let tracked reader = auth.lend();
             let guard = PageTableGuard {
                 inner: new_page,
-                owner: Tracked(exclusive),
+                tracked_frac: Tracked(reader),
+                tracked_writer: Tracked(writer),
                 _marker: core::marker::PhantomData,
             };
 
-            // Publish the PTE only after the node is exclusively held.
+            // Publish the PTE only after the node is locked.
             let new_pte = Pte::new_pt(paddr);
             proof {
                 broadcast use Pte::group_pte_laws;

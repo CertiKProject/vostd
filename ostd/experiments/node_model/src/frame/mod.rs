@@ -7,8 +7,8 @@
 //! Under fractional ownership this layer is *much* thinner than it used to be.
 //! A `Frame<M>` is now nothing but a typed address: all of the ownership that
 //! used to be parked in a central `MetaRegionOwners` has moved into the node's
-//! own resource (`crate::node::NodeOwner`, lent out as
-//! `crate::node::NodeFrac`). Consequently:
+//! own resources (`crate::node::NodeIdentity`, shared as
+//! `crate::node::NodeFrac`, and `crate::node::NodeWriter`). Consequently:
 //!
 //! * `Frame::start_paddr` needs no permission at all, only a well-formed
 //!   address;
@@ -79,8 +79,8 @@ impl<M> Frame<M> {
 
     /// Borrows the frame's metadata.
     ///
-    /// The permission comes from the caller's `NodeOwner`/`NodeFrac`, which is
-    /// where the slot's `PointsTo` now lives.
+    /// The permission comes from the caller's `NodeFrac` (via its
+    /// `NodeIdentity`), which is where the slot's `PointsTo` now lives.
     #[verus_spec(res =>
         with Tracked(perm): Tracked<&'a PointsTo<M>>,
         requires

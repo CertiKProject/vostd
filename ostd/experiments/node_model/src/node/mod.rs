@@ -4,17 +4,16 @@
 //! `ostd::specs::mm::page_table::node`.
 //!
 //! A page table node is a frame holding `NR_ENTRIES` page table entries. There
-//! are three handle types, and under fractional ownership the distinction
-//! between them is carried *in the types*, not by a ghost lock-set:
+//! are three handle types, and the distinction between them is carried *in
+//! the types*, not by a ghost lock-set:
 //!
 //! * [`PageTableNode`] — a bare owning handle: an address and nothing else.
-//! * [`PageTableNodeRef`] — a borrowed handle that carries a [`NodeFrac`], one
-//!   **fraction** of the node's ownership. Enough to read; never enough to
-//!   write.
-//! * [`PageTableGuard`] — carries the [`NodeOwner`] **outright**, which is
-//!   only obtainable once every outstanding fraction has been returned to the
-//!   [`NodeAuth`]. This is what makes "only the guard can write a PTE" a
-//!   consequence of the ownership algebra rather than a convention.
+//! * [`PageTableNodeRef`] — a borrowed handle that carries a [`NodeFrac`], a
+//!   **reader**. Enough to read PTEs, but only up to the weak predicate
+//!   [`pte_wf`]: a writer may be changing the node concurrently.
+//! * [`PageTableGuard`] — a reader *plus* the node's unique [`NodeWriter`].
+//!   It knows the node's exact contents and may write them. Readers coexist
+//!   with it; another guard cannot.
 pub mod child;
 pub mod entry;
 pub mod entry_owners;
@@ -31,6 +30,7 @@ use core::marker::PhantomData;
 use core::sync::atomic::Ordering;
 
 use vstd::cell::pcell_maybe_uninit;
+use vstd::invariant::open_atomic_invariant;
 use vstd::prelude::*;
 
 use vstd_extra::array_ptr;
@@ -63,8 +63,8 @@ pub struct PageTablePageMeta {
 
 /// A bare owning handle to a page table node.
 ///
-/// All authority has moved into [`NodeAuth`] / [`NodeFrac`], so this is now
-/// just a typed address.
+/// All authority has moved into [`NodeAuth`] / [`NodeFrac`] / [`NodeWriter`],
+/// so this is now just a typed address.
 pub type PageTableNode = Frame<PageTablePageMeta>;
 
 impl PageTablePageMeta {
@@ -121,37 +121,36 @@ impl PageTableNode {
 }
 
 // ─── The borrowed handle ───────────────────────────────────────────────────
-/// A borrowed handle to a page table node, carrying one fraction of its
-/// ownership.
+/// A borrowed handle to a page table node, carrying one reader fraction.
 ///
 /// The real type is `FrameRef<'a, PageTablePageMeta>`, a `ManuallyDrop<Frame>`
 /// plus a lifetime. Here the lifetime is joined by the fraction, which is what
 /// actually licenses reading through the handle.
 pub struct PageTableNodeRef<'a> {
     pub inner: Frame<PageTablePageMeta>,
-    pub frac: Tracked<NodeFrac>,
+    pub tracked_frac: Tracked<NodeFrac>,
     pub _marker: PhantomData<&'a ()>,
 }
 
 impl<'a> PageTableNodeRef<'a> {
     /// The handle and the fraction name the same node.
     pub open spec fn wf(self) -> bool {
-        &&& self.inner.ptr.addr() == self.frac@@.meta_vaddr()
+        &&& self.inner.ptr.addr() == self.tracked_frac@@.meta_vaddr()
         &&& self.inner.wf_addr()
         // One reference holds exactly one fraction. This is what makes
         // "return every outstanding fraction" a statement about the number of
         // live references.
-        &&& self.frac@.frac() == 1
+        &&& self.tracked_frac@.frac() == 1
     }
 
-    /// The node this reference names.
-    pub open spec fn view(self) -> NodeOwner {
-        self.frac@@
+    /// The identity of the node this reference names.
+    pub open spec fn view(self) -> NodeIdentity {
+        self.tracked_frac@@
     }
 
     /// Which node's ownership this is a fraction of.
     pub open spec fn id(self) -> vstd::resource::Loc {
-        self.frac@.id()
+        self.tracked_frac@.id()
     }
 }
 
@@ -161,7 +160,6 @@ impl<'a> PageTableNodeRef<'a> {
     #[verus_spec(res =>
         with Tracked(frac): Tracked<NodeFrac>,
         requires
-            frac@.inv(),
             frac.frac() == 1,
             paddr == frac@.paddr(),
         ensures
@@ -174,20 +172,19 @@ impl<'a> PageTableNodeRef<'a> {
         proof {
             broadcast use group_page_meta;
 
+            frac.validate();
             lemma_index_to_frame_biinjective(frac@.slot_index);
             lemma_index_to_meta_biinjective(frac@.slot_index);
         }
         // SAFETY: the fraction is the entitlement to name this frame.
         let inner = unsafe { Frame::from_raw(paddr) };
-        PageTableNodeRef { inner, frac: Tracked(frac), _marker: PhantomData }
+        PageTableNodeRef { inner, tracked_frac: Tracked(frac), _marker: PhantomData }
     }
 
     /// Gets the level of the node.
     ///
-    /// Compare the old signature, which needed the node's owner *and* the
-    /// global region just to read one `u8`. The fraction carried by the handle
-    /// supplies both, and its type invariant supplies the well-formedness that
-    /// used to be a `meta_bridge` precondition.
+    /// The level is part of the node's immutable identity, so a reader knows
+    /// it exactly.
     #[verus_spec(res =>
         requires
             self.wf(),
@@ -195,8 +192,8 @@ impl<'a> PageTableNodeRef<'a> {
             self@.level,
     )]
     pub fn level(&self) -> PagingLevel {
-        let tracked owner = self.frac.borrow().borrow();
-        #[verus_spec(with Tracked(&owner.meta_perm))]
+        let tracked ident = self.tracked_frac.borrow().borrow();
+        #[verus_spec(with Tracked(&ident.meta_perm))]
         let meta = self.inner.meta();
         meta.level
     }
@@ -213,7 +210,7 @@ impl<'a> PageTableNodeRef<'a> {
         proof {
             broadcast use group_page_meta;
 
-            self.frac.borrow().validate();
+            self.tracked_frac.borrow().validate();
             lemma_index_to_meta_biinjective(self@.slot_index);
         }
         self.inner.start_paddr()
@@ -221,7 +218,9 @@ impl<'a> PageTableNodeRef<'a> {
 
     /// Reads a non-owning PTE at the given index.
     ///
-    /// A *fraction is enough* — this is the read half of the split.
+    /// A reader learns only that the PTE is well formed ([`pte_wf`]), not
+    /// which PTE it is: a guard elsewhere may be writing the node right now.
+    /// This is the guarantee a lock-free reader has in the real code.
     ///
     /// # Safety
     ///
@@ -231,139 +230,170 @@ impl<'a> PageTableNodeRef<'a> {
             self.wf(),
             idx < NR_ENTRIES,
         ensures
-            pte == self@.children_perm.value()[idx as int],
+            pte_wf(pte, self@.level),
     )]
     pub unsafe fn read_pte(&self, idx: usize) -> Pte {
-        let tracked owner = self.frac.borrow().borrow();
+        let tracked ident = self.tracked_frac.borrow().borrow();
         proof {
             broadcast use group_page_meta;
 
-            lemma_index_to_frame_biinjective(owner.slot_index);
-            lemma_index_to_meta_biinjective(owner.slot_index);
+            lemma_index_to_frame_biinjective(ident.slot_index);
+            lemma_index_to_meta_biinjective(ident.slot_index);
         }
         let ptr = array_ptr::ArrayPtr::<Pte, NR_ENTRIES>::from_addr(
             paddr_to_vaddr(self.inner.start_paddr()),
-        );
+        ).add(idx);
+        let pte;
         // SAFETY:
         // - The node is alive (we hold a fraction) and the index is in bounds.
         // - All PTEs are aligned and accessed only with atomic operations.
-        unsafe {
-            #[verus_spec(with Tracked(&owner.children_perm))]
-            load_pte(ptr.add(idx), Ordering::Relaxed)
-        }
+        open_atomic_invariant!(&ident.ptes => arr => {
+            pte = unsafe {
+                #[verus_spec(with Tracked(&arr.perm))]
+                load_pte(ptr, Ordering::Relaxed)
+            };
+        });
+        pte
     }
 
-    /// Locks the node, yielding exclusive ownership.
+    /// Locks the node, yielding its writer.
     ///
     /// Axiomatised, as in the real development, which had no verified spin
-    /// lock either. But the axiom is now a statement about *ownership* rather
-    /// than about a ghost set: it says the lock protocol has brought every
-    /// outstanding fraction home, so the caller may take the `NodeOwner`. The
-    /// returned guard's node is the one the fraction named.
+    /// lock either. The axiom says the lock protocol hands over the node's
+    /// unique [`NodeWriter`]; the reader fraction stays with the handle. The
+    /// guard learns the node's exact contents only through the writer, so
+    /// all the axiom promises about them is that they are settled.
     ///
-    /// See [`Self::into_guard`] for the same step done without an axiom, when
-    /// the caller actually holds the authority.
+    /// Closing this gap means storing the writer in an atomic invariant on
+    /// the lock word, as `rwlock.rs` does. See [`Self::into_guard`] for the
+    /// same step done without an axiom, when the caller holds the core.
     #[verifier::external_body]
     #[verus_spec(res =>
         requires
             self.wf(),
         ensures
             res.wf(),
-            res@ == self@,
+            res.id() == self.id(),
+            res.identity() == self@,
             res@.settled(),
+            res.inner == self.inner,
     )]
     pub fn lock<'rcu>(self) -> PageTableGuard<'rcu> where 'a: 'rcu {
         unimplemented!()
     }
 
-    /// Turns a reference into a guard by returning its fraction to the
-    /// authority and taking exclusive ownership once every fraction is home.
+    /// Turns a reference into a guard by taking the writer from the core.
     ///
-    /// **No axiom.** This is what fractional ownership actually buys: when the
-    /// caller holds the authority — as a cursor holding the whole path does —
-    /// mutual exclusion is *proved*, not assumed.
+    /// **No axiom**, and — unlike before the reader/writer split — no
+    /// requirement that the other readers come home first.
     #[verus_spec(res =>
         with Tracked(auth): Tracked<&mut NodeAuth>,
         requires
             self.wf(),
             old(auth).wf(),
             old(auth).id() == self.id(),
-            old(auth).frac() > 0,
-            // Every other fraction is already home.
-            old(auth).frac() + 1 == MAX_REFS,
-            old(auth)@ == self@,
-            old(auth)@.settled(),
+            !old(auth).is_lent_out(),
         ensures
             final(auth).wf(),
             final(auth).id() == old(auth).id(),
+            final(auth)@ == old(auth)@,
+            final(auth).frac() == old(auth).frac(),
             final(auth).is_lent_out(),
             res.wf(),
-            res@ == old(auth)@,
+            res.id() == self.id(),
+            res.identity() == self@,
             res@.settled(),
+            res.inner == self.inner,
     )]
     pub fn into_guard<'rcu>(self) -> PageTableGuard<'rcu> where 'a: 'rcu {
-        let PageTableNodeRef { inner, frac: Tracked(f), .. } = self;
+        let PageTableNodeRef { inner, tracked_frac: Tracked(f), .. } = self;
         proof {
-            auth.reclaim(f);
-            auth.lemma_full_from_frac();
+            auth.agree(&f);
         }
-        let tracked owner = auth.into_exclusive();
-        PageTableGuard { inner, owner: Tracked(owner), _marker: PhantomData }
+        let tracked w = auth.take_writer();
+        PageTableGuard {
+            inner,
+            tracked_frac: Tracked(f),
+            tracked_writer: Tracked(w),
+            _marker: PhantomData,
+        }
     }
 }
 
 // ─── The guard ─────────────────────────────────────────────────────────────
-/// A guard holding a node's ownership outright.
+/// A guard holding a reader fraction and the node's writer.
 ///
-/// Holding a `NodeOwner` rather than a fraction is precisely what permits
-/// [`Self::write_pte`]: writing needs `&mut children_perm`, and a fraction can
-/// only ever yield `&`.
+/// The writer is precisely what permits [`Self::write_pte`] and
+/// [`Self::set_nr_children`], and what lets the guard know the node's exact
+/// contents.
 pub struct PageTableGuard<'rcu> {
     pub inner: Frame<PageTablePageMeta>,
-    pub owner: Tracked<NodeOwner>,
+    pub tracked_frac: Tracked<NodeFrac>,
+    pub tracked_writer: Tracked<NodeWriter>,
     pub _marker: PhantomData<&'rcu ()>,
 }
 
 impl<'rcu> PageTableGuard<'rcu> {
     pub open spec fn wf(self) -> bool {
-        &&& self.inner.ptr.addr() == self.owner@.meta_vaddr()
+        &&& self.inner.ptr.addr() == self.tracked_frac@@.meta_vaddr()
         &&& self.inner.wf_addr()
-        &&& self.owner@.inv()
+        &&& self.tracked_frac@.frac() == 1
+        &&& self.tracked_writer@.wf_for(self.tracked_frac@@)
     }
 
-    pub open spec fn view(self) -> NodeOwner {
-        self.owner@
+    /// Which node this guard holds.
+    pub open spec fn id(self) -> vstd::resource::Loc {
+        self.tracked_frac@.id()
+    }
+
+    /// The node's immutable identity.
+    pub open spec fn identity(self) -> NodeIdentity {
+        self.tracked_frac@@
+    }
+
+    /// Everything the guard knows about the node, exactly.
+    pub open spec fn view(self) -> NodeView {
+        NodeView {
+            level: self.tracked_frac@@.level,
+            slot_index: self.tracked_frac@@.slot_index,
+            ptes: self.tracked_writer@.contents@,
+            nr_children: self.tracked_writer@.meta_own.nr_children.value(),
+            stray: self.tracked_writer@.meta_own.stray.value(),
+        }
     }
 }
 
 #[verus_verify]
 impl<'rcu> PageTableGuard<'rcu> {
-    /// Releases the guard, returning ownership to the authority and taking
-    /// back a fraction. The inverse of [`PageTableNodeRef::into_guard`].
+    /// Releases the guard, returning the writer to the core. The reader
+    /// fraction stays with the handle. The inverse of
+    /// [`PageTableNodeRef::into_guard`].
     #[verus_spec(res =>
         with Tracked(auth): Tracked<&mut NodeAuth>,
         requires
             self.wf(),
+            self@.settled(),
             old(auth).wf(),
+            old(auth).id() == self.id(),
             old(auth).is_lent_out(),
-            self@.slot_index == old(auth).slot_index(),
-            self@.level == old(auth).level(),
         ensures
             final(auth).wf(),
             final(auth).id() == old(auth).id(),
-            final(auth)@ == self@,
+            final(auth)@ == old(auth)@,
+            final(auth).frac() == old(auth).frac(),
+            !final(auth).is_lent_out(),
             res.wf(),
-            res@ == self@,
-            res.id() == final(auth).id(),
+            res.id() == self.id(),
+            res@ == self.identity(),
     )]
     pub fn unlock<'a>(self) -> PageTableNodeRef<'a> where 'rcu: 'a {
-        let PageTableGuard { inner, owner: Tracked(o), .. } = self;
+        let PageTableGuard { inner, tracked_frac: Tracked(f), tracked_writer: Tracked(w), .. } =
+            self;
         proof {
-            auth.restore(o);
-            auth.lemma_full_frac();
+            auth.agree(&f);
+            auth.put_writer(w);
         }
-        let tracked f = auth.lend();
-        PageTableNodeRef { inner, frac: Tracked(f), _marker: PhantomData }
+        PageTableNodeRef { inner, tracked_frac: Tracked(f), _marker: PhantomData }
     }
 
     /// Gets the level of the node.
@@ -374,8 +404,8 @@ impl<'rcu> PageTableGuard<'rcu> {
             self@.level,
     )]
     pub fn level(&self) -> PagingLevel {
-        let tracked owner = self.owner.borrow();
-        #[verus_spec(with Tracked(&owner.meta_perm))]
+        let tracked ident = self.tracked_frac.borrow().borrow();
+        #[verus_spec(with Tracked(&ident.meta_perm))]
         let meta = self.inner.meta();
         meta.level
     }
@@ -387,7 +417,7 @@ impl<'rcu> PageTableGuard<'rcu> {
             idx < NR_ENTRIES,
         ensures
             res.idx == idx,
-            res.pte == old(self)@.children_perm.value()[idx as int],
+            res.pte == old(self)@.ptes[idx as int],
             *res.node == *old(self),
             *final(self) == *final(res.node),
     )]
@@ -402,40 +432,37 @@ impl<'rcu> PageTableGuard<'rcu> {
         requires
             self.wf(),
         returns
-            self@.meta_own.nr_children.value(),
+            self@.nr_children,
     )]
     pub fn nr_children(&self) -> u16 {
-        let tracked owner = self.owner.borrow();
-        #[verus_spec(with Tracked(&owner.meta_perm))]
+        let tracked ident = self.tracked_frac.borrow().borrow();
+        let tracked w = self.tracked_writer.borrow();
+        #[verus_spec(with Tracked(&ident.meta_perm))]
         let meta = self.inner.meta();
-        *meta.nr_children.borrow(Tracked(&owner.meta_own.nr_children))
+        *meta.nr_children.borrow(Tracked(&w.meta_own.nr_children))
     }
 
     /// Sets the number of present PTEs in the node.
     ///
-    /// The slot's storage permission and the `PCell` permission now live in
-    /// the *same* `NodeOwner`, so this borrows two disjoint fields of one
-    /// `&mut` rather than two separate ghost arguments.
+    /// The slot's storage permission comes from the reader fraction, the
+    /// `PCell` permission from the writer.
     #[verus_spec(
         requires
             old(self).wf(),
             0 <= n <= NR_ENTRIES,
         ensures
             final(self).wf(),
-            final(self)@.meta_own.nr_children.value() == n,
-            final(self)@.meta_own.nr_children.id() == old(self)@.meta_own.nr_children.id(),
-            final(self)@.meta_own.stray == old(self)@.meta_own.stray,
-            final(self)@.meta_perm == old(self)@.meta_perm,
-            final(self)@.children_perm == old(self)@.children_perm,
-            final(self)@.level == old(self)@.level,
-            final(self)@.slot_index == old(self)@.slot_index,
+            final(self).id() == old(self).id(),
+            final(self).identity() == old(self).identity(),
+            final(self)@ == (NodeView { nr_children: n, ..old(self)@ }),
             final(self).inner == old(self).inner,
     )]
     pub fn set_nr_children(&mut self, n: u16) {
-        let tracked owner = self.owner.borrow_mut();
-        #[verus_spec(with Tracked(&owner.meta_perm))]
+        let tracked ident = self.tracked_frac.borrow().borrow();
+        let tracked w = self.tracked_writer.borrow_mut();
+        #[verus_spec(with Tracked(&ident.meta_perm))]
         let meta = self.inner.meta();
-        meta.nr_children.write(Tracked(&mut owner.meta_own.nr_children), n);
+        meta.nr_children.write(Tracked(&mut w.meta_own.nr_children), n);
     }
 
     /// Returns whether the node is detached from its parent.
@@ -443,16 +470,20 @@ impl<'rcu> PageTableGuard<'rcu> {
         requires
             self.wf(),
         returns
-            self@.meta_own.stray.value(),
+            self@.stray,
     )]
     pub fn stray(&self) -> bool {
-        let tracked owner = self.owner.borrow();
-        #[verus_spec(with Tracked(&owner.meta_perm))]
+        let tracked ident = self.tracked_frac.borrow().borrow();
+        let tracked w = self.tracked_writer.borrow();
+        #[verus_spec(with Tracked(&ident.meta_perm))]
         let meta = self.inner.meta();
-        *meta.stray.borrow(Tracked(&owner.meta_own.stray))
+        *meta.stray.borrow(Tracked(&w.meta_own.stray))
     }
 
     /// Reads a non-owning PTE at the given index.
+    ///
+    /// Unlike [`PageTableNodeRef::read_pte`], the result is *exact*: the
+    /// writer's half of the ghost variable pins the array's contents.
     ///
     /// # Safety
     ///
@@ -462,23 +493,32 @@ impl<'rcu> PageTableGuard<'rcu> {
             self.wf(),
             idx < NR_ENTRIES,
         ensures
-            pte == self@.children_perm.value()[idx as int],
+            pte == self@.ptes[idx as int],
+            pte_wf(pte, self@.level),
     )]
     pub unsafe fn read_pte(&self, idx: usize) -> Pte {
-        let tracked owner = self.owner.borrow();
+        let tracked ident = self.tracked_frac.borrow().borrow();
+        let tracked w = self.tracked_writer.borrow();
         proof {
             broadcast use group_page_meta;
 
-            lemma_index_to_frame_biinjective(owner.slot_index);
-            lemma_index_to_meta_biinjective(owner.slot_index);
+            lemma_index_to_frame_biinjective(ident.slot_index);
+            lemma_index_to_meta_biinjective(ident.slot_index);
         }
         let ptr = array_ptr::ArrayPtr::<Pte, NR_ENTRIES>::from_addr(
             paddr_to_vaddr(self.inner.start_paddr()),
-        );
-        unsafe {
-            #[verus_spec(with Tracked(&owner.children_perm))]
-            load_pte(ptr.add(idx), Ordering::Relaxed)
-        }
+        ).add(idx);
+        let pte;
+        open_atomic_invariant!(&ident.ptes => arr => {
+            proof {
+                w.contents.agree(&arr.contents);
+            }
+            pte = unsafe {
+                #[verus_spec(with Tracked(&arr.perm))]
+                load_pte(ptr, Ordering::Relaxed)
+            };
+        });
+        pte
     }
 
     /// Writes a page table entry at a given index.
@@ -492,38 +532,53 @@ impl<'rcu> PageTableGuard<'rcu> {
     ///  2. the PTE represents a valid child whose level is compatible with
     ///     this node;
     ///  3. the node takes over ownership of that child.
+    ///
+    /// Requirement 2 is partly checked: the new PTE must satisfy [`pte_wf`],
+    /// because concurrent readers are promised it.
     #[verus_spec(
         requires
             old(self).wf(),
             idx < NR_ENTRIES,
+            pte_wf(pte, old(self)@.level),
         ensures
             final(self).wf(),
-            final(self)@.level == old(self)@.level,
-            final(self)@.slot_index == old(self)@.slot_index,
-            final(self)@.meta_own == old(self)@.meta_own,
-            final(self)@.meta_perm == old(self)@.meta_perm,
-            final(self)@.children_perm.addr() == old(self)@.children_perm.addr(),
-            final(self)@.children_perm.value() == old(self)@.children_perm.value().update(
-                idx as int,
-                pte,
-            ),
+            final(self).id() == old(self).id(),
+            final(self).identity() == old(self).identity(),
+            final(self)@ == (NodeView { ptes: old(self)@.ptes.update(idx as int, pte), ..old(self)@ }),
             final(self).inner == old(self).inner,
     )]
     pub unsafe fn write_pte(&mut self, idx: usize, pte: Pte) {
-        let tracked owner = self.owner.borrow_mut();
+        let tracked ident = self.tracked_frac.borrow().borrow();
+        let tracked w = self.tracked_writer.borrow_mut();
         proof {
             broadcast use group_page_meta;
 
-            lemma_index_to_frame_biinjective(owner.slot_index);
-            lemma_index_to_meta_biinjective(owner.slot_index);
+            lemma_index_to_frame_biinjective(ident.slot_index);
+            lemma_index_to_meta_biinjective(ident.slot_index);
         }
         let ptr = array_ptr::ArrayPtr::<Pte, NR_ENTRIES>::from_addr(
             paddr_to_vaddr(self.inner.start_paddr()),
-        );
-        unsafe {
-            #[verus_spec(with Tracked(&mut owner.children_perm))]
-            store_pte(ptr.add(idx), pte, Ordering::Release)
-        }
+        ).add(idx);
+        open_atomic_invariant!(&ident.ptes => arr => {
+            let ghost old_ptes = arr.perm.value();
+            proof {
+                w.contents.update(&mut arr.contents, old_ptes.update(idx as int, pte));
+            }
+            unsafe {
+                #[verus_spec(with Tracked(&mut arr.perm))]
+                store_pte(ptr, pte, Ordering::Release)
+            };
+            proof {
+                assert forall|i: int| 0 <= i < NR_ENTRIES implies #[trigger] pte_wf(
+                    arr.perm.value()[i],
+                    ident.level,
+                ) by {
+                    if i != idx {
+                        assert(arr.perm.value()[i] == old_ptes[i]);
+                    }
+                }
+            }
+        });
     }
 }
 

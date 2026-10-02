@@ -1,44 +1,48 @@
 //! Fractional ownership of a page table node.
 //!
-//! This module is the ownership *currency* of the model. It replaces the
-//! central `MetaRegionOwners` and the `Guards` ghost lock-set with two tokens
-//! built on `vstd_extra::resource::ghost_resource::count_auth`:
+//! This module is the ownership *currency* of the model, built on
+//! `vstd_extra::resource::ghost_resource::count_auth`:
 //!
-//! * [`NodeFrac`] — a **fraction** of one node's ownership. Enough to *read*
-//!   the node (its level, its PTEs, its `nr_children`), and nothing more. A
-//!   [`PageTableNodeRef`](crate::node::PageTableNodeRef) carries one.
-//! * [`NodeAuth`] — the **authority**: the node's [`NodeOwner`] itself,
-//!   together with whatever fractions have not been lent out. Only when every
-//!   fraction has come home can the authority hand back exclusive ownership,
-//!   which is what a [`PageTableGuard`](crate::node::PageTableGuard) holds and
-//!   what permits *writing* a PTE.
+//! * [`NodeFrac`] — a **reader**: one fraction of a node's [`NodeIdentity`].
+//!   Enough to name the node, read its level, and read PTEs through the
+//!   node's atomic invariant. A [`PageTableNodeRef`](crate::node::PageTableNodeRef)
+//!   carries one, and so does a [`PageTableGuard`](crate::node::PageTableGuard).
+//! * [`NodeWriter`] — the **writer**: the unique token licensing PTE writes
+//!   and metadata updates. It coexists with readers.
+//! * [`NodeAuth`] — the **core**: the node's identity resource, every
+//!   fraction not currently lent out, and the writer while nobody holds it.
+//!
+//! The fractions count *readers*, not anything about the node's contents. The
+//! resource they agree on is the immutable [`NodeIdentity`], so a write never
+//! has to touch them.
 //!
 //! The same construction is used in production by `ostd/src/sync/rwlock.rs`
 //! (`CountResource<ReadPerm<T>, MAX_READER>`).
 //!
-//! # Invariants travel with the token
+//! # Lifetimes
 //!
-//! [`NodeFrac`] declares a `#[verifier::type_invariant]` asserting
-//! `NodeOwner::inv()` of the node it names. So [`NodeFrac::borrow`] hands back
-//! a `&NodeOwner` *already known to be well formed*, with no precondition and
-//! no region to consult. That is the substance of the change: a node's
-//! invariant is carried by the thing that refers to the node, rather than
-//! re-established from a global map at every call.
+//! A reader must not outlive its node. That is enforced by the count, not by a
+//! Rust lifetime: freeing the node would need the full fraction back in the
+//! core. The model is non-RCU — readers return their fractions explicitly —
+//! see the README's "Open issue: RCU reclamation".
+use vstd::invariant::AtomicInvariant;
 use vstd::prelude::*;
+use vstd::resource::ghost_var::GhostVarAuth;
 use vstd_extra::ownership::Inv;
 use vstd_extra::resource::ghost_resource::count_auth::*;
 
 use crate::arch::*;
 use crate::frame::mapping::*;
-use crate::node::owners::NodeOwner;
+use crate::node::owners::*;
+use crate::pte::Pte;
 
 verus! {
 
-/// The static ceiling on simultaneous references to one node.
+/// The static ceiling on simultaneous readers of one node.
 ///
-/// This is a *bound*, not a fixed arity: the authority holds every fraction it
-/// has not lent out, so the number of live references is dynamic. `rwlock.rs`
-/// uses the same `1 << 60` for `MAX_READER`.
+/// This is a *bound*, not a fixed arity: the core holds every fraction it has
+/// not lent out, so the number of live readers is dynamic. `rwlock.rs` uses
+/// the same `1 << 60` for `MAX_READER`.
 pub const MAX_REFS: usize = 1 << 60;
 
 /// The literal value of [`MAX_REFS`].
@@ -53,10 +57,10 @@ pub broadcast proof fn lemma_max_refs_value()
     assert(MAX_REFS == 1152921504606846976usize) by (compute_only);
 }
 
-// ─── The fraction ──────────────────────────────────────────────────────────
-/// A fraction of one node's ownership: enough to read, never enough to write.
+// ─── The reader ────────────────────────────────────────────────────────────
+/// A fraction of one node's identity: a reader.
 pub tracked struct NodeFrac {
-    tracked inner: Count<NodeOwner, MAX_REFS>,
+    tracked inner: Count<NodeIdentity, MAX_REFS>,
 }
 
 impl NodeFrac {
@@ -80,9 +84,9 @@ impl NodeFrac {
         self.inner.frac()
     }
 
-    /// What the node currently is. All fractions of a node agree on this; see
+    /// The node's identity. All fractions of a node agree on it; see
     /// [`Self::agree`].
-    pub closed spec fn view(self) -> NodeOwner {
+    pub closed spec fn view(self) -> NodeIdentity {
         self.inner.resource()
     }
 
@@ -98,8 +102,8 @@ impl NodeFrac {
         self.inner.bounded();
     }
 
-    /// Read access, with the node's invariant for free.
-    pub proof fn borrow(tracked &self) -> (tracked res: &NodeOwner)
+    /// Read access to the identity, with its invariant for free.
+    pub proof fn borrow(tracked &self) -> (tracked res: &NodeIdentity)
         ensures
             *res == self@,
             res.inv(),
@@ -152,53 +156,53 @@ impl NodeFrac {
     }
 }
 
-// ─── The authority ─────────────────────────────────────────────────────────
-/// A node's ownership, plus every fraction not currently lent out.
+// ─── The core ──────────────────────────────────────────────────────────────
+/// A node's identity, every reader fraction not currently lent out, and the
+/// writer whenever no guard holds it.
 ///
-/// The parent's [`EntryOwner`](crate::node::EntryOwner) holds the authority
-/// for its child node; this is what decentralises the ownership story — the
-/// tree structure carries it, instead of a flat global map.
+/// The parent's [`EntryOwner`](crate::node::EntryOwner) holds the core for its
+/// child node; this is what decentralises the ownership story — the tree
+/// structure carries it, instead of a flat global map.
 pub tracked struct NodeAuth {
-    tracked inner: CountResource<NodeOwner, MAX_REFS>,
-    /// Which node this is the authority for.
-    ///
-    /// Held separately from the resource so that the node stays *identifiable*
-    /// while it is lent out to a guard. Without this, a locked child would
-    /// make its parent's `match_pte` meaningless, because a vacant
-    /// `CountResource` has no resource to ask.
-    pub ghost slot: int,
-    /// The node's paging level, kept for the same reason.
-    pub ghost lvl: PagingLevel,
+    tracked inner: CountResource<NodeIdentity, MAX_REFS>,
+    /// The writer, parked here while no guard holds the node.
+    tracked writer: Option<NodeWriter>,
 }
 
 impl NodeAuth {
     /// An *explicit* well-formedness predicate, deliberately not a
     /// `#[verifier::type_invariant]`.
     ///
-    /// The authority is mutated in place (`lend`, `reclaim`,
-    /// `into_exclusive`), and a type invariant on a struct whose field is
-    /// mutated through `&mut self.inner` is re-checked the instant the inner
-    /// call returns — before the post-state facts needed to re-establish it
-    /// are available.
+    /// The core is mutated in place (`lend`, `reclaim`, `take_writer`), and a
+    /// type invariant on a struct whose field is mutated through
+    /// `&mut self.inner` is re-checked the instant the inner call returns —
+    /// before the post-state facts needed to re-establish it are available.
+    ///
+    /// A parked writer is always *settled*: a node is only ever released with
+    /// its `nr_children` bookkeeping in order.
     pub closed spec fn wf(self) -> bool {
         &&& self.inner.wf()
-        &&& 0 <= self.slot < max_meta_slots()
-        &&& 1 <= self.lvl <= NR_LEVELS
-        &&& !self.inner.is_resource_vacant() ==> {
-            &&& self.inner.resource().inv()
-            &&& self.inner.resource().slot_index == self.slot
-            &&& self.inner.resource().level == self.lvl
+        &&& !self.inner.is_resource_vacant()
+        &&& self.inner.resource().inv()
+        &&& self.writer matches Some(w) ==> {
+            &&& w.wf_for(self.inner.resource())
+            &&& w.settled()
         }
     }
 
-    /// The node's metadata-slot index. Meaningful even while lent out.
-    pub closed spec fn slot_index(self) -> int {
-        self.slot
+    /// The node's identity.
+    pub closed spec fn view(self) -> NodeIdentity {
+        self.inner.resource()
     }
 
-    /// The node's paging level. Meaningful even while lent out.
-    pub closed spec fn level(self) -> PagingLevel {
-        self.lvl
+    /// The node's metadata-slot index.
+    pub open spec fn slot_index(self) -> int {
+        self@.slot_index
+    }
+
+    /// The node's paging level.
+    pub open spec fn level(self) -> PagingLevel {
+        self@.level
     }
 
     /// The physical address of the node's frame — what a PTE pointing at this
@@ -216,50 +220,44 @@ impl NodeAuth {
         self.inner.id()
     }
 
+    /// The number of reader fractions still at home.
     pub closed spec fn frac(self) -> int {
         self.inner.frac()
     }
 
-    /// Every fraction is home, so exclusive ownership can be taken.
+    /// Every reader fraction is home.
     pub closed spec fn is_full(self) -> bool {
         self.inner.is_full()
     }
 
-    /// A guard currently holds the node's `NodeOwner`.
+    /// A guard currently holds the node's writer.
     pub closed spec fn is_lent_out(self) -> bool {
-        self.inner.is_resource_vacant()
+        self.writer is None
     }
 
-    pub closed spec fn view(self) -> NodeOwner {
-        self.inner.resource()
-    }
-
-    /// The node's invariant, straight from the authority — available whenever
-    /// the node is not currently lent out to a guard.
-    pub proof fn lemma_inv(self)
-        requires
-            self.wf(),
-            !self.is_lent_out(),
-        ensures
-            self@.inv(),
-            self@.slot_index == self.slot_index(),
-            self@.level == self.level(),
-            self@.paddr() == self.paddr(),
-            self@.meta_vaddr() == self.meta_vaddr(),
-    {
-    }
-
-    /// Identity facts that hold unconditionally, lent out or not.
+    /// Identity facts.
     pub proof fn lemma_identity(self)
         requires
             self.wf(),
         ensures
+            self@.inv(),
             0 <= self.slot_index() < max_meta_slots(),
             1 <= self.level() <= NR_LEVELS,
     {
     }
 
-    /// A full authority holds exactly `MAX_REFS` fractions.
+    /// A lent-out fraction names the same identity as its core.
+    pub proof fn agree(tracked &self, tracked frac: &NodeFrac)
+        requires
+            self.wf(),
+            self.id() == frac.id(),
+        ensures
+            self@ == frac@,
+    {
+        self.inner.validate_with_frac(&frac.inner);
+    }
+
+    /// A full core holds exactly `MAX_REFS` fractions.
     pub proof fn lemma_full_frac(self)
         requires
             self.wf(),
@@ -272,58 +270,42 @@ impl NodeAuth {
 
     }
 
-    /// Every fraction is home. Folding the `MAX_REFS` literal is needed because
-    /// `is_full()` is stated against the const-generic `TOTAL`.
-    pub proof fn lemma_full_from_frac(self)
-        requires
-            self.wf(),
-            self.frac() == MAX_REFS as int,
-        ensures
-            self.is_full(),
-    {
-        broadcast use lemma_max_refs_value;
-
-    }
-
-    /// A non-zero fraction means the node is actually present here, so the
-    /// carried invariant applies.
-    pub proof fn lemma_present(tracked &self)
-        requires
-            self.wf(),
-            self.frac() > 0,
-        ensures
-            !self.is_lent_out(),
-            self@.inv(),
-    {
-        if self.inner.is_resource_vacant() {
-            self.inner.lemma_resource_vacant_implies_empty();
-        }
-    }
-
-    /// Take ownership of a freshly created node.
-    pub proof fn alloc(tracked owner: NodeOwner) -> (tracked res: Self)
+    /// Pack a freshly allocated node: build its PTE invariant and its core,
+    /// and hand back the writer, so the new node starts out locked.
+    ///
+    /// Every reader fraction stays in the core.
+    pub proof fn alloc(tracked owner: NodeOwner) -> (tracked res: (Self, NodeWriter))
         requires
             owner.inv(),
+            ptes_wf(owner.children_perm.value(), owner.level),
         ensures
-            res.wf(),
-            res.is_full(),
-            res@ == owner,
-            res.slot_index() == owner.slot_index,
-            res.level() == owner.level,
+            res.0.wf(),
+            res.0.is_full(),
+            res.0.is_lent_out(),
+            res.0.slot_index() == owner.slot_index,
+            res.0.level() == owner.level,
+            res.0@.meta_perm == owner.meta_perm,
+            res.1.wf_for(res.0@),
+            res.1.meta_own == owner.meta_own,
+            res.1.contents@ == owner.children_perm.value(),
     {
         broadcast use lemma_max_refs_value;
 
-        let ghost slot = owner.slot_index;
-        let ghost lvl = owner.level;
-        let tracked inner = CountResource::alloc(owner);
-        Self { inner, slot, lvl }
+        let tracked NodeOwner { meta_perm, meta_own, children_perm, level, slot_index } = owner;
+        let tracked (auth, var) = GhostVarAuth::<Seq<Pte>>::new(children_perm.value());
+        let ghost k = PteArrayParams { addr: children_perm.addr(), level, contents_id: auth.id() };
+        let tracked arr = PteArray { perm: children_perm, contents: var };
+        let tracked ptes = AtomicInvariant::<_, _, PteArrayPred>::new(k, arr, pte_array_ns());
+        let tracked ident = NodeIdentity { meta_perm, ptes, level, slot_index };
+        let tracked writer = NodeWriter { meta_own, contents: auth };
+        (Self { inner: CountResource::alloc(ident), writer: None }, writer)
     }
 
-    /// Lend a fraction to a new reference.
+    /// Lend a reader fraction.
     pub proof fn lend(tracked &mut self) -> (tracked res: NodeFrac)
         requires
             old(self).wf(),
-            old(self).frac() > 1,
+            old(self).frac() > 0,
         ensures
             final(self).wf(),
             res.id() == final(self).id(),
@@ -332,79 +314,66 @@ impl NodeAuth {
             final(self)@ == old(self)@,
             res.frac() == 1,
             final(self).frac() == old(self).frac() - 1,
-            final(self).slot_index() == old(self).slot_index(),
-            final(self).level() == old(self).level(),
-            res@.slot_index == old(self).slot_index(),
-            res@.level == old(self).level(),
+            final(self).is_lent_out() == old(self).is_lent_out(),
     {
-        self.lemma_present();
         let tracked f = self.inner.split_one();
         NodeFrac { inner: f }
     }
 
-    /// Take a fraction back from a reference that is going away.
+    /// Take a reader fraction back.
     pub proof fn reclaim(tracked &mut self, tracked frac: NodeFrac)
         requires
             old(self).wf(),
             old(self).id() == frac.id(),
-            old(self).frac() > 0,
         ensures
             final(self).wf(),
             final(self).id() == old(self).id(),
             final(self).frac() == old(self).frac() + frac.frac(),
             final(self)@ == old(self)@,
-            final(self).slot_index() == old(self).slot_index(),
-            final(self).level() == old(self).level(),
+            final(self).is_lent_out() == old(self).is_lent_out(),
     {
-        self.lemma_present();
         use_type_invariant(&frac);
         self.inner.validate_with_frac(&frac.inner);
         let tracked NodeFrac { inner } = frac;
         self.inner.combine(inner);
     }
 
-    /// Every fraction is home: hand over exclusive ownership.
+    /// Hand the writer to a guard.
     ///
-    /// This is the only route to a [`PageTableGuard`](crate::node::PageTableGuard),
-    /// and therefore the only route to writing a PTE.
-    pub proof fn into_exclusive(tracked &mut self) -> (tracked res: NodeOwner)
+    /// Note what is *not* required: the readers need not come home. Readers
+    /// coexist with the writer; only another writer is excluded, and that by
+    /// the writer's uniqueness.
+    pub proof fn take_writer(tracked &mut self) -> (tracked res: NodeWriter)
         requires
             old(self).wf(),
-            old(self).is_full(),
+            !old(self).is_lent_out(),
         ensures
             final(self).wf(),
             final(self).is_lent_out(),
-            res == old(self)@,
-            res.inv(),
-            res.slot_index == old(self).slot_index(),
-            res.level == old(self).level(),
             final(self).id() == old(self).id(),
-            final(self).slot_index() == old(self).slot_index(),
-            final(self).level() == old(self).level(),
+            final(self)@ == old(self)@,
+            final(self).frac() == old(self).frac(),
+            res.wf_for(old(self)@),
+            res.settled(),
     {
-        broadcast use lemma_max_refs_value;
-
-        self.lemma_present();
-        self.inner.take_resource()
+        self.writer.tracked_take()
     }
 
-    /// Give exclusive ownership back when the guard is released.
-    pub proof fn restore(tracked &mut self, tracked owner: NodeOwner)
+    /// Take the writer back from a guard being released.
+    pub proof fn put_writer(tracked &mut self, tracked writer: NodeWriter)
         requires
             old(self).wf(),
             old(self).is_lent_out(),
-            owner.inv(),
-            owner.slot_index == old(self).slot_index(),
-            owner.level == old(self).level(),
+            writer.wf_for(old(self)@),
+            writer.settled(),
         ensures
             final(self).wf(),
-            final(self).is_full(),
-            final(self)@ == owner,
+            !final(self).is_lent_out(),
             final(self).id() == old(self).id(),
-            final(self).slot_index() == old(self).slot_index(),
-            final(self).level() == old(self).level(),
+            final(self)@ == old(self)@,
+            final(self).frac() == old(self).frac(),
     {
-        self.inner.put_resource(owner);
+        self.writer = Some(writer);
     }
 }
 

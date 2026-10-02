@@ -201,7 +201,7 @@ impl ChildRef<'_> {
     /// Converts a PTE to a *reference* to its child.
     ///
     /// Takes `&mut EntryOwner` because producing a reference means lending a
-    /// fraction out of the child's authority — a mutation. Under the central
+    /// reader fraction out of the child's core — a mutation. Under the central
     /// region this was a shared read of a global map; making it a mutation is
     /// the honest accounting, and it is what stops an unbounded number of
     /// references appearing from nowhere.
@@ -214,10 +214,8 @@ impl ChildRef<'_> {
         with Tracked(entry_owner): Tracked<&mut EntryOwner>,
         requires
             old(entry_owner).pte_invariants(*pte),
-            old(entry_owner).is_node() ==> {
-                &&& !old(entry_owner).node().is_lent_out()
-                &&& old(entry_owner).node().frac() > 1
-            },
+            // The child may be locked elsewhere; a reader does not care.
+            old(entry_owner).is_node() ==> old(entry_owner).node().frac() > 0,
             level == old(entry_owner).parent_level,
         ensures
             res.invariants(*final(entry_owner)),
