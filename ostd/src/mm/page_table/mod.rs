@@ -149,9 +149,21 @@ fn vaddr_range<C: PageTableConfig>() -> Range<Vaddr> {
     start..end + 1
 }
 
+/// Both addresses lie in the same half of the canonical x86-64 address space:
+/// their top 16 bits agree (`ADDRESS_WIDTH` is 48).
+pub open spec fn same_canonical_half(a: Vaddr, b: Vaddr) -> bool {
+    a >> 48 == b >> 48
+}
+
 /// Checks if the given range is covered by the valid range of the page table.
+///
+/// Every configuration in this tree manages a range inside one canonical
+/// half, so a valid non-empty range has both ends in the same half.
 #[verifier::external_body]
-fn is_valid_range<C: PageTableConfig>(r: &Range<Vaddr>) -> bool {
+fn is_valid_range<C: PageTableConfig>(r: &Range<Vaddr>) -> (res: bool)
+    ensures
+        res && r.start < r.end ==> same_canonical_half(r.start, (r.end - 1) as Vaddr),
+{
     let va_range = vaddr_range::<C>();
     (r.start == 0 && r.end == 0) || (va_range.start <= r.start && r.end - 1 <= va_range.end)
 }

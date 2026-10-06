@@ -94,8 +94,10 @@ pub proof fn lemma_page_size_next_level(level: PagingLevel)
         1 <= level <= PagingConsts::NR_LEVELS(),
     ensures
         page_size(level) > 0,
-        page_size((level + 1) as PagingLevel) == page_size(level)
-            * nr_subpage_per_huge::<PagingConsts>(),
+        page_size((level + 1) as PagingLevel) > 0,
+        page_size((level + 1) as PagingLevel) == page_size(level) * nr_subpage_per_huge::<
+            PagingConsts,
+        >(),
 {
     lemma_usize_ilog2_to32();
     // Naming the trait constants directly instantiates the impl axioms for
@@ -103,10 +105,29 @@ pub proof fn lemma_page_size_next_level(level: PagingLevel)
     assert(PagingConsts::BASE_PAGE_SIZE_spec() == 4096);
     assert(PagingConsts::PTE_SIZE_spec() == 8);
     assert(nr_subpage_per_huge::<PagingConsts>() == 512);
-    assert(4096usize << 0usize == 0x1000usize && 4096usize << 9usize == 0x200000usize
-        && 4096usize << 18usize == 0x40000000usize && 4096usize << 27usize == 0x8000000000usize
-        && 4096usize << 36usize == 0x1000000000000usize) by (bit_vector);
+    assert(4096usize << 0usize == 0x1000usize && 4096usize << 9usize == 0x200000usize && 4096usize
+        << 18usize == 0x40000000usize && 4096usize << 27usize == 0x8000000000usize && 4096usize
+        << 36usize == 0x1000000000000usize) by (bit_vector);
     assert(level == 1 || level == 2 || level == 3 || level == 4);
+}
+
+/// The page sizes of the five x86-64 levels (level 5 is the whole address
+/// space covered by one level-4 node).
+pub proof fn lemma_page_size_values()
+    ensures
+        page_size(1) == 0x1000,
+        page_size(2) == 0x20_0000,
+        page_size(3) == 0x4000_0000,
+        page_size(4) == 0x80_0000_0000,
+        page_size(5) == 0x1_0000_0000_0000,
+{
+    lemma_usize_ilog2_to32();
+    assert(PagingConsts::BASE_PAGE_SIZE_spec() == 4096);
+    assert(PagingConsts::PTE_SIZE_spec() == 8);
+    assert(nr_subpage_per_huge::<PagingConsts>() == 512);
+    assert(4096usize << 0usize == 0x1000usize && 4096usize << 9usize == 0x200000usize && 4096usize
+        << 18usize == 0x40000000usize && 4096usize << 27usize == 0x8000000000usize && 4096usize
+        << 36usize == 0x1000000000000usize) by (bit_vector);
 }
 
 pub const fn align_down(x: usize, align: usize) -> (res: usize)
@@ -115,6 +136,7 @@ pub const fn align_down(x: usize, align: usize) -> (res: usize)
     ensures
         res <= x,
         res % align == 0,
+        res == x & !((align - 1) as usize),
 {
     let res = x & !(align - 1);
     assert(res <= x) by { admit() };

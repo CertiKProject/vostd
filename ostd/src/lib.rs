@@ -26,8 +26,15 @@
 
 extern crate alloc;
 
+use vstd::prelude::*;
 use vstd_extra::prelude;
 
+verus! {
+
+// Bit-vector reasoning on `usize` needs the word width of the target.
+global size_of usize == 8;
+
+} // verus!
 //#[cfg(target_arch = "x86_64")]
 #[path = "arch/x86/mod.rs"]
 pub mod arch;

@@ -96,12 +96,20 @@ impl<C: PageTableConfig> ChildRef<'_, C> {
     #[verus_spec(
         with Tracked(regions): Tracked<&mut MetaRegionOwners>
     )]
-    pub fn from_pte(pte: &C::E, level: PagingLevel) -> Self
+    pub fn from_pte(pte: &C::E, level: PagingLevel) -> (res: Self)
         requires
-            pte.paddr() % PAGE_SIZE() == 0,
-            pte.paddr() < MAX_PADDR(),
-            !old(regions).slots.contains_key(frame_to_index(pte.paddr())),
-            old(regions).dropped_slots.contains_key(frame_to_index(pte.paddr())),
+            pte.is_present() && !pte.is_last(level) ==> {
+                &&& pte.paddr() % PAGE_SIZE() == 0
+                &&& pte.paddr() < MAX_PADDR()
+                &&& !old(regions).slots.contains_key(frame_to_index(pte.paddr()))
+                &&& old(regions).dropped_slots.contains_key(frame_to_index(pte.paddr()))
+            },
+        ensures
+            res is PageTable <==> (pte.is_present() && !pte.is_last(level)),
+            res is PageTable ==> res->PageTable_0.inner.paddr() == pte.paddr(),
+            res is PageTable ==> res->PageTable_0.inner.ptr.addr() == frame_to_meta(pte.paddr()),
+            regions.slot_owners == old(regions).slot_owners,
+            old(regions).inv() ==> regions.inv(),
     {
         if !pte.is_present() {
             return ChildRef::None;

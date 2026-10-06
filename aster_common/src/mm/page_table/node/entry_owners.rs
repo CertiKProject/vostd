@@ -4,6 +4,7 @@ use vstd::simple_pptr::PointsTo;
 use vstd_extra::array_ptr;
 
 use super::*;
+use crate::mm::frame::*;
 
 verus! {
 
@@ -34,6 +35,42 @@ impl<'rcu, C: PageTableConfig> EntryOwner<'rcu, C> {
         &&& slot_own.inv()
         &&& self.slot_perm@.value().wf(&slot_own)
         &&& self.slot_perm@.addr() == slot_own.self_addr
+    }
+
+    /// The physical address of the page-table node this owner stands for.
+    pub open spec fn paddr(self) -> Paddr {
+        meta_to_frame(self.slot_perm@.pptr().addr())
+    }
+
+    /// The level recorded in the node's metadata.
+    pub open spec fn level(self) -> PagingLevel {
+        self.node_own.meta_perm@.value().level
+    }
+
+    /// Whether the node has been detached from its parent.
+    pub open spec fn is_stray(self) -> bool {
+        self.node_own.meta_own.stray@.value()
+    }
+
+    /// The owner's slot permission agrees with the slot owner that `regions`
+    /// keeps for the node's frame.
+    pub open spec fn in_region(self, regions: MetaRegionOwners) -> bool {
+        let idx = frame_to_index(self.paddr());
+        &&& self.paddr() % PAGE_SIZE() == 0
+        &&& self.paddr() < MAX_PADDR()
+        &&& regions.slot_owners.contains_key(idx)
+        &&& self.slot_perm@.value().wf(&regions.slot_owners[idx])
+        &&& self.slot_perm@.addr() == regions.slot_owners[idx].self_addr
+    }
+
+    /// An owner that is `in_region` relates to the region's slot owner.
+    pub proof fn lemma_in_region_relates(self, regions: MetaRegionOwners)
+        requires
+            regions.inv(),
+            self.in_region(regions),
+        ensures
+            self.relate_slot_owner(&regions.slot_owners[frame_to_index(self.paddr())]),
+    {
     }
 }
 

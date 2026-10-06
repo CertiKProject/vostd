@@ -28,7 +28,10 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'rcu, C> {
     /// Returns if the entry does not map to anything.
     #[rustc_allow_incoherent_impl]
     #[verus_spec]
-    pub fn is_none(&self) -> bool {
+    pub fn is_none(&self) -> (res: bool)
+        ensures
+            res == !self.pte.is_present(),
+    {
         !self.pte.is_present()
     }
 
@@ -63,24 +66,34 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'rcu, C> {
         with Tracked(owner): Tracked<&EntryOwner<'rcu, C>>,
             Tracked(regions): Tracked<&mut MetaRegionOwners>
     )]
-    pub fn to_ref(&self) -> ChildRef<'rcu, C>
+    pub fn to_ref(&self) -> (res: ChildRef<'rcu, C>)
         requires
             self.wf(owner),
             owner.inv(),
             old(regions).inv(),
-            self.pte.paddr() == meta_to_frame(owner.slot_perm@.addr()),
-            owner.slot_perm@.value().wf(
-                &old(regions).slot_owners[frame_to_index(self.pte.paddr())],
+            owner.in_region(*old(regions)),
+            // A child page table must be a forgotten (raw) frame handle.
+            self.pte.is_present() && !self.pte.is_last(owner.level()) ==> {
+                &&& old(regions).dropped_slots.contains_key(frame_to_index(self.pte.paddr()))
+                &&& !old(regions).slots.contains_key(frame_to_index(self.pte.paddr()))
+            },
+        ensures
+            res is PageTable <==> (self.pte.is_present() && !self.pte.is_last(owner.level())),
+            res is PageTable ==> res->PageTable_0.inner.paddr() == self.pte.paddr(),
+            res is PageTable ==> res->PageTable_0.inner.ptr.addr() == frame_to_meta(
+                self.pte.paddr(),
             ),
-            old(regions).dropped_slots.contains_key(frame_to_index(self.pte.paddr())),
-            !old(regions).slots.contains_key(frame_to_index(self.pte.paddr())),
+            regions.slot_owners == old(regions).slot_owners,
+            regions.inv(),
     {
         let guard = self.node.borrow(Tracked(owner.guard_perm.borrow()));
 
-        assert(regions.slot_owners.contains_key(frame_to_index(self.pte.paddr())));
+        proof {
+            owner.lemma_in_region_relates(*regions);
+        }
 
         #[verus_spec(with Tracked(regions.slot_owners.tracked_borrow(
-            frame_to_index(meta_to_frame(owner.slot_perm@.addr())))),
+            frame_to_index(owner.paddr()))),
             Tracked(owner.slot_perm.borrow()),
             Tracked(owner.node_own.meta_perm.borrow()))]
         let level = guard.level();
@@ -210,6 +223,7 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'rcu, C> {
     #[verus_spec(
         with Tracked(owner): Tracked<&mut EntryOwner<'rcu, C>>,
             Tracked(regions): Tracked<&mut MetaRegionOwners>,
+            Tracked(owners): Tracked<&Map<Paddr, EntryOwner<'rcu, C>>>,
             Tracked(child_own): Tracked<&mut Option<EntryOwner<'rcu, C>>>
     )]
     #[verifier::external_body]
@@ -225,21 +239,29 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'rcu, C> {
         ensures
             owner.inv(),
             owner.guard_perm@.pptr() == old(owner).guard_perm@.pptr(),
-            owner.node_own.meta_perm@.value().level == old(owner).node_own.meta_perm@.value().level,
+            owner.slot_perm == old(owner).slot_perm,
+            owner.level() == old(owner).level(),
+            owner.is_stray() == old(owner).is_stray(),
             regions.inv(),
+            regions.slot_owners == old(regions).slot_owners,
             self.idx == old(self).idx,
             self.node == old(self).node,
+            // Allocation only fails if the entry is present or the node is a leaf.
+            !old(self).pte.is_present() && old(owner).level() > 1 ==> res is Some,
             res is None ==> *child_own is None && *self == *old(self),
             res is Some ==> {
                 &&& *child_own is Some
                 &&& child_own.unwrap().inv()
+                &&& child_own.unwrap().in_region(*regions)
+                // The new node is a fresh frame: nobody owns it yet.
+                &&& !owners.contains_key(child_own.unwrap().paddr())
+                &&& child_own.unwrap().paddr() != owner.paddr()
                 &&& child_own.unwrap().guard_perm@.pptr() == res.unwrap()
-                &&& !child_own.unwrap().node_own.meta_own.stray@.value()
-                &&& child_own.unwrap().node_own.meta_perm@.value().level + 1
-                    == owner.node_own.meta_perm@.value().level
+                &&& !child_own.unwrap().is_stray()
+                &&& child_own.unwrap().level() + 1 == owner.level()
                 &&& self.pte.is_present()
-                &&& !self.pte.is_last(owner.node_own.meta_perm@.value().level)
-                &&& self.pte.paddr() == meta_to_frame(child_own.unwrap().slot_perm@.pptr().addr())
+                &&& !self.pte.is_last(owner.level())
+                &&& self.pte.paddr() == child_own.unwrap().paddr()
             },
     {
         unimplemented!()/*

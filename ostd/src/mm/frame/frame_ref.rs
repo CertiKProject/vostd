@@ -4,6 +4,7 @@ use core::{marker::PhantomData, mem::ManuallyDrop, ops::Deref, ptr::NonNull};
 use vstd::prelude::*;
 
 use vstd_extra::manually_drop::*;
+use vstd_extra::ownership::*;
 
 use aster_common::prelude::frame::*;
 use aster_common::prelude::*;
@@ -26,13 +27,21 @@ impl<M: AnyFrameMeta> FrameRef<'_, M> {
     #[verus_spec(
         with Tracked(regions): Tracked<&mut MetaRegionOwners>
     )]
-    pub fn borrow_paddr(raw: Paddr) -> Self
+    pub fn borrow_paddr(raw: Paddr) -> (res: Self)
         requires
             raw % PAGE_SIZE() == 0,
             raw < MAX_PADDR(),
             !old(regions).slots.contains_key(frame_to_index(raw)),
             old(regions).dropped_slots.contains_key(frame_to_index(raw)),
+        ensures
+            res.inner.ptr.addr() == frame_to_meta(raw),
+            res.inner.paddr() == raw,
+            regions.slot_owners == old(regions).slot_owners,
+            old(regions).inv() ==> regions.inv(),
     {
+        proof {
+            lemma_paddr_to_meta_biinjective(raw);
+        }
         #[verus_spec(with Tracked(regions))]
         let frame = Frame::from_raw(raw);
         Self {

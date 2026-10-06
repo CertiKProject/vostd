@@ -102,13 +102,16 @@ impl<'rcu, C: PageTableConfig, A: InAtomicMode> Cursor<'rcu, C, A> {
     pub fn new(pt: &'rcu PageTable<C>, guard: &'rcu A, va: &Range<Vaddr>)
         -> (res: Result<Self, PageTableError>)
         requires
+            locking::config_is_x86_64::<C>(),
             old(regions).inv(),
-            locking::owners_wf(*old(owners)),
-            old(owners).contains_key(pt.root.paddr()),
+            locking::owners_wf(*old(owners), *old(regions)),
+            locking::root_owned(pt, *old(owners)),
         ensures
             regions.inv(),
-            locking::owners_wf(*owners),
-            res is Ok ==> locking::cursor_locked_at(res.unwrap(), guard, *va),
+            locking::owners_wf(*owners, *regions),
+            locking::root_owned(pt, *owners),
+            res is Ok ==> locking::cursor_locked_at(res.unwrap(), guard, *va)
+                && locking::cursor_guard_owned(res.unwrap(), *owners),
     {
         proof {
             locking::lemma_config_is_x86_64::<C>();

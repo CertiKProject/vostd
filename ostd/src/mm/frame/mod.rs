@@ -311,12 +311,21 @@ impl<'a, M: AnyFrameMeta> Frame<M> {
         with Tracked(regions) : Tracked<&mut MetaRegionOwners>
     )]
     #[rustc_allow_incoherent_impl]
-    pub fn from_raw(paddr: Paddr) -> Self
+    pub fn from_raw(paddr: Paddr) -> (res: Self)
         requires
             paddr % PAGE_SIZE() == 0,
             paddr < MAX_PADDR(),
             !old(regions).slots.contains_key(frame_to_index(paddr)),
             old(regions).dropped_slots.contains_key(frame_to_index(paddr)),
+        ensures
+            res.ptr.addr() == frame_to_meta(paddr),
+            regions.slot_owners == old(regions).slot_owners,
+            regions.slots == old(regions).slots.insert(
+                frame_to_index(paddr),
+                old(regions).dropped_slots[frame_to_index(paddr)],
+            ),
+            regions.dropped_slots == old(regions).dropped_slots.remove(frame_to_index(paddr)),
+            old(regions).inv() ==> regions.inv(),
     {
         let vaddr = frame_to_meta(paddr);
         let ptr = PPtr::from_addr(vaddr);

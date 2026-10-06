@@ -14,15 +14,20 @@
 //! The frame metadata region (`regions`) is threaded alongside, as the frame
 //! code requires.
 //!
-//! Proof obligations are discharged with `admit()` for now. The
-//! specifications record what must be proven once the proof effort starts.
+//! The only admitted facts are the four `axiom_*` lemmas below, which state
+//! what the protocol needs from the page-table memory and frame-handle models
+//! that this port does not have yet.
 use core::{marker::PhantomData, ops::Range, sync::atomic::Ordering};
 
+use vstd::arithmetic::div_mod::*;
+use vstd::arithmetic::mul::*;
+use vstd::arithmetic::power::pow;
 use vstd::prelude::*;
 use vstd::simple_pptr::*;
 
 use vstd_extra::array_ptr::*;
 use vstd_extra::ownership::*;
+use vstd_extra::prelude::lemma_usize_ilog2_to32;
 
 use aster_common::prelude::frame::*;
 use aster_common::prelude::page_table::*;
@@ -31,8 +36,9 @@ use aster_common::prelude::*;
 use crate::mm::{
     nr_subpage_per_huge, paddr_to_vaddr,
     page_table::{
-        load_pte, pte_index, pte_index_spec, ChildRef, PageTable, PageTableConfig,
-        PageTableEntryTrait, PageTableGuard, PageTableNodeRef, PagingConstsTrait, PagingLevel,
+        load_pte, pte_index, pte_index_spec, same_canonical_half, ChildRef, PageTable,
+        PageTableConfig, PageTableEntryTrait, PageTableGuard, PageTableNodeRef, PagingConstsTrait,
+        PagingLevel,
     },
     Paddr, Vaddr,
 };
@@ -57,30 +63,59 @@ pub assume_specification[ <usize>::div_ceil ](x: usize, y: usize) -> (res: usize
 // ---------------------------------------------------------------------------
 // Specification vocabulary.
 // ---------------------------------------------------------------------------
-/// Every page-table configuration verified in this tree uses the x86-64
-/// paging constants. The generic code is written against `C`, so this is the
-/// bridge between `C`'s constants and the concrete ones used by the
-/// arithmetic lemmas.
+/// The configuration uses the x86-64 paging constants. The generic code is
+/// written against `C`; every caller instantiates `C` concretely and can
+/// discharge this, so it is a precondition rather than an axiom.
+pub open spec fn config_is_x86_64<C: PageTableConfig>() -> bool {
+    &&& C::NR_LEVELS() == 4
+    &&& C::BASE_PAGE_SIZE() == 4096
+    &&& C::PTE_SIZE() == 8
+}
+
+/// The concrete constants that follow from `config_is_x86_64`.
 pub proof fn lemma_config_is_x86_64<C: PageTableConfig>()
+    requires
+        config_is_x86_64::<C>(),
     ensures
         C::NR_LEVELS() == NR_LEVELS() as PagingLevel,
         C::BASE_PAGE_SIZE() == PAGE_SIZE(),
         nr_subpage_per_huge::<C>() == nr_subpage_per_huge::<PagingConsts>(),
         nr_subpage_per_huge::<C>() == NR_ENTRIES(),
+        nr_subpage_per_huge::<C>() == 512,
         NR_LEVELS() == 4,
         NR_ENTRIES() == 512,
         PAGE_SIZE() == 4096,
         PagingConsts::NR_LEVELS() == 4,
         PagingConsts::BASE_PAGE_SIZE() == 4096,
 {
-    admit();
+    assert(PagingConsts::BASE_PAGE_SIZE_spec() == 4096);
+    assert(PagingConsts::PTE_SIZE_spec() == 8);
+    assert(PagingConsts::NR_LEVELS_spec() == 4);
+    assert(nr_subpage_per_huge::<PagingConsts>() == 512);
 }
 
-/// A range that a cursor may lock: non-empty and page aligned.
+/// `pte_index` under the x86-64 constants: nine index bits per level above
+/// the twelve page-offset bits.
+pub proof fn lemma_pte_index_x86_64<C: PageTableConfig>(va: Vaddr, level: PagingLevel)
+    requires
+        config_is_x86_64::<C>(),
+        1 <= level <= 4,
+    ensures
+        pte_index_spec::<C>(va, level) == (va >> ((12 + 9 * (level - 1)) as usize)) & 0x1ff,
+{
+    lemma_usize_ilog2_to32();
+    assert(C::BASE_PAGE_SIZE().ilog2() == 12);
+    assert(nr_subpage_per_huge::<C>() == 512);
+    assert(nr_pte_index_bits::<C>() == 9);
+}
+
+/// A range that a cursor may lock: non-empty, page aligned, and inside one
+/// canonical half of the address space.
 pub open spec fn lockable_range(va: Range<Vaddr>) -> bool {
     &&& va.start < va.end
     &&& va.start % PAGE_SIZE() == 0
     &&& va.end % PAGE_SIZE() == 0
+    &&& same_canonical_half(va.start, (va.end - 1) as Vaddr)
 }
 
 /// Both ends of `va` fall into the same slot at every level above `level`,
@@ -101,32 +136,192 @@ pub open spec fn node_start_va(va: Vaddr, level: PagingLevel) -> int {
     (va as int / node_size) * node_size
 }
 
-/// The level recorded in the metadata of the node that `own` owns.
-pub open spec fn owner_level<'rcu, C: PageTableConfig>(own: EntryOwner<'rcu, C>) -> PagingLevel {
-    own.node_own.meta_perm@.value().level
+/// Going one level down keeps the covering property when both ends of the
+/// range share the slot at the level just left.
+pub proof fn lemma_covers_descend<C: PageTableConfig>(level: PagingLevel, va: Range<Vaddr>)
+    requires
+        node_covers_range::<C>(level, va),
+        pte_index_spec::<C>(va.start, level) == pte_index_spec::<C>((va.end - 1) as Vaddr, level),
+    ensures
+        node_covers_range::<C>((level - 1) as PagingLevel, va),
+{
+    assert forall|l: PagingLevel|
+        level - 1 < l && l <= C::NR_LEVELS() implies #[trigger] pte_index_spec::<C>(va.start, l)
+        == pte_index_spec::<C>((va.end - 1) as Vaddr, l) by {
+        if l != level {
+            assert(level < l);
+        }
+    }
 }
 
-/// Whether the node that `own` owns has been detached from its parent.
-pub open spec fn owner_stray<'rcu, C: PageTableConfig>(own: EntryOwner<'rcu, C>) -> bool {
-    own.node_own.meta_own.stray@.value()
+/// `align_down` to the span of a node computes `node_start_va`.
+pub proof fn lemma_align_down_is_node_start(x: Vaddr, level: PagingLevel)
+    requires
+        1 <= level <= 4,
+    ensures
+        (x & !((page_size((level + 1) as PagingLevel) - 1) as usize)) == node_start_va(x, level),
+{
+    lemma_page_size_values();
+    if level == 1 {
+        assert((x & !0x1f_ffffusize) == (x / 0x20_0000usize) * 0x20_0000usize) by (bit_vector);
+    } else if level == 2 {
+        assert((x & !0x3fff_ffffusize) == (x / 0x4000_0000usize) * 0x4000_0000usize)
+            by (bit_vector);
+    } else if level == 3 {
+        assert((x & !0x7f_ffff_ffffusize) == (x / 0x80_0000_0000usize) * 0x80_0000_0000usize)
+            by (bit_vector);
+    } else {
+        assert((x & !0xffff_ffff_ffffusize) == (x / 0x1_0000_0000_0000usize)
+            * 0x1_0000_0000_0000usize) by (bit_vector);
+    }
 }
 
-/// The physical address of the node that `own` owns.
-pub open spec fn owner_paddr<'rcu, C: PageTableConfig>(own: EntryOwner<'rcu, C>) -> Paddr {
-    meta_to_frame(own.slot_perm@.pptr().addr())
+/// The node at `level` that contains `va.start` contains the whole range:
+/// the index bits above `level` agree, and so do the bits above the address
+/// width, hence the two ends are in the same node.
+pub proof fn lemma_covering_node_contains_range<C: PageTableConfig>(
+    level: PagingLevel,
+    va: Range<Vaddr>,
+)
+    requires
+        config_is_x86_64::<C>(),
+        1 <= level <= 4,
+        lockable_range(va),
+        node_covers_range::<C>(level, va),
+    ensures
+        node_start_va(va.start, level) <= va.start,
+        va.end <= node_start_va(va.start, level) + page_size((level + 1) as PagingLevel),
+{
+    lemma_page_size_values();
+    let s = va.start;
+    let e = (va.end - 1) as Vaddr;
+    if level < 4 {
+        lemma_pte_index_x86_64::<C>(s, 4);
+        lemma_pte_index_x86_64::<C>(e, 4);
+        assert(pte_index_spec::<C>(s, 4) == pte_index_spec::<C>(e, 4));
+    }
+    if level < 3 {
+        lemma_pte_index_x86_64::<C>(s, 3);
+        lemma_pte_index_x86_64::<C>(e, 3);
+        assert(pte_index_spec::<C>(s, 3) == pte_index_spec::<C>(e, 3));
+    }
+    if level < 2 {
+        lemma_pte_index_x86_64::<C>(s, 2);
+        lemma_pte_index_x86_64::<C>(e, 2);
+        assert(pte_index_spec::<C>(s, 2) == pte_index_spec::<C>(e, 2));
+    }
+    let n = page_size((level + 1) as PagingLevel) as int;
+    if level == 4 {
+        assert(s / 0x1_0000_0000_0000usize == e / 0x1_0000_0000_0000usize) by (bit_vector)
+            requires
+                s >> 48usize == e >> 48usize,
+        ;
+    } else if level == 3 {
+        assert(s / 0x80_0000_0000usize == e / 0x80_0000_0000usize) by (bit_vector)
+            requires
+                s >> 48usize == e >> 48usize,
+                (s >> 39usize) & 0x1ff == (e >> 39usize) & 0x1ff,
+        ;
+    } else if level == 2 {
+        assert(s / 0x4000_0000usize == e / 0x4000_0000usize) by (bit_vector)
+            requires
+                s >> 48usize == e >> 48usize,
+                (s >> 39usize) & 0x1ff == (e >> 39usize) & 0x1ff,
+                (s >> 30usize) & 0x1ff == (e >> 30usize) & 0x1ff,
+        ;
+    } else {
+        assert(s / 0x20_0000usize == e / 0x20_0000usize) by (bit_vector)
+            requires
+                s >> 48usize == e >> 48usize,
+                (s >> 39usize) & 0x1ff == (e >> 39usize) & 0x1ff,
+                (s >> 30usize) & 0x1ff == (e >> 30usize) & 0x1ff,
+                (s >> 21usize) & 0x1ff == (e >> 21usize) & 0x1ff,
+        ;
+    }
+    assert(e as int / n == s as int / n);
+    lemma_fundamental_div_mod(e as int, n);
+    lemma_fundamental_div_mod(s as int, n);
 }
 
-/// `owners` is a consistent ownership map: every owner is well formed and is
-/// filed under the physical address of the node it owns.
-pub open spec fn owners_wf<'rcu, C: PageTableConfig>(
-    owners: Map<Paddr, EntryOwner<'rcu, C>>,
-) -> bool {
-    forall|pa: Paddr| #[trigger]
-        owners.contains_key(pa) ==> owners[pa].inv() && owner_paddr(owners[pa]) == pa
+/// `i < ceil(x / s)` implies `i * s < x`.
+pub proof fn lemma_lt_ceil_div(i: int, x: int, s: int)
+    requires
+        s > 0,
+        x > 0,
+        0 <= i,
+        i < (x + s - 1) / s,
+    ensures
+        i * s < x,
+{
+    let q = (x + s - 1) / s;
+    lemma_fundamental_div_mod(x + s - 1, s);
+    lemma_mul_inequality(i, q - 1, s);
+    lemma_mul_is_distributive_sub(s, q, 1);
 }
 
-/// The owner filed under `pa` holds the permission for the guard pointer
-/// `guard`, i.e. `pa` is the node that `guard` locks.
+/// `i >= floor(y / s)` implies `(i + 1) * s > y`.
+pub proof fn lemma_ge_floor_div(i: int, y: int, s: int)
+    requires
+        s > 0,
+        y >= 0,
+        i >= y / s,
+    ensures
+        (i + 1) * s > y,
+{
+    lemma_fundamental_div_mod(y, s);
+    lemma_mul_inequality(y / s, i, s);
+    lemma_mul_is_distributive_add(s, i, 1);
+}
+
+/// The `i`-th child of the node at `cur_level` starting at `cur_node_va`
+/// starts at `cur_node_va + i * size` and is the node at `cur_level - 1`
+/// that contains every address in its span.
+pub proof fn lemma_child_node_start(cur_node_va: Vaddr, cur_level: PagingLevel, i: int, v: int)
+    requires
+        2 <= cur_level <= 4,
+        cur_node_va % page_size((cur_level + 1) as PagingLevel) == 0,
+        0 <= i < 512,
+        0 <= v <= usize::MAX,
+        cur_node_va + i * page_size(cur_level) <= v,
+        v < cur_node_va + i * page_size(cur_level) + page_size(cur_level),
+    ensures
+        node_start_va(v as Vaddr, (cur_level - 1) as PagingLevel) == cur_node_va + i * page_size(
+            cur_level,
+        ),
+{
+    lemma_page_size_next_level(cur_level);
+    let child_level = (cur_level - 1) as PagingLevel;
+    assert((child_level + 1) as PagingLevel == cur_level);
+    let s = page_size(cur_level) as int;
+    let big = page_size((cur_level + 1) as PagingLevel) as int;
+    assert(big == s * 512);
+    lemma_fundamental_div_mod(cur_node_va as int, big);
+    let k = cur_node_va as int / big;
+    assert(cur_node_va == big * k);
+    assert(cur_node_va == (k * 512) * s) by (nonlinear_arith)
+        requires
+            cur_node_va == big * k,
+            big == s * 512,
+    ;
+    let q = k * 512 + i;
+    let r = v - (cur_node_va + i * s);
+    assert(v == q * s + r) by (nonlinear_arith)
+        requires
+            cur_node_va == (k * 512) * s,
+            q == k * 512 + i,
+            r == v - (cur_node_va + i * s),
+    ;
+    lemma_fundamental_div_mod_converse(v, s, q, r);
+    assert((v / s) * s == cur_node_va + i * s) by (nonlinear_arith)
+        requires
+            v / s == q,
+            q == k * 512 + i,
+            cur_node_va == (k * 512) * s,
+    ;
+    assert(node_start_va(v as Vaddr, child_level) == (v / s) * s);
+}
+
+/// The owner is live, has the given level, and `guard` is its lock guard.
 pub open spec fn owns_guard<'rcu, C: PageTableConfig>(
     owners: Map<Paddr, EntryOwner<'rcu, C>>,
     pa: Paddr,
@@ -134,6 +329,102 @@ pub open spec fn owns_guard<'rcu, C: PageTableConfig>(
 ) -> bool {
     &&& owners.contains_key(pa)
     &&& owners[pa].guard_perm@.pptr() == guard
+}
+
+/// `owners` is a consistent ownership map: every owner is well formed, filed
+/// under the physical address of the node it owns, and agrees with the
+/// metadata region about the node's slot.
+pub open spec fn owners_wf<'rcu, C: PageTableConfig>(
+    owners: Map<Paddr, EntryOwner<'rcu, C>>,
+    regions: MetaRegionOwners,
+) -> bool {
+    forall|pa: Paddr| #[trigger]
+        owners.contains_key(pa) ==> owners[pa].inv() && owners[pa].paddr() == pa
+            && owners[pa].in_region(regions)
+}
+
+/// `owners_wf` only looks at the slot owners of the region.
+pub proof fn lemma_owners_wf_same_slot_owners<'rcu, C: PageTableConfig>(
+    owners: Map<Paddr, EntryOwner<'rcu, C>>,
+    r1: MetaRegionOwners,
+    r2: MetaRegionOwners,
+)
+    requires
+        owners_wf(owners, r1),
+        r1.slot_owners == r2.slot_owners,
+    ensures
+        owners_wf(owners, r2),
+{
+    assert forall|pa: Paddr| #[trigger] owners.contains_key(pa) implies owners[pa].inv()
+        && owners[pa].paddr() == pa && owners[pa].in_region(r2) by {
+        assert(owners[pa].in_region(r1));
+    }
+}
+
+/// Filing a well-formed owner keeps the map well formed.
+pub proof fn lemma_owners_wf_insert<'rcu, C: PageTableConfig>(
+    before: Map<Paddr, EntryOwner<'rcu, C>>,
+    regions: MetaRegionOwners,
+    pa: Paddr,
+    own: EntryOwner<'rcu, C>,
+)
+    requires
+        owners_wf(before, regions),
+        own.inv(),
+        own.paddr() == pa,
+        own.in_region(regions),
+    ensures
+        owners_wf(before.insert(pa, own), regions),
+{
+    let after = before.insert(pa, own);
+    assert forall|q: Paddr| #[trigger] after.contains_key(q) implies after[q].inv()
+        && after[q].paddr() == q && after[q].in_region(regions) by {
+        if q != pa {
+            assert(before.contains_key(q));
+        }
+    }
+}
+
+/// Taking an owner out keeps the map well formed.
+pub proof fn lemma_owners_wf_remove<'rcu, C: PageTableConfig>(
+    before: Map<Paddr, EntryOwner<'rcu, C>>,
+    regions: MetaRegionOwners,
+    pa: Paddr,
+)
+    requires
+        owners_wf(before, regions),
+    ensures
+        owners_wf(before.remove(pa), regions),
+{
+    let after = before.remove(pa);
+    assert forall|q: Paddr| #[trigger] after.contains_key(q) implies after[q].inv()
+        && after[q].paddr() == q && after[q].in_region(regions) by {
+        assert(before.contains_key(q));
+    }
+}
+
+/// An owner filed in a well-formed map relates to the region's slot owner
+/// for its frame, and its frame is a valid physical page.
+pub proof fn lemma_owner_slot<'rcu, C: PageTableConfig>(
+    owners: Map<Paddr, EntryOwner<'rcu, C>>,
+    regions: MetaRegionOwners,
+    pa: Paddr,
+)
+    requires
+        owners_wf(owners, regions),
+        regions.inv(),
+        owners.contains_key(pa),
+    ensures
+        regions.slot_owners.contains_key(frame_to_index(pa)),
+        owners[pa].relate_slot_owner(&regions.slot_owners[frame_to_index(pa)]),
+        pa % PAGE_SIZE() == 0,
+        pa < MAX_PADDR(),
+        pa < VMALLOC_BASE_VADDR() - LINEAR_MAPPING_BASE_VADDR(),
+        frame_to_meta(pa) == owners[pa].slot_perm@.pptr().addr(),
+{
+    owners[pa].lemma_in_region_relates(regions);
+    lemma_max_paddr_range();
+    lemma_meta_to_paddr_biinjective(owners[pa].slot_perm@.pptr().addr());
 }
 
 /// The owner filed under `pa` is a live (non-stray) node whose range covers
@@ -146,9 +437,9 @@ pub open spec fn covering_node_locked<'rcu, C: PageTableConfig>(
     va: Range<Vaddr>,
 ) -> bool {
     &&& owns_guard(owners, pa, guard)
-    &&& !owner_stray(owners[pa])
-    &&& 1 <= owner_level(owners[pa]) <= C::NR_LEVELS()
-    &&& node_covers_range::<C>(owner_level(owners[pa]), va)
+    &&& !owners[pa].is_stray()
+    &&& 1 <= owners[pa].level() <= C::NR_LEVELS()
+    &&& node_covers_range::<C>(owners[pa].level(), va)
 }
 
 /// What `lock_range` establishes about the cursor it returns.
@@ -168,9 +459,116 @@ pub open spec fn cursor_locked_at<'rcu, C: PageTableConfig, A: InAtomicMode>(
         0 <= i < MAX_NR_LEVELS() && i != cursor.guard_level - 1 ==> cursor.path[i] is None
 }
 
+/// The cursor's guard node is owned: a live node at the guard level whose
+/// lock guard sits in the cursor's path.
+pub open spec fn cursor_guard_owned<'rcu, C: PageTableConfig, A: InAtomicMode>(
+    cursor: Cursor<'rcu, C, A>,
+    owners: Map<Paddr, EntryOwner<'rcu, C>>,
+) -> bool {
+    exists|pa: Paddr| #[trigger]
+        owns_guard(owners, pa, cursor.path[cursor.guard_level - 1].unwrap()) && owners[pa].level()
+            == cursor.guard_level && !owners[pa].is_stray()
+}
+
+/// An upper bound on the number of frames mapped under a node at `level`:
+/// at most `u16::MAX` leaves per last-level node, 512 children per level.
+pub open spec fn max_frames(level: PagingLevel) -> int {
+    0xffff * pow(512, (level - 1) as nat)
+}
+
+pub proof fn lemma_max_frames_bounded(level: PagingLevel)
+    requires
+        1 <= level <= 4,
+    ensures
+        max_frames(1) == 0xffff,
+        0 < max_frames(level) < 0x1_0000_0000_0000,
+        level > 1 ==> 0 < max_frames((level - 1) as PagingLevel),
+        level > 1 ==> 512 * max_frames((level - 1) as PagingLevel) == max_frames(level),
+{
+    reveal_with_fuel(pow, 5);
+    assert(pow(512, 0) == 1);
+    assert(pow(512, 1) == 512);
+    assert(pow(512, 2) == 0x40000);
+    assert(pow(512, 3) == 0x8000000);
+}
+
+// ---------------------------------------------------------------------------
+// Assumptions about the page-table memory model.
+//
+// These are the facts the protocol needs from the contents of page-table
+// pages. `load_pte` reads a PTE through a raw pointer with no permission,
+// and `EntryOwner` does not yet carry a view of its node's entries, so the
+// link between a PTE read from memory and the owner of the node it points
+// to cannot be proven here. They are collected as named lemmas so that the
+// gap is explicit and localised.
+// ---------------------------------------------------------------------------
+/// A present, non-leaf entry of an owned node points to a node that is also
+/// owned, one level below the parent.
+pub proof fn axiom_pte_child_owned<'rcu, C: PageTableConfig>(
+    owners: Map<Paddr, EntryOwner<'rcu, C>>,
+    parent: EntryOwner<'rcu, C>,
+    child_pa: Paddr,
+)
+    requires
+        parent.inv(),
+    ensures
+        owners.contains_key(child_pa),
+        owners[child_pa].level() + 1 == parent.level(),
+        child_pa != parent.paddr(),
+{
+    admit();
+}
+
+/// A child of a locked, live node is live: recycling marks a sub-tree stray
+/// only while holding every lock in it.
+pub proof fn axiom_locked_child_live<'rcu, C: PageTableConfig>(
+    parent: EntryOwner<'rcu, C>,
+    child: EntryOwner<'rcu, C>,
+)
+    requires
+        !parent.is_stray(),
+    ensures
+        !child.is_stray(),
+{
+    admit();
+}
+
+/// The physical address in any entry is a valid, page-aligned frame address.
+pub proof fn axiom_pte_paddr_wf<E: PageTableEntryTrait>(pte: E)
+    ensures
+        pte.paddr() % PAGE_SIZE() == 0,
+        pte.paddr() < MAX_PADDR(),
+{
+    admit();
+}
+
+/// The frame handle of a page-table node is a forgotten (raw) handle, so
+/// `borrow_paddr` may re-create a reference to it. The frame model moves the
+/// slot permission into `slots` on every borrow and never back, so this has
+/// to be assumed each time.
+pub proof fn axiom_node_handle_raw(regions: MetaRegionOwners, pa: Paddr)
+    ensures
+        !regions.slots.contains_key(frame_to_index(pa)),
+        regions.dropped_slots.contains_key(frame_to_index(pa)),
+{
+    admit();
+}
+
 // ---------------------------------------------------------------------------
 // The protocol.
 // ---------------------------------------------------------------------------
+/// The page table's root node is owned: filed under its address, at the top
+/// level, live, and the owner's slot permission is the root frame's slot.
+pub open spec fn root_owned<'rcu, C: PageTableConfig>(
+    pt: &PageTable<C>,
+    owners: Map<Paddr, EntryOwner<'rcu, C>>,
+) -> bool {
+    &&& owners.contains_key(pt.root.paddr())
+    &&& owners[pt.root.paddr()].slot_perm@.pptr() == pt.root.ptr
+    &&& owners[pt.root.paddr()].level() == C::NR_LEVELS()
+    &&& !owners[pt.root.paddr()].is_stray()
+}
+
 /// Locks the sub-tree covering `va` and returns a cursor positioned at its
 /// start.
 ///
@@ -189,15 +587,16 @@ pub fn lock_range<'rcu, C: PageTableConfig, A: InAtomicMode>(
     va: &Range<Vaddr>,
 ) -> (cursor: Cursor<'rcu, C, A>)
     requires
+        config_is_x86_64::<C>(),
         lockable_range(*va),
         old(regions).inv(),
-        owners_wf(*old(owners)),
-        old(owners).contains_key(pt.root.paddr()),
+        owners_wf(*old(owners), *old(regions)),
+        root_owned(pt, *old(owners)),
     ensures
         cursor_locked_at(cursor, guard, *va),
-        exists|pa: Paddr| #[trigger]
-            owns_guard(*owners, pa, cursor.path[cursor.guard_level - 1].unwrap()),
-        owners_wf(*owners),
+        cursor_guard_owned(cursor, *owners),
+        owners_wf(*owners, *regions),
+        root_owned(pt, *owners),
         regions.inv(),
 {
     proof {
@@ -214,20 +613,19 @@ pub fn lock_range<'rcu, C: PageTableConfig, A: InAtomicMode>(
     loop
         invariant_except_break
             subtree_root_opt is None,
+            config_is_x86_64::<C>(),
             lockable_range(*va),
             regions.inv(),
-            owners_wf(*owners),
-            owners.contains_key(pt.root.paddr()),
+            owners_wf(*owners, *regions),
+            root_owned(pt, *owners),
         ensures
             subtree_root_opt is Some,
             subtree_root_opt matches Some(subtree_root) ==> exists|pa: Paddr| #[trigger]
                 covering_node_locked(*owners, pa, subtree_root, *va),
             regions.inv(),
-            owners_wf(*owners),
+            owners_wf(*owners, *regions),
+            root_owned(pt, *owners),
     {
-        proof {
-            lemma_config_is_x86_64::<C>();
-        }
         #[verus_spec(with Tracked(owners), Tracked(regions))]
         let found = try_traverse_and_lock_subtree_root(pt, guard, va);
         match found {
@@ -246,11 +644,13 @@ pub fn lock_range<'rcu, C: PageTableConfig, A: InAtomicMode>(
     // Once we have locked the sub-tree that is not stray, we won't read any
     // stray nodes in the following traversal since we must lock before reading.
     let ghost root_pa = choose|pa: Paddr| covering_node_locked(*owners, pa, subtree_root, *va);
+    let ghost owners0 = *owners;
+    proof {
+        lemma_owner_slot(*owners, *regions, root_pa);
+        lemma_owners_wf_remove(*owners, *regions, root_pa);
+    }
     let tracked root_own = owners.tracked_remove(root_pa);
-
-    assert(regions.slot_owners.contains_key(frame_to_index(root_pa))) by { admit() };
     let tracked slot_own = regions.slot_owners.tracked_borrow(frame_to_index(root_pa));
-    assert(root_own.relate_slot_owner(slot_own)) by { admit() };
 
     let subtree_guard = subtree_root.borrow(Tracked(root_own.guard_perm.borrow()));
     #[verus_spec(with Tracked(slot_own), Tracked(root_own.slot_perm.borrow()), Tracked(root_own.node_own.meta_perm.borrow()))]
@@ -258,24 +658,19 @@ pub fn lock_range<'rcu, C: PageTableConfig, A: InAtomicMode>(
 
     proof {
         lemma_page_size_next_level(guard_level);
+        lemma_align_down_is_node_start(va.start, guard_level);
+        lemma_covering_node_contains_range::<C>(guard_level, *va);
     }
-    assert(page_size((guard_level + 1) as PagingLevel) > 0) by { admit() };
     let cur_node_va = align_down(va.start, page_size((guard_level + 1) as PagingLevel));
-
-    // TODO: the covering node's range contains `va`, and `cur_node_va` is its
-    // start; both follow from `covering_node_locked` and `align_down`.
-    assert(cur_node_va == node_start_va(va.start, guard_level) && va.end <= cur_node_va + page_size(
-        (guard_level + 1) as PagingLevel,
-    )) by { admit() };
 
     #[verus_spec(with Tracked(&root_own), Tracked(owners), Tracked(regions))]
     dfs_acquire_lock(guard, subtree_root, cur_node_va, va.clone());
 
     proof {
+        lemma_owners_wf_insert(*owners, *regions, root_pa, root_own);
         owners.tracked_insert(root_pa, root_own);
+        assert(*owners =~= owners0);
     }
-    // TODO: the re-filed owner is well formed and filed under its own address.
-    assert(owners_wf(*owners)) by { admit() };
 
     let mut path: [Option<PPtr<PageTableGuard<'rcu, C>>>; 4] = [None, None, None, None];
     path.set(guard_level as usize - 1, Some(subtree_root));
@@ -289,8 +684,7 @@ pub fn lock_range<'rcu, C: PageTableConfig, A: InAtomicMode>(
         barrier_va: va.clone(),
         _phantom: PhantomData,
     };
-    assert(cursor_locked_at(cursor, guard, *va)) by { admit() };
-    assert(owns_guard(*owners, root_pa, subtree_root)) by { admit() };
+    assert(owns_guard(*owners, root_pa, subtree_root));
     cursor
 }
 
@@ -306,18 +700,23 @@ pub fn lock_range<'rcu, C: PageTableConfig, A: InAtomicMode>(
 )]
 pub fn unlock_range<'rcu, C: PageTableConfig, A: InAtomicMode>(cursor: &mut Cursor<'rcu, C, A>)
     requires
+        config_is_x86_64::<C>(),
         1 <= old(cursor).level <= old(cursor).guard_level <= C::NR_LEVELS(),
         old(cursor).path[old(cursor).guard_level - 1] is Some,
+        forall|i: int|
+            0 <= i < MAX_NR_LEVELS() && i != old(cursor).guard_level - 1 ==> old(
+                cursor,
+            ).path[i] is None,
         lockable_range(old(cursor).barrier_va),
-        exists|pa: Paddr| #[trigger]
-            owns_guard(*old(owners), pa, old(cursor).path[old(cursor).guard_level - 1].unwrap()),
-        owners_wf(*old(owners)),
+        node_covers_range::<C>(old(cursor).guard_level, old(cursor).barrier_va),
+        cursor_guard_owned(*old(cursor), *old(owners)),
+        owners_wf(*old(owners), *old(regions)),
         old(regions).inv(),
     ensures
         forall|i: int| 0 <= i < MAX_NR_LEVELS() ==> cursor.path[i] is None,
         cursor.guard_level == old(cursor).guard_level,
         cursor.barrier_va == old(cursor).barrier_va,
-        owners_wf(*owners),
+        owners_wf(*owners, *regions),
         regions.inv(),
 {
     proof {
@@ -338,11 +737,11 @@ pub fn unlock_range<'rcu, C: PageTableConfig, A: InAtomicMode>(cursor: &mut Curs
             cursor.path[end as int] == old(cursor).path[end as int],
             1 <= cursor.guard_level <= 4,
             forall|j: int| 0 <= j < i ==> cursor.path[j] is None,
+            forall|j: int| end < j < MAX_NR_LEVELS() ==> cursor.path[j] is None,
+            *owners == *old(owners),
+            *regions == *old(regions),
         decreases end - i,
     {
-        proof {
-            lemma_config_is_x86_64::<C>();
-        }
         cursor.path.set(i, None);
         i = i + 1;
     }
@@ -352,23 +751,21 @@ pub fn unlock_range<'rcu, C: PageTableConfig, A: InAtomicMode>(cursor: &mut Curs
     };
     cursor.path.set(end, None);
 
+    let ghost root_pa = choose|pa: Paddr| #[trigger]
+        owns_guard(*owners, pa, guard_node) && owners[pa].level() == cursor.guard_level
+            && !owners[pa].is_stray();
     proof {
+        lemma_owner_slot(*owners, *regions, root_pa);
+        lemma_owners_wf_remove(*owners, *regions, root_pa);
         lemma_page_size_next_level(cursor.guard_level);
+        lemma_align_down_is_node_start(cursor.barrier_va.start, cursor.guard_level);
+        lemma_covering_node_contains_range::<C>(cursor.guard_level, cursor.barrier_va);
     }
-    assert(page_size((cursor.guard_level + 1) as PagingLevel) > 0) by { admit() };
     let cur_node_va = align_down(
         cursor.barrier_va.start,
         page_size((cursor.guard_level + 1) as PagingLevel),
     );
-
-    let ghost root_pa = choose|pa: Paddr| owns_guard(*owners, pa, guard_node);
     let tracked root_own = owners.tracked_remove(root_pa);
-
-    // TODO: the guard node is live and covers the barrier range; this is the
-    // part of `cursor_locked_at` that the cursor must keep as its invariant.
-    assert(!owner_stray(root_own) && 1 <= owner_level(root_own) <= C::NR_LEVELS() && cur_node_va
-        == node_start_va(cursor.barrier_va.start, owner_level(root_own)) && cursor.barrier_va.end
-        <= cur_node_va + page_size((owner_level(root_own) + 1) as PagingLevel)) by { admit() };
 
     // A cursor maintains that its corresponding sub-tree is locked.
     #[verus_spec(with Tracked(&root_own), Tracked(owners), Tracked(regions))]
@@ -379,11 +776,9 @@ pub fn unlock_range<'rcu, C: PageTableConfig, A: InAtomicMode>(cursor: &mut Curs
     PageTableGuard::<'rcu, C>::unlock(guard_node);
 
     proof {
+        lemma_owners_wf_insert(*owners, *regions, root_pa, root_own);
         owners.tracked_insert(root_pa, root_own);
     }
-    // TODO: the re-filed owner is well formed and filed under its own address.
-    assert(owners_wf(*owners)) by { admit() };
-    assert(forall|i: int| 0 <= i < MAX_NR_LEVELS() ==> cursor.path[i] is None) by { admit() };
 }
 
 /// Finds and locks an intermediate page table node that covers the range.
@@ -409,14 +804,15 @@ fn try_traverse_and_lock_subtree_root<'rcu, C: PageTableConfig, A: InAtomicMode>
     va: &Range<Vaddr>,
 ) -> (res: Option<PPtr<PageTableGuard<'rcu, C>>>)
     requires
+        config_is_x86_64::<C>(),
         lockable_range(*va),
         old(regions).inv(),
-        owners_wf(*old(owners)),
-        old(owners).contains_key(pt.root.paddr()),
+        owners_wf(*old(owners), *old(regions)),
+        root_owned(pt, *old(owners)),
     ensures
         regions.inv(),
-        owners_wf(*owners),
-        owners.contains_key(pt.root.paddr()),
+        owners_wf(*owners, *regions),
+        root_owned(pt, *owners),
         res matches Some(subtree_root) ==> exists|pa: Paddr| #[trigger]
             covering_node_locked(*owners, pa, subtree_root, *va),
 {
@@ -429,35 +825,47 @@ fn try_traverse_and_lock_subtree_root<'rcu, C: PageTableConfig, A: InAtomicMode>
     // The root's address is read through the root owner's slot permission.
     let ghost root_pa = pt.root.paddr();
     let mut cur_pt_addr: Paddr = {
+        proof {
+            lemma_owner_slot(*owners, *regions, root_pa);
+        }
         let tracked root_own = owners.tracked_borrow(root_pa);
-        assert(regions.slot_owners.contains_key(frame_to_index(root_pa))) by { admit() };
         let tracked slot_own = regions.slot_owners.tracked_borrow(frame_to_index(root_pa));
-        assert(root_own.relate_slot_owner(slot_own) && root_own.slot_perm@.pptr() == pt.root.ptr)
-            by { admit() };
         #[verus_spec(with Tracked(slot_own), Tracked(root_own.slot_perm.borrow()))]
         let root_paddr = pt.root.start_paddr();
         root_paddr
     };
 
     // Walk from the top level down to level 1 (`(1..=NR_LEVELS).rev()`).
-    let mut cur_level: PagingLevel = C::NR_LEVELS();
-    while cur_level >= 1
-        invariant
-            cur_level <= C::NR_LEVELS(),
-            C::NR_LEVELS() == 4,
-            nr_subpage_per_huge::<C>() == 512,
+    // `level` is the level of the node at `cur_pt_addr`.
+    let mut level: PagingLevel = C::NR_LEVELS();
+    loop
+        invariant_except_break
+            config_is_x86_64::<C>(),
             lockable_range(*va),
+            1 <= level <= 4,
             regions.inv(),
-            owners_wf(*owners),
-            owners.contains_key(root_pa),
-            root_pa == pt.root.paddr(),
-        decreases cur_level,
+            owners_wf(*owners, *regions),
+            root_owned(pt, *owners),
+            node_covers_range::<C>(level, *va),
+            owners.contains_key(cur_pt_addr),
+            owners[cur_pt_addr].level() == level,
+            cur_node_guard matches Some(g) ==> owns_guard(*owners, cur_pt_addr, g)
+                && !owners[cur_pt_addr].is_stray(),
+        ensures
+            1 <= level <= 4,
+            regions.inv(),
+            owners_wf(*owners, *regions),
+            root_owned(pt, *owners),
+            node_covers_range::<C>(level, *va),
+            owners.contains_key(cur_pt_addr),
+            owners[cur_pt_addr].level() == level,
+            cur_node_guard matches Some(g) ==> owns_guard(*owners, cur_pt_addr, g)
+                && !owners[cur_pt_addr].is_stray(),
+        decreases level,
     {
         proof {
             lemma_config_is_x86_64::<C>();
         }
-        let level = cur_level;
-        cur_level = cur_level - 1;
 
         let start_idx = pte_index::<C>(va.start, level);
         let level_too_high = {
@@ -467,7 +875,9 @@ fn try_traverse_and_lock_subtree_root<'rcu, C: PageTableConfig, A: InAtomicMode>
         if !level_too_high {
             break;
         }
-        assert(cur_pt_addr < VMALLOC_BASE_VADDR() - LINEAR_MAPPING_BASE_VADDR()) by { admit() };
+        proof {
+            lemma_owner_slot(*owners, *regions, cur_pt_addr);
+        }
         let cur_pt_ptr = ArrayPtr::<C::E, CONST_NR_ENTRIES>::from_addr(paddr_to_vaddr(cur_pt_addr));
         // SAFETY:
         //  - The page table node is alive because (1) the root node is alive and
@@ -480,8 +890,14 @@ fn try_traverse_and_lock_subtree_root<'rcu, C: PageTableConfig, A: InAtomicMode>
             if cur_pte.is_last(level) {
                 break;
             }
+            let ghost parent_pa = cur_pt_addr;
             cur_pt_addr = cur_pte.paddr();
             cur_node_guard = None;
+            proof {
+                axiom_pte_child_owned(*owners, owners[parent_pa], cur_pt_addr);
+                lemma_covers_descend::<C>(level, *va);
+            }
+            level = level - 1;
             continue;
         }
         // In case the child is absent, we should lock and allocate a new page table node.
@@ -490,33 +906,33 @@ fn try_traverse_and_lock_subtree_root<'rcu, C: PageTableConfig, A: InAtomicMode>
         let pt_guard = match cur_node_guard {
             Some(pt_guard) => pt_guard,
             None => {
-                assert(owners.contains_key(node_pa)) by { admit() };
-                assert(node_pa % PAGE_SIZE() == 0 && node_pa < MAX_PADDR()
-                    && !regions.slots.contains_key(frame_to_index(node_pa))
-                    && regions.dropped_slots.contains_key(frame_to_index(node_pa))) by { admit() };
+                let ghost r0 = *regions;
+                proof {
+                    lemma_owner_slot(*owners, *regions, node_pa);
+                    axiom_node_handle_raw(*regions, node_pa);
+                }
                 // SAFETY: The node must be alive for at least `'rcu` since the
                 // address is read from the page table node.
                 #[verus_spec(with Tracked(regions))]
                 let node_ref = PageTableNodeRef::<'rcu, C>::borrow_paddr(node_pa);
-                // TODO: `borrow_paddr` does not yet state that it preserves the region invariant.
-                assert(regions.inv()) by { admit() };
+                proof {
+                    lemma_owners_wf_same_slot_owners(*owners, r0, *regions);
+                }
                 let tracked node_own = owners.tracked_borrow(node_pa);
-                assert(node_own.guard_perm@.value().inner.inner.ptr == node_ref.inner.ptr) by {
-                    admit()
-                };
+                assert(node_ref.inner.ptr == node_own.slot_perm@.pptr());
                 #[verus_spec(with Tracked(node_own))]
                 let locked = node_ref.lock(guard);
                 locked
             },
         };
 
-        assert(owners.contains_key(node_pa)) by { admit() };
+        let ghost owners0 = *owners;
+        proof {
+            lemma_owner_slot(*owners, *regions, node_pa);
+            lemma_owners_wf_remove(*owners, *regions, node_pa);
+        }
         let tracked mut cur_own = owners.tracked_remove(node_pa);
-        assert(regions.slot_owners.contains_key(frame_to_index(node_pa))) by { admit() };
         let tracked slot_own = regions.slot_owners.tracked_borrow(frame_to_index(node_pa));
-        assert(cur_own.guard_perm@.pptr() == pt_guard && cur_own.relate_slot_owner(slot_own)) by {
-            admit()
-        };
 
         let guard_val = pt_guard.borrow(Tracked(cur_own.guard_perm.borrow()));
         #[verus_spec(with Tracked(&cur_own), Tracked(slot_own))]
@@ -528,29 +944,35 @@ fn try_traverse_and_lock_subtree_root<'rcu, C: PageTableConfig, A: InAtomicMode>
             #[verus_spec(with Tracked(&cur_own))]
             PageTableGuard::<'rcu, C>::unlock(pt_guard);
             proof {
+                lemma_owners_wf_insert(*owners, *regions, node_pa, cur_own);
                 owners.tracked_insert(node_pa, cur_own);
+                assert(*owners == owners0);
             }
-            // TODO: the re-filed owner is well formed and filed under its own address.
-            assert(owners_wf(*owners)) by { admit() };
             return None;
         }
         #[verus_spec(with Tracked(&cur_own), Tracked(slot_own))]
         let mut cur_entry = PageTableGuard::<'rcu, C>::entry(pt_guard, start_idx);
+        proof {
+            axiom_pte_paddr_wf(cur_entry.pte);
+        }
         if cur_entry.is_none() {
-            assert(cur_entry.wf(&cur_own)) by { admit() };
             let tracked mut new_child_own: Option<EntryOwner<'rcu, C>> = None;
-            #[verus_spec(with Tracked(&mut cur_own), Tracked(regions), Tracked(&mut new_child_own))]
+            let ghost r0 = *regions;
+            #[verus_spec(with Tracked(&mut cur_own), Tracked(regions), Tracked(&*owners), Tracked(&mut new_child_own))]
             let allocated = cur_entry.alloc_if_none(guard);
+            proof {
+                lemma_owners_wf_same_slot_owners(*owners, r0, *regions);
+            }
             match allocated {
                 Some(allocated_guard) => {
                     let tracked child_own = new_child_own.tracked_unwrap();
-                    let ghost child_pa = owner_paddr(child_own);
-                    assert(regions.slot_owners.contains_key(frame_to_index(child_pa))) by { admit()
-                    };
+                    let ghost child_pa = child_own.paddr();
+                    proof {
+                        child_own.lemma_in_region_relates(*regions);
+                    }
                     let tracked child_slot_own = regions.slot_owners.tracked_borrow(
                         frame_to_index(child_pa),
                     );
-                    assert(child_own.relate_slot_owner(child_slot_own)) by { admit() };
                     let child_guard = allocated_guard.borrow(
                         Tracked(child_own.guard_perm.borrow()),
                     );
@@ -559,59 +981,56 @@ fn try_traverse_and_lock_subtree_root<'rcu, C: PageTableConfig, A: InAtomicMode>
                     cur_pt_addr = child_paddr;
                     cur_node_guard = Some(allocated_guard);
                     proof {
+                        lemma_owners_wf_insert(*owners, *regions, child_pa, child_own);
                         owners.tracked_insert(child_pa, child_own);
+                        lemma_covers_descend::<C>(level, *va);
+                        assert(child_pa != node_pa);
+                        assert(child_pa != pt.root.paddr());
                     }
-                    // TODO: the re-filed owner is well formed and filed under its own address.
-                    assert(owners_wf(*owners)) by { admit() };
+                    level = level - 1;
                 },
                 None => {
                     // `alloc_if_none` only fails if the entry is present or the
                     // node is a leaf; neither holds here (`is_none` and `level > 1`).
-                    proof {
-                        admit();
-                    }
                     unreached()
                 },
             }
         } else {
-            assert(cur_entry.wf(&cur_own)) by { admit() };
             #[verus_spec(with Tracked(&cur_own), Tracked(slot_own))]
             let is_node = cur_entry.is_node();
             if is_node {
-                // TODO: `to_ref` asks for the entry's frame bookkeeping.
-                assert(cur_entry.pte.paddr() == meta_to_frame(cur_own.slot_perm@.addr())
-                    && cur_own.slot_perm@.value().wf(
-                    &regions.slot_owners[frame_to_index(cur_entry.pte.paddr())],
-                ) && regions.dropped_slots.contains_key(frame_to_index(cur_entry.pte.paddr()))
-                    && !regions.slots.contains_key(frame_to_index(cur_entry.pte.paddr()))) by {
-                    admit()
-                };
+                let ghost r0 = *regions;
+                proof {
+                    axiom_node_handle_raw(*regions, cur_entry.pte.paddr());
+                }
                 #[verus_spec(with Tracked(&cur_own), Tracked(regions))]
                 let child_ref = cur_entry.to_ref();
-                // TODO: `to_ref` does not yet state that it preserves the region invariant.
-                assert(regions.inv()) by { admit() };
+                proof {
+                    lemma_owners_wf_same_slot_owners(*owners, r0, *regions);
+                }
                 match child_ref {
                     ChildRef::PageTable(pt_ref) => {
                         let ghost child_pa = pt_ref.inner.paddr();
-                        assert(owners.contains_key(child_pa) && regions.slot_owners.contains_key(
-                            frame_to_index(child_pa),
-                        )) by { admit() };
+                        proof {
+                            axiom_pte_child_owned(*owners, cur_own, child_pa);
+                            lemma_owner_slot(*owners, *regions, child_pa);
+                        }
                         let tracked child_own = owners.tracked_borrow(child_pa);
                         let tracked child_slot_own = regions.slot_owners.tracked_borrow(
                             frame_to_index(child_pa),
                         );
-                        assert(child_own.relate_slot_owner(child_slot_own)
-                            && child_own.slot_perm@.pptr() == pt_ref.inner.ptr) by { admit() };
+                        assert(pt_ref.inner.ptr == child_own.slot_perm@.pptr());
                         #[verus_spec(with Tracked(child_slot_own), Tracked(child_own.slot_perm.borrow()))]
                         let child_paddr = pt_ref.start_paddr();
                         cur_pt_addr = child_paddr;
                         cur_node_guard = None;
+                        proof {
+                            lemma_covers_descend::<C>(level, *va);
+                        }
+                        level = level - 1;
                     },
                     ChildRef::Frame(_, _, _) | ChildRef::None => {
                         // `is_node` guarantees a page-table child.
-                        proof {
-                            admit();
-                        }
                         unreached()
                     },
                 }
@@ -621,10 +1040,10 @@ fn try_traverse_and_lock_subtree_root<'rcu, C: PageTableConfig, A: InAtomicMode>
                 #[verus_spec(with Tracked(&cur_own))]
                 PageTableGuard::<'rcu, C>::unlock(pt_guard);
                 proof {
+                    lemma_owners_wf_insert(*owners, *regions, node_pa, cur_own);
                     owners.tracked_insert(node_pa, cur_own);
+                    assert(*owners == owners0);
                 }
-                // TODO: the re-filed owner is well formed and filed under its own address.
-                assert(owners_wf(*owners)) by { admit() };
                 break;
             }
         }
@@ -634,42 +1053,48 @@ fn try_traverse_and_lock_subtree_root<'rcu, C: PageTableConfig, A: InAtomicMode>
         #[verus_spec(with Tracked(&cur_own))]
         PageTableGuard::<'rcu, C>::unlock(pt_guard);
         proof {
+            lemma_owners_wf_insert(*owners, *regions, node_pa, cur_own);
             owners.tracked_insert(node_pa, cur_own);
+            assert(owners[node_pa] == cur_own);
+            assert(cur_pt_addr != node_pa);
+            if node_pa != pt.root.paddr() {
+                assert(owners[pt.root.paddr()] == owners0[pt.root.paddr()]);
+            }
+            assert(root_owned(pt, *owners));
         }
-        // TODO: the re-filed owner is well formed and filed under its own address.
-        assert(owners_wf(*owners)) by { admit() };
     }
 
     let node_pa = cur_pt_addr;
     let pt_guard = match cur_node_guard {
         Some(pt_guard) => pt_guard,
         None => {
-            assert(owners.contains_key(node_pa)) by { admit() };
-            assert(node_pa % PAGE_SIZE() == 0 && node_pa < MAX_PADDR()
-                && !regions.slots.contains_key(frame_to_index(node_pa))
-                && regions.dropped_slots.contains_key(frame_to_index(node_pa))) by { admit() };
+            let ghost r0 = *regions;
+            proof {
+                lemma_owner_slot(*owners, *regions, node_pa);
+                axiom_node_handle_raw(*regions, node_pa);
+            }
             // SAFETY: The node must be alive for at least `'rcu` since the
             // address is read from the page table node.
             #[verus_spec(with Tracked(regions))]
             let node_ref = PageTableNodeRef::<'rcu, C>::borrow_paddr(node_pa);
-            // TODO: `borrow_paddr` does not yet state that it preserves the region invariant.
-            assert(regions.inv()) by { admit() };
+            proof {
+                lemma_owners_wf_same_slot_owners(*owners, r0, *regions);
+            }
             let tracked node_own = owners.tracked_borrow(node_pa);
-            assert(node_own.guard_perm@.value().inner.inner.ptr == node_ref.inner.ptr) by { admit()
-            };
+            assert(node_ref.inner.ptr == node_own.slot_perm@.pptr());
             #[verus_spec(with Tracked(node_own))]
             let locked = node_ref.lock(guard);
             locked
         },
     };
 
-    assert(owners.contains_key(node_pa)) by { admit() };
+    let ghost owners0 = *owners;
+    proof {
+        lemma_owner_slot(*owners, *regions, node_pa);
+        lemma_owners_wf_remove(*owners, *regions, node_pa);
+    }
     let tracked cur_own = owners.tracked_remove(node_pa);
-    assert(regions.slot_owners.contains_key(frame_to_index(node_pa))) by { admit() };
     let tracked slot_own = regions.slot_owners.tracked_borrow(frame_to_index(node_pa));
-    assert(cur_own.guard_perm@.pptr() == pt_guard && cur_own.relate_slot_owner(slot_own)) by {
-        admit()
-    };
 
     let guard_val = pt_guard.borrow(Tracked(cur_own.guard_perm.borrow()));
     #[verus_spec(with Tracked(&cur_own), Tracked(slot_own))]
@@ -679,21 +1104,57 @@ fn try_traverse_and_lock_subtree_root<'rcu, C: PageTableConfig, A: InAtomicMode>
         #[verus_spec(with Tracked(&cur_own))]
         PageTableGuard::<'rcu, C>::unlock(pt_guard);
         proof {
+            lemma_owners_wf_insert(*owners, *regions, node_pa, cur_own);
             owners.tracked_insert(node_pa, cur_own);
+            assert(*owners == owners0);
         }
-        // TODO: the re-filed owner is well formed and filed under its own address.
-        assert(owners_wf(*owners)) by { admit() };
         return None;
     }
     proof {
+        lemma_owners_wf_insert(*owners, *regions, node_pa, cur_own);
         owners.tracked_insert(node_pa, cur_own);
+        assert(*owners == owners0);
     }
-    // TODO: the re-filed owner is well formed and filed under its own address.
-    assert(owners_wf(*owners)) by { admit() };
-    // TODO: the node reached is the covering node of `va` (every level above
-    // it put both ends of `va` in the same slot, by the loop's exit condition).
-    assert(covering_node_locked(*owners, node_pa, pt_guard, *va)) by { admit() };
+    assert(covering_node_locked(*owners, node_pa, pt_guard, *va));
     Some(pt_guard)
+}
+
+/// The arithmetic facts about the `i`-th child of the node at `cur_level`
+/// (starting at `cur_node_va`) that both DFS passes rely on, for a child
+/// index inside the range computed by `dfs_get_idx_range`.
+pub proof fn lemma_dfs_child_range(
+    cur_level: PagingLevel,
+    cur_node_va: Vaddr,
+    va_range: Range<Vaddr>,
+    i: int,
+)
+    requires
+        2 <= cur_level <= 4,
+        cur_node_va == node_start_va(va_range.start, cur_level),
+        cur_node_va <= va_range.start < va_range.end,
+        va_range.end <= cur_node_va + page_size((cur_level + 1) as PagingLevel),
+        (va_range.start - cur_node_va) / page_size(cur_level) as int <= i,
+        i < (va_range.end - cur_node_va + page_size(cur_level) - 1) / page_size(cur_level) as int,
+    ensures
+        0 <= i < 512,
+        cur_node_va + i * page_size(cur_level) < va_range.end,
+        va_range.start < cur_node_va + i * page_size(cur_level) + page_size(cur_level),
+        cur_node_va % page_size((cur_level + 1) as PagingLevel) == 0,
+{
+    lemma_page_size_next_level(cur_level);
+    let s = page_size(cur_level) as int;
+    let big = page_size((cur_level + 1) as PagingLevel) as int;
+    lemma_lt_ceil_div(i, va_range.end - cur_node_va, s);
+    lemma_ge_floor_div(i, va_range.start - cur_node_va, s);
+    assert((i + 1) * s == i * s + s) by (nonlinear_arith);
+    lemma_mod_multiples_basic(va_range.start as int / big, big);
+    // `i < 512` since `i * s < va_range.end - cur_node_va <= 512 * s`.
+    assert(i < 512) by (nonlinear_arith)
+        requires
+            s > 0,
+            i * s < big,
+            big == s * 512,
+    ;
 }
 
 /// Acquires the locks for the given range in the sub-tree rooted at the node.
@@ -718,33 +1179,33 @@ fn dfs_acquire_lock<'rcu, C: PageTableConfig, A: InAtomicMode>(
     va_range: Range<Vaddr>,
 )
     requires
+        config_is_x86_64::<C>(),
         cur_own.inv(),
         cur_own.guard_perm@.pptr() == cur_node,
-        !owner_stray(*cur_own),
-        1 <= owner_level(*cur_own) <= C::NR_LEVELS(),
-        cur_node_va == node_start_va(va_range.start, owner_level(*cur_own)),
+        !cur_own.is_stray(),
+        1 <= cur_own.level() <= 4,
+        cur_own.in_region(*old(regions)),
+        cur_node_va == node_start_va(va_range.start, cur_own.level()),
         cur_node_va <= va_range.start,
         va_range.start < va_range.end,
-        va_range.end <= cur_node_va + page_size((owner_level(*cur_own) + 1) as PagingLevel),
+        va_range.end <= cur_node_va + page_size((cur_own.level() + 1) as PagingLevel),
         old(regions).inv(),
-        owners_wf(*old(owners)),
+        owners_wf(*old(owners), *old(regions)),
     ensures
         regions.inv(),
-        owners_wf(*owners),
-    decreases owner_level(*cur_own),
+        regions.slot_owners == old(regions).slot_owners,
+        owners_wf(*owners, *regions),
+        *owners == *old(owners),
+    decreases cur_own.level(),
 {
     proof {
         lemma_config_is_x86_64::<C>();
+        cur_own.lemma_in_region_relates(*regions);
     }
 
     let cur_level = {
         let cur_guard = cur_node.borrow(Tracked(cur_own.guard_perm.borrow()));
-        assert(regions.slot_owners.contains_key(frame_to_index(owner_paddr(*cur_own)))) by { admit()
-        };
-        let tracked slot_own = regions.slot_owners.tracked_borrow(
-            frame_to_index(owner_paddr(*cur_own)),
-        );
-        assert(cur_own.relate_slot_owner(slot_own)) by { admit() };
+        let tracked slot_own = regions.slot_owners.tracked_borrow(frame_to_index(cur_own.paddr()));
         #[verus_spec(with Tracked(slot_own), Tracked(cur_own.slot_perm.borrow()), Tracked(cur_own.node_own.meta_perm.borrow()))]
         let level = cur_guard.level();
         level
@@ -753,86 +1214,95 @@ fn dfs_acquire_lock<'rcu, C: PageTableConfig, A: InAtomicMode>(
         return;
     }
     let idx_range = dfs_get_idx_range::<C>(cur_level, cur_node_va, &va_range);
+    let size = page_size(cur_level);
     let start = idx_range.start;
     let end = idx_range.end;
     let mut i = start;
     while i < end
         invariant
+            config_is_x86_64::<C>(),
             start <= i <= end,
-            end <= nr_subpage_per_huge::<C>(),
-            nr_subpage_per_huge::<C>() == 512,
-            1 < cur_level <= 4,
-            cur_level == owner_level(*cur_own),
+            end <= 512,
+            start == (va_range.start - cur_node_va) / size as int,
+            end == (va_range.end - cur_node_va + size - 1) / size as int,
+            size == page_size(cur_level),
+            2 <= cur_level <= 4,
+            cur_level == cur_own.level(),
             cur_own.inv(),
+            !cur_own.is_stray(),
             cur_own.guard_perm@.pptr() == cur_node,
+            cur_own.in_region(*old(regions)),
+            cur_node_va == node_start_va(va_range.start, cur_level),
+            cur_node_va <= va_range.start,
+            va_range.start < va_range.end,
+            va_range.end <= cur_node_va + page_size((cur_level + 1) as PagingLevel),
             regions.inv(),
-            owners_wf(*owners),
+            regions.slot_owners == old(regions).slot_owners,
+            owners_wf(*owners, *regions),
+            *owners == *old(owners),
         decreases end - i,
     {
         proof {
             lemma_config_is_x86_64::<C>();
+            cur_own.lemma_in_region_relates(*regions);
         }
-        assert(regions.slot_owners.contains_key(frame_to_index(owner_paddr(*cur_own)))) by { admit()
-        };
-        let tracked slot_own = regions.slot_owners.tracked_borrow(
-            frame_to_index(owner_paddr(*cur_own)),
-        );
-        assert(cur_own.relate_slot_owner(slot_own)) by { admit() };
+        let tracked slot_own = regions.slot_owners.tracked_borrow(frame_to_index(cur_own.paddr()));
         #[verus_spec(with Tracked(cur_own), Tracked(slot_own))]
         let child = PageTableGuard::<'rcu, C>::entry(cur_node, i);
 
-        // TODO: `to_ref` asks for the entry's frame bookkeeping.
-        assert(child.wf(cur_own) && child.pte.paddr() == meta_to_frame(cur_own.slot_perm@.addr())
-            && cur_own.slot_perm@.value().wf(
-            &regions.slot_owners[frame_to_index(child.pte.paddr())],
-        ) && regions.dropped_slots.contains_key(frame_to_index(child.pte.paddr()))
-            && !regions.slots.contains_key(frame_to_index(child.pte.paddr()))) by { admit() };
+        let ghost r0 = *regions;
+        proof {
+            axiom_pte_paddr_wf(child.pte);
+            axiom_node_handle_raw(*regions, child.pte.paddr());
+        }
         #[verus_spec(with Tracked(cur_own), Tracked(regions))]
         let child_ref = child.to_ref();
-        // TODO: `to_ref` does not yet state that it preserves the region invariant.
-        assert(regions.inv()) by { admit() };
+        proof {
+            lemma_owners_wf_same_slot_owners(*owners, r0, *regions);
+        }
         match child_ref {
             ChildRef::PageTable(pt) => {
                 let ghost child_pa = pt.inner.paddr();
-                assert(owners.contains_key(child_pa)) by { admit() };
+                proof {
+                    axiom_pte_child_owned(*owners, *cur_own, child_pa);
+                    axiom_locked_child_live(*cur_own, owners[child_pa]);
+                    lemma_owner_slot(*owners, *regions, child_pa);
+                    lemma_owners_wf_remove(*owners, *regions, child_pa);
+                }
+                let ghost owners0 = *owners;
                 let tracked child_own = owners.tracked_remove(child_pa);
-                assert(child_own.guard_perm@.value().inner.inner.ptr == pt.inner.ptr) by { admit()
-                };
+                assert(pt.inner.ptr == child_own.slot_perm@.pptr());
                 #[verus_spec(with Tracked(&child_own))]
                 let pt_guard = pt.lock(guard);
 
-                assert(i * page_size(cur_level) + page_size(cur_level) + cur_node_va <= usize::MAX)
-                    by { admit() };
-                let child_node_va = cur_node_va + i * page_size(cur_level);
-                let child_node_va_end = child_node_va + page_size(cur_level);
+                proof {
+                    lemma_dfs_child_range(cur_level, cur_node_va, va_range, i as int);
+                }
+                let child_node_va = cur_node_va + i * size;
                 let va_start = if va_range.start > child_node_va {
                     va_range.start
                 } else {
                     child_node_va
                 };
-                let va_end = if va_range.end < child_node_va_end {
+                let va_end = if va_range.end - child_node_va <= size {
                     va_range.end
                 } else {
-                    child_node_va_end
+                    child_node_va + size
                 };
+                proof {
+                    lemma_child_node_start(cur_node_va, cur_level, i as int, va_start as int);
+                }
 
-                // TODO: the child is a live node one level down whose range is
-                // `child_node_va..child_node_va_end`, and the clipped range is non-empty.
-                assert(!owner_stray(child_own) && owner_level(child_own) == cur_level - 1
-                    && child_node_va == node_start_va(va_start, owner_level(child_own)) && va_start
-                    < va_end && va_end <= child_node_va + page_size(
-                    (owner_level(child_own) + 1) as PagingLevel,
-                )) by { admit() };
                 #[verus_spec(with Tracked(&child_own), Tracked(owners), Tracked(regions))]
                 dfs_acquire_lock(guard, pt_guard, child_node_va, va_start..va_end);
 
                 // The child's guard is forgotten (`ManuallyDrop` in the original):
                 // the child stays locked until `dfs_release_lock`.
                 proof {
+                    lemma_owners_wf_insert(*owners, *regions, child_pa, child_own);
                     owners.tracked_insert(child_pa, child_own);
+                    assert(*owners =~= owners0);
                 }
-                // TODO: the re-filed owner is well formed and filed under its own address.
-                assert(owners_wf(*owners)) by { admit() };
             },
             ChildRef::None | ChildRef::Frame(_, _, _) => {},
         }
@@ -857,33 +1327,33 @@ fn dfs_release_lock<'rcu, C: PageTableConfig, A: InAtomicMode>(
     va_range: Range<Vaddr>,
 )
     requires
+        config_is_x86_64::<C>(),
         cur_own.inv(),
         cur_own.guard_perm@.pptr() == cur_node,
-        !owner_stray(*cur_own),
-        1 <= owner_level(*cur_own) <= C::NR_LEVELS(),
-        cur_node_va == node_start_va(va_range.start, owner_level(*cur_own)),
+        !cur_own.is_stray(),
+        1 <= cur_own.level() <= 4,
+        cur_own.in_region(*old(regions)),
+        cur_node_va == node_start_va(va_range.start, cur_own.level()),
         cur_node_va <= va_range.start,
         va_range.start < va_range.end,
-        va_range.end <= cur_node_va + page_size((owner_level(*cur_own) + 1) as PagingLevel),
+        va_range.end <= cur_node_va + page_size((cur_own.level() + 1) as PagingLevel),
         old(regions).inv(),
-        owners_wf(*old(owners)),
+        owners_wf(*old(owners), *old(regions)),
     ensures
         regions.inv(),
-        owners_wf(*owners),
-    decreases owner_level(*cur_own),
+        regions.slot_owners == old(regions).slot_owners,
+        owners_wf(*owners, *regions),
+        *owners == *old(owners),
+    decreases cur_own.level(),
 {
     proof {
         lemma_config_is_x86_64::<C>();
+        cur_own.lemma_in_region_relates(*regions);
     }
 
     let cur_level = {
         let cur_guard = cur_node.borrow(Tracked(cur_own.guard_perm.borrow()));
-        assert(regions.slot_owners.contains_key(frame_to_index(owner_paddr(*cur_own)))) by { admit()
-        };
-        let tracked slot_own = regions.slot_owners.tracked_borrow(
-            frame_to_index(owner_paddr(*cur_own)),
-        );
-        assert(cur_own.relate_slot_owner(slot_own)) by { admit() };
+        let tracked slot_own = regions.slot_owners.tracked_borrow(frame_to_index(cur_own.paddr()));
         #[verus_spec(with Tracked(slot_own), Tracked(cur_own.slot_perm.borrow()), Tracked(cur_own.node_own.meta_perm.borrow()))]
         let level = cur_guard.level();
         level
@@ -892,80 +1362,90 @@ fn dfs_release_lock<'rcu, C: PageTableConfig, A: InAtomicMode>(
         return;
     }
     let idx_range = dfs_get_idx_range::<C>(cur_level, cur_node_va, &va_range);
+    let size = page_size(cur_level);
     let start = idx_range.start;
     let end = idx_range.end;
     // Reverse order of acquisition.
     let mut i = end;
     while i > start
         invariant
+            config_is_x86_64::<C>(),
             start <= i <= end,
-            end <= nr_subpage_per_huge::<C>(),
-            nr_subpage_per_huge::<C>() == 512,
-            1 < cur_level <= 4,
-            cur_level == owner_level(*cur_own),
+            end <= 512,
+            start == (va_range.start - cur_node_va) / size as int,
+            end == (va_range.end - cur_node_va + size - 1) / size as int,
+            size == page_size(cur_level),
+            2 <= cur_level <= 4,
+            cur_level == cur_own.level(),
             cur_own.inv(),
+            !cur_own.is_stray(),
             cur_own.guard_perm@.pptr() == cur_node,
+            cur_own.in_region(*old(regions)),
+            cur_node_va == node_start_va(va_range.start, cur_level),
+            cur_node_va <= va_range.start,
+            va_range.start < va_range.end,
+            va_range.end <= cur_node_va + page_size((cur_level + 1) as PagingLevel),
             regions.inv(),
-            owners_wf(*owners),
+            regions.slot_owners == old(regions).slot_owners,
+            owners_wf(*owners, *regions),
+            *owners == *old(owners),
         decreases i,
     {
-        proof {
-            lemma_config_is_x86_64::<C>();
-        }
         i = i - 1;
 
-        assert(regions.slot_owners.contains_key(frame_to_index(owner_paddr(*cur_own)))) by { admit()
-        };
-        let tracked slot_own = regions.slot_owners.tracked_borrow(
-            frame_to_index(owner_paddr(*cur_own)),
-        );
-        assert(cur_own.relate_slot_owner(slot_own)) by { admit() };
+        proof {
+            lemma_config_is_x86_64::<C>();
+            cur_own.lemma_in_region_relates(*regions);
+        }
+        let tracked slot_own = regions.slot_owners.tracked_borrow(frame_to_index(cur_own.paddr()));
         #[verus_spec(with Tracked(cur_own), Tracked(slot_own))]
         let child = PageTableGuard::<'rcu, C>::entry(cur_node, i);
 
-        // TODO: `to_ref` asks for the entry's frame bookkeeping.
-        assert(child.wf(cur_own) && child.pte.paddr() == meta_to_frame(cur_own.slot_perm@.addr())
-            && cur_own.slot_perm@.value().wf(
-            &regions.slot_owners[frame_to_index(child.pte.paddr())],
-        ) && regions.dropped_slots.contains_key(frame_to_index(child.pte.paddr()))
-            && !regions.slots.contains_key(frame_to_index(child.pte.paddr()))) by { admit() };
+        let ghost r0 = *regions;
+        proof {
+            axiom_pte_paddr_wf(child.pte);
+            axiom_node_handle_raw(*regions, child.pte.paddr());
+        }
         #[verus_spec(with Tracked(cur_own), Tracked(regions))]
         let child_ref = child.to_ref();
-        // TODO: `to_ref` does not yet state that it preserves the region invariant.
-        assert(regions.inv()) by { admit() };
+        proof {
+            lemma_owners_wf_same_slot_owners(*owners, r0, *regions);
+        }
         match child_ref {
             ChildRef::PageTable(pt) => {
                 let ghost child_pa = pt.inner.paddr();
-                assert(owners.contains_key(child_pa)) by { admit() };
+                proof {
+                    axiom_pte_child_owned(*owners, *cur_own, child_pa);
+                    axiom_locked_child_live(*cur_own, owners[child_pa]);
+                    lemma_owner_slot(*owners, *regions, child_pa);
+                    lemma_owners_wf_remove(*owners, *regions, child_pa);
+                }
+                let ghost owners0 = *owners;
                 let tracked child_own = owners.tracked_remove(child_pa);
-                assert(child_own.guard_perm@.value().inner.inner.ptr == pt.inner.ptr) by { admit()
-                };
+                assert(pt.inner.ptr == child_own.slot_perm@.pptr());
                 // The node is locked (by `dfs_acquire_lock`) and its guard was
                 // forgotten, so re-creating the guard is unique.
                 #[verus_spec(with Tracked(&child_own))]
                 let child_node = pt.make_guard_unchecked(guard);
 
-                assert(i * page_size(cur_level) + page_size(cur_level) + cur_node_va <= usize::MAX)
-                    by { admit() };
-                let child_node_va = cur_node_va + i * page_size(cur_level);
-                let child_node_va_end = child_node_va + page_size(cur_level);
+                proof {
+                    lemma_dfs_child_range(cur_level, cur_node_va, va_range, i as int);
+                }
+                let child_node_va = cur_node_va + i * size;
                 let va_start = if va_range.start > child_node_va {
                     va_range.start
                 } else {
                     child_node_va
                 };
-                let va_end = if va_range.end < child_node_va_end {
+                let va_end = if va_range.end - child_node_va <= size {
                     va_range.end
                 } else {
-                    child_node_va_end
+                    child_node_va + size
                 };
+                proof {
+                    lemma_child_node_start(cur_node_va, cur_level, i as int, va_start as int);
+                }
 
-                // TODO: see `dfs_acquire_lock`.
-                assert(!owner_stray(child_own) && owner_level(child_own) == cur_level - 1
-                    && child_node_va == node_start_va(va_start, owner_level(child_own)) && va_start
-                    < va_end && va_end <= child_node_va + page_size(
-                    (owner_level(child_own) + 1) as PagingLevel,
-                )) by { admit() };
                 // All the nodes in the sub-tree are locked and all guards are forgotten.
                 #[verus_spec(with Tracked(&child_own), Tracked(owners), Tracked(regions))]
                 dfs_release_lock(guard, child_node, child_node_va, va_start..va_end);
@@ -974,10 +1454,10 @@ fn dfs_release_lock<'rcu, C: PageTableConfig, A: InAtomicMode>(
                 #[verus_spec(with Tracked(&child_own))]
                 PageTableGuard::<'rcu, C>::unlock(child_node);
                 proof {
+                    lemma_owners_wf_insert(*owners, *regions, child_pa, child_own);
                     owners.tracked_insert(child_pa, child_own);
+                    assert(*owners =~= owners0);
                 }
-                // TODO: the re-filed owner is well formed and filed under its own address.
-                assert(owners_wf(*owners)) by { admit() };
             },
             ChildRef::None | ChildRef::Frame(_, _, _) => {},
         }
@@ -1012,30 +1492,32 @@ pub fn dfs_mark_stray_and_unlock<'a, C: PageTableConfig, A: InAtomicMode>(
     sub_tree: PPtr<PageTableGuard<'a, C>>,
 ) -> (num_frames: usize)
     requires
+        config_is_x86_64::<C>(),
         old(cur_own).inv(),
         old(cur_own).guard_perm@.pptr() == sub_tree,
-        1 <= owner_level(*old(cur_own)) <= C::NR_LEVELS(),
+        1 <= old(cur_own).level() <= 4,
+        old(cur_own).in_region(*old(regions)),
         old(regions).inv(),
-        owners_wf(*old(owners)),
+        owners_wf(*old(owners), *old(regions)),
     ensures
         cur_own.inv(),
         cur_own.guard_perm@.pptr() == sub_tree,
-        owner_level(*cur_own) == owner_level(*old(cur_own)),
-        owner_stray(*cur_own),
+        cur_own.slot_perm == old(cur_own).slot_perm,
+        cur_own.level() == old(cur_own).level(),
+        cur_own.is_stray(),
+        cur_own.in_region(*regions),
+        num_frames <= max_frames(old(cur_own).level()),
         regions.inv(),
-        owners_wf(*owners),
-    decreases owner_level(*old(cur_own)),
+        regions.slot_owners == old(regions).slot_owners,
+        owners_wf(*owners, *regions),
+    decreases old(cur_own).level(),
 {
     proof {
         lemma_config_is_x86_64::<C>();
+        cur_own.lemma_in_region_relates(*regions);
     }
 
-    assert(regions.slot_owners.contains_key(frame_to_index(owner_paddr(*cur_own)))) by { admit() };
-    let tracked slot_own = regions.slot_owners.tracked_borrow(
-        frame_to_index(owner_paddr(*cur_own)),
-    );
-    assert(cur_own.relate_slot_owner(slot_own)) by { admit() };
-
+    let tracked slot_own = regions.slot_owners.tracked_borrow(frame_to_index(cur_own.paddr()));
     let sub_tree_val = sub_tree.borrow(Tracked(cur_own.guard_perm.borrow()));
     #[verus_spec(with Tracked(&*cur_own), Tracked(slot_own))]
     let stray_cell = sub_tree_val.stray_mut();
@@ -1043,6 +1525,8 @@ pub fn dfs_mark_stray_and_unlock<'a, C: PageTableConfig, A: InAtomicMode>(
         Tracked(cur_own.node_own.meta_own.stray.borrow_mut()),
         true,
     );
+    assert(cur_own.level() == old(cur_own).level());
+    assert(cur_own.inv());
 
     #[verus_spec(with Tracked(slot_own), Tracked(cur_own.slot_perm.borrow()), Tracked(cur_own.node_own.meta_perm.borrow()))]
     let level = sub_tree_val.level();
@@ -1052,7 +1536,9 @@ pub fn dfs_mark_stray_and_unlock<'a, C: PageTableConfig, A: InAtomicMode>(
         // Dropping the guard releases the lock.
         #[verus_spec(with Tracked(&*cur_own))]
         PageTableGuard::<'a, C>::unlock(sub_tree);
-        assert(cur_own.inv()) by { admit() };
+        proof {
+            lemma_max_frames_bounded(1);
+        }
         return nr_children as usize;
     }
     let mut num_frames: usize = 0;
@@ -1061,66 +1547,84 @@ pub fn dfs_mark_stray_and_unlock<'a, C: PageTableConfig, A: InAtomicMode>(
     let mut i: usize = 0;
     while i < end
         invariant
+            config_is_x86_64::<C>(),
             i <= end,
             end == 512,
             1 < level <= 4,
-            level == owner_level(*cur_own),
-            owner_level(*cur_own) == owner_level(*old(cur_own)),
+            level == cur_own.level(),
+            cur_own.level() == old(cur_own).level(),
+            cur_own.slot_perm == old(cur_own).slot_perm,
             cur_own.inv(),
             cur_own.guard_perm@.pptr() == sub_tree,
-            owner_stray(*cur_own),
+            cur_own.is_stray(),
+            cur_own.in_region(*old(regions)),
+            num_frames <= i * max_frames((level - 1) as PagingLevel),
             regions.inv(),
-            owners_wf(*owners),
+            regions.slot_owners == old(regions).slot_owners,
+            owners_wf(*owners, *regions),
         decreases end - i,
     {
         proof {
             lemma_config_is_x86_64::<C>();
+            cur_own.lemma_in_region_relates(*regions);
         }
-        assert(regions.slot_owners.contains_key(frame_to_index(owner_paddr(*cur_own)))) by { admit()
-        };
-        let tracked slot_own = regions.slot_owners.tracked_borrow(
-            frame_to_index(owner_paddr(*cur_own)),
-        );
-        assert(cur_own.relate_slot_owner(slot_own)) by { admit() };
+        let tracked slot_own = regions.slot_owners.tracked_borrow(frame_to_index(cur_own.paddr()));
         #[verus_spec(with Tracked(&*cur_own), Tracked(slot_own))]
         let child = PageTableGuard::<'a, C>::entry(sub_tree, i);
 
-        // TODO: `to_ref` asks for the entry's frame bookkeeping.
-        assert(child.wf(&*cur_own) && child.pte.paddr() == meta_to_frame(cur_own.slot_perm@.addr())
-            && cur_own.slot_perm@.value().wf(
-            &regions.slot_owners[frame_to_index(child.pte.paddr())],
-        ) && regions.dropped_slots.contains_key(frame_to_index(child.pte.paddr()))
-            && !regions.slots.contains_key(frame_to_index(child.pte.paddr()))) by { admit() };
+        let ghost r0 = *regions;
+        proof {
+            axiom_pte_paddr_wf(child.pte);
+            axiom_node_handle_raw(*regions, child.pte.paddr());
+        }
         #[verus_spec(with Tracked(&*cur_own), Tracked(regions))]
         let child_ref = child.to_ref();
-        // TODO: `to_ref` does not yet state that it preserves the region invariant.
-        assert(regions.inv()) by { admit() };
+        proof {
+            lemma_owners_wf_same_slot_owners(*owners, r0, *regions);
+        }
         match child_ref {
             ChildRef::PageTable(pt) => {
                 let ghost child_pa = pt.inner.paddr();
-                assert(owners.contains_key(child_pa)) by { admit() };
+                proof {
+                    axiom_pte_child_owned(*owners, *cur_own, child_pa);
+                    lemma_owner_slot(*owners, *regions, child_pa);
+                    lemma_owners_wf_remove(*owners, *regions, child_pa);
+                }
                 let tracked mut child_own = owners.tracked_remove(child_pa);
-                assert(child_own.guard_perm@.value().inner.inner.ptr == pt.inner.ptr) by { admit()
-                };
+                assert(pt.inner.ptr == child_own.slot_perm@.pptr());
                 // The node is locked and the new guard is unique.
                 #[verus_spec(with Tracked(&child_own))]
                 let locked_pt = pt.make_guard_unchecked(rcu_guard);
 
-                // TODO: the child is one level down.
-                assert(owner_level(child_own) == level - 1) by { admit() };
                 // All the nodes in the sub-tree are locked and all guards are forgotten.
                 #[verus_spec(with Tracked(&mut child_own), Tracked(owners), Tracked(regions))]
                 let frames_below = dfs_mark_stray_and_unlock(rcu_guard, locked_pt);
 
-                assert(num_frames + frames_below <= usize::MAX) by { admit() };
+                proof {
+                    lemma_max_frames_bounded(level);
+                    lemma_mul_inequality(i as int + 1, 512, max_frames((level - 1) as PagingLevel));
+                    lemma_mul_is_distributive_add_other_way(
+                        max_frames((level - 1) as PagingLevel),
+                        i as int,
+                        1,
+                    );
+                }
                 num_frames = num_frames + frames_below;
                 proof {
+                    lemma_owners_wf_insert(*owners, *regions, child_pa, child_own);
                     owners.tracked_insert(child_pa, child_own);
                 }
-                // TODO: the re-filed owner is well formed and filed under its own address.
-                assert(owners_wf(*owners)) by { admit() };
             },
-            ChildRef::None | ChildRef::Frame(_, _, _) => {},
+            ChildRef::None | ChildRef::Frame(_, _, _) => {
+                proof {
+                    lemma_max_frames_bounded(level);
+                    lemma_mul_inequality(
+                        i as int,
+                        i as int + 1,
+                        max_frames((level - 1) as PagingLevel),
+                    );
+                }
+            },
         }
         i = i + 1;
     }
@@ -1129,6 +1633,9 @@ pub fn dfs_mark_stray_and_unlock<'a, C: PageTableConfig, A: InAtomicMode>(
     #[verus_spec(with Tracked(&*cur_own))]
     PageTableGuard::<'a, C>::unlock(sub_tree);
 
+    proof {
+        lemma_max_frames_bounded(level);
+    }
     num_frames
 }
 
@@ -1148,6 +1655,10 @@ fn dfs_get_idx_range<C: PagingConstsTrait>(
         va_range.start < va_range.end,
         va_range.end <= cur_node_va + page_size((cur_node_level + 1) as PagingLevel),
     ensures
+        res.start == (va_range.start - cur_node_va) / page_size(cur_node_level) as int,
+        res.end == (va_range.end - cur_node_va + page_size(cur_node_level) - 1) / page_size(
+            cur_node_level,
+        ) as int,
         res.start < res.end,
         res.end <= nr_subpage_per_huge::<C>(),
 {
