@@ -35,16 +35,17 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'rcu, C> {
     /// Returns if the entry maps to a page table node.
     #[rustc_allow_incoherent_impl]
     #[verus_spec(
-        with Tracked(owner) : Tracked<EntryOwner<C>>,
-            Tracked(slot_own) : Tracked<&MetaSlotOwner>,
-            Tracked(inner_perm) : Tracked<vstd_extra::cast_ptr::PointsTo<MetaSlotStorage, PageTablePageMeta<C>>>
+        with Tracked(owner) : Tracked<&EntryOwner<'rcu, C>>,
+            Tracked(slot_own) : Tracked<&MetaSlotOwner>
     )]
     #[verusfmt::skip]
-    pub fn is_node(&self) -> bool
+    pub fn is_node(&self) -> (res: bool)
         requires
             owner.inv(),
-            self.wf(&owner),
+            self.wf(owner),
             owner.relate_slot_owner(slot_own),
+        ensures
+            res == (self.pte.is_present() && !self.pte.is_last(owner.node_own.meta_perm@.value().level)),
     {
         let guard = self.node.borrow(Tracked(owner.guard_perm.borrow()));
 
@@ -59,12 +60,12 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'rcu, C> {
     /// Gets a reference to the child.
     #[rustc_allow_incoherent_impl]
     #[verus_spec(
-        with Tracked(owner): Tracked<EntryOwner<C>>,
+        with Tracked(owner): Tracked<&EntryOwner<'rcu, C>>,
             Tracked(regions): Tracked<&mut MetaRegionOwners>
     )]
     pub fn to_ref(&self) -> ChildRef<'rcu, C>
         requires
-            self.wf(&owner),
+            self.wf(owner),
             owner.inv(),
             old(regions).inv(),
             self.pte.paddr() == meta_to_frame(owner.slot_perm@.addr()),
@@ -106,7 +107,7 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'rcu, C> {
             op.requires((old(self).pte.prop(),)),
     {
         if !self.pte.is_present() {
-            return ;
+            return;
         }
         let prop = self.pte.prop();
         let new_prop = op(prop);
@@ -203,11 +204,44 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'rcu, C> {
     ///
     /// If the old entry is not none, the operation will fail and return `None`.
     /// Otherwise, the lock guard of the new child page table node is returned.
+    ///
+    /// The owner of the new node is handed back through `child_own`; it is
+    /// the caller's job to file it in its ownership map.
+    #[verus_spec(
+        with Tracked(owner): Tracked<&mut EntryOwner<'rcu, C>>,
+            Tracked(regions): Tracked<&mut MetaRegionOwners>,
+            Tracked(child_own): Tracked<&mut Option<EntryOwner<'rcu, C>>>
+    )]
     #[verifier::external_body]
     #[rustc_allow_incoherent_impl]
     #[verusfmt::skip]
     pub fn alloc_if_none<A: InAtomicMode>(&mut self, guard: &'rcu A)
-        -> Option<PPtr<PageTableGuard<'rcu, C>>> {
+        -> (res: Option<PPtr<PageTableGuard<'rcu, C>>>)
+        requires
+            old(owner).inv(),
+            old(self).wf(old(owner)),
+            old(regions).inv(),
+            *old(child_own) is None,
+        ensures
+            owner.inv(),
+            owner.guard_perm@.pptr() == old(owner).guard_perm@.pptr(),
+            owner.node_own.meta_perm@.value().level == old(owner).node_own.meta_perm@.value().level,
+            regions.inv(),
+            self.idx == old(self).idx,
+            self.node == old(self).node,
+            res is None ==> *child_own is None && *self == *old(self),
+            res is Some ==> {
+                &&& *child_own is Some
+                &&& child_own.unwrap().inv()
+                &&& child_own.unwrap().guard_perm@.pptr() == res.unwrap()
+                &&& !child_own.unwrap().node_own.meta_own.stray@.value()
+                &&& child_own.unwrap().node_own.meta_perm@.value().level + 1
+                    == owner.node_own.meta_perm@.value().level
+                &&& self.pte.is_present()
+                &&& !self.pte.is_last(owner.node_own.meta_perm@.value().level)
+                &&& self.pte.paddr() == meta_to_frame(child_own.unwrap().slot_perm@.pptr().addr())
+            },
+    {
         unimplemented!()/*
         if !(self.is_none() && self.node.level() > 1) {
             return None;
@@ -302,17 +336,20 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'rcu, C> {
     /// The caller must ensure that the index is within the bounds of the node.
     #[rustc_allow_incoherent_impl]
     #[verus_spec(
-        with Tracked(owner) : Tracked<EntryOwner<C>>,
+        with Tracked(owner) : Tracked<&EntryOwner<'rcu, C>>,
             Tracked(slot_own) : Tracked<&MetaSlotOwner>
     )]
     #[verifier::external_body]
-    pub fn new_at(guard: PPtr<PageTableGuard<'rcu, C>>, idx: usize) -> Self
+    pub fn new_at(guard: PPtr<PageTableGuard<'rcu, C>>, idx: usize) -> (res: Self)
         requires
             owner.inv(),
             owner.guard_perm@.pptr() == guard,
+        ensures
+            res.idx == idx,
+            res.node == guard,
     {
         // SAFETY: The index is within the bound.
-        #[verus_spec(with Tracked(owner.node_own), Tracked(slot_own), Tracked(owner.slot_perm.borrow()))]
+        #[verus_spec(with Tracked(&owner.node_own), Tracked(slot_own), Tracked(owner.slot_perm.borrow()))]
         let pte = guard.borrow(Tracked(owner.guard_perm.borrow())).read_pte(idx);
         Self { pte, idx, node: guard }
     }

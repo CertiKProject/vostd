@@ -33,7 +33,7 @@ use vstd::simple_pptr::*;
 
 use vstd_extra::ownership::*;
 
-use aster_common::prelude::frame::{Frame, MetaSlotOwner};
+use aster_common::prelude::frame::{Frame, MetaRegionOwners, MetaSlotOwner};
 use aster_common::prelude::page_table::*;
 use aster_common::prelude::*;
 
@@ -89,13 +89,30 @@ impl<'rcu, C: PageTableConfig, A: InAtomicMode> Cursor<'rcu, C, A> {
     /// The cursor created will only be able to query or jump within the given
     /// range. Out-of-bound accesses will result in panics or errors as return values,
     /// depending on the access method.
+    ///
+    /// `owners` holds the owners of the page-table nodes the cursor may lock,
+    /// keyed by physical address (see [`locking`]).
     #[rustc_allow_incoherent_impl]
     #[verus_spec(
-        with Tracked(pt_own): Tracked<&mut PageTableOwner<C>>
+        with Tracked(pt_own): Tracked<&mut PageTableOwner<'rcu, C>>,
+            Tracked(owners): Tracked<&mut Map<Paddr, EntryOwner<'rcu, C>>>,
+            Tracked(regions): Tracked<&mut MetaRegionOwners>
     )]
     #[verusfmt::skip]
     pub fn new(pt: &'rcu PageTable<C>, guard: &'rcu A, va: &Range<Vaddr>)
-        -> Result<Self, PageTableError> {
+        -> (res: Result<Self, PageTableError>)
+        requires
+            old(regions).inv(),
+            locking::owners_wf(*old(owners)),
+            old(owners).contains_key(pt.root.paddr()),
+        ensures
+            regions.inv(),
+            locking::owners_wf(*owners),
+            res is Ok ==> locking::cursor_locked_at(res.unwrap(), guard, *va),
+    {
+        proof {
+            locking::lemma_config_is_x86_64::<C>();
+        }
         if !is_valid_range::<C>(va) || va.start >= va.end {
             return Err(PageTableError::InvalidVaddrRange(va.start, va.end));
         }
@@ -105,7 +122,7 @@ impl<'rcu, C: PageTableConfig, A: InAtomicMode> Cursor<'rcu, C, A> {
         //        const { assert!(C::NR_LEVELS() as usize <= MAX_NR_LEVELS()) };
 
         Ok(
-            #[verus_spec(with Tracked(pt_own))]
+            #[verus_spec(with Tracked(owners), Tracked(regions))]
             locking::lock_range(pt, guard, va)
         )
     }
@@ -141,7 +158,7 @@ impl<'rcu, C: PageTableConfig, A: InAtomicMode> Cursor<'rcu, C, A> {
                     let guard = pt.make_guard_unchecked(rcu_guard);
                     assert(1 < self.level <= 4) by { admit() };
                     self.push_level(guard);
-                    continue ;
+                    continue;
                 },
                 ChildRef::None => None,
                 ChildRef::Frame(pa, ch_level, prop) => {
@@ -242,11 +259,11 @@ impl<'rcu, C: PageTableConfig, A: InAtomicMode> Cursor<'rcu, C, A> {
                         let _ = ManuallyDrop::new(pt_guard);
                         self.move_forward();
                     }
-                    continue ;
+                    continue;
                 },
                 ChildRef::None => {
                     self.move_forward();
-                    continue ;
+                    continue;
                 },
                 ChildRef::Frame(_, _, _) => {
                     if cur_entry_fits_range || !split_huge {
@@ -256,7 +273,7 @@ impl<'rcu, C: PageTableConfig, A: InAtomicMode> Cursor<'rcu, C, A> {
                         "The entry must be a huge page",
                     );
                     self.push_level(split_child);
-                    continue ;
+                    continue;
                 },
             }
         }
@@ -355,7 +372,7 @@ impl<'rcu, C: PageTableConfig, A: InAtomicMode> Cursor<'rcu, C, A> {
 
     #[rustc_allow_incoherent_impl]
     #[verus_spec(
-        with Tracked(pt_own): Tracked<&mut PageTableOwner<C>>,
+        with Tracked(pt_own): Tracked<&mut PageTableOwner<'rcu, C>>,
             Tracked(slot_own): Tracked<&MetaSlotOwner>
     )]
     fn cur_entry(&mut self) -> Entry<'rcu, C>
@@ -371,7 +388,7 @@ impl<'rcu, C: PageTableConfig, A: InAtomicMode> Cursor<'rcu, C, A> {
     {
         let node = self.path[self.level as usize - 1].unwrap();
         let tracked entry_own = pt_own.tree.root.value.tree_node.tracked_take();
-        #[verus_spec(with Tracked(entry_own), Tracked(slot_own))]
+        #[verus_spec(with Tracked(&entry_own), Tracked(slot_own))]
         PageTableGuard::<'rcu, C>::entry(node, pte_index::<C>(self.va, self.level))
     }
 
@@ -486,7 +503,7 @@ impl<'rcu, C: PageTableConfig, A: InAtomicMode> CursorMut<'rcu, C, A> {
         {
             if self.inner.level < level {
                 self.inner.pop_level();
-                continue ;
+                continue;
             }
             // We are at a higher level, go down.
 

@@ -158,8 +158,20 @@ fn is_valid_range<C: PageTableConfig>(r: &Range<Vaddr>) -> bool {
 
 // Here are some const values that are determined by the paging constants.
 /// The index of a VA's PTE in a page table node at the given level.
+pub open spec fn pte_index_spec<C: PagingConstsTrait>(va: Vaddr, level: PagingLevel) -> usize {
+    let shift = (C::BASE_PAGE_SIZE().ilog2() + (nr_pte_index_bits::<C>() as u32) * ((level
+        - 1) as u32)) as usize;
+    (va >> shift) & ((nr_subpage_per_huge::<C>() - 1) as usize)
+}
+
+/// The index of a VA's PTE in a page table node at the given level.
 #[verifier::external_body]
-fn pte_index<C: PagingConstsTrait>(va: Vaddr, level: PagingLevel) -> usize {
+#[verifier::when_used_as_spec(pte_index_spec)]
+fn pte_index<C: PagingConstsTrait>(va: Vaddr, level: PagingLevel) -> (res: usize)
+    ensures
+        res == pte_index_spec::<C>(va, level),
+        res < nr_subpage_per_huge::<C>(),
+{
     (va >> pte_index_bit_offset::<C>(level)) & (nr_subpage_per_huge::<C>() - 1)
 }
 
@@ -393,7 +405,7 @@ pub(super) unsafe fn page_walk<C: PageTableConfig>(root_paddr: Paddr, vaddr: Vad
         }
         if cur_pte.is_last(cur_level) {
             debug_assert!(cur_level <= C::HIGHEST_TRANSLATION_LEVEL);
-            break ;
+            break;
         }
         cur_level -= 1;
         cur_pte =
@@ -421,7 +433,10 @@ pub(super) unsafe fn page_walk<C: PageTableConfig>(root_paddr: Paddr, vaddr: Vad
 pub fn load_pte<E: PageTableEntryTrait>(
     ptr: vstd_extra::array_ptr::ArrayPtr<E, CONST_NR_ENTRIES>,
     ordering: Ordering,
-) -> E {
+) -> E
+    requires
+        ptr.index < CONST_NR_ENTRIES,
+{
     unimplemented!()/*    // SAFETY: The safety is upheld by the caller.
     let atomic = unsafe { AtomicUsize::from_ptr(ptr.cast()) };
     let pte_raw = atomic.load(ordering);

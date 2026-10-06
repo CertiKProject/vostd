@@ -22,7 +22,6 @@ impl Clone for PagingConsts {
 
 impl PagingConstsTrait for PagingConsts {
     // Expansion for BASE_PAGE_SIZE
-    #[verifier::inline]
     open spec fn BASE_PAGE_SIZE_spec() -> usize {
         4096
     }
@@ -99,7 +98,6 @@ impl PagingConstsTrait for PagingConsts {
     }
 
     // Expansion for PTE_SIZE
-    #[verifier::inline]
     open spec fn PTE_SIZE_spec() -> usize {
         8
     }

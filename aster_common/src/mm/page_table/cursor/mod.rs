@@ -2,6 +2,7 @@
 use vstd::prelude::*;
 
 use vstd::simple_pptr::*;
+use vstd_extra::prelude::lemma_usize_ilog2_to32;
 
 use core::marker::PhantomData;
 use core::ops::Range;
@@ -78,9 +79,34 @@ pub open spec fn page_size_spec(level: PagingLevel) -> usize {
 /// The page size at a given level.
 #[verifier::when_used_as_spec(page_size_spec)]
 #[verifier::external_body]
-pub fn page_size(level: PagingLevel) -> usize {
+pub fn page_size(level: PagingLevel) -> (res: usize)
+    ensures
+        res == page_size_spec(level),
+{
     assert(level as usize > 0) by { admit() };
     PAGE_SIZE() << (nr_subpage_per_huge::<PagingConsts>().ilog2() as usize * (level as usize - 1))
+}
+
+/// At every level of the x86-64 page table, a node covers exactly
+/// `nr_subpage_per_huge` children of the size one level below.
+pub proof fn lemma_page_size_next_level(level: PagingLevel)
+    requires
+        1 <= level <= PagingConsts::NR_LEVELS(),
+    ensures
+        page_size(level) > 0,
+        page_size((level + 1) as PagingLevel) == page_size(level)
+            * nr_subpage_per_huge::<PagingConsts>(),
+{
+    lemma_usize_ilog2_to32();
+    // Naming the trait constants directly instantiates the impl axioms for
+    // `PagingConsts`; without this the generic `nr_subpage_per_huge` is opaque.
+    assert(PagingConsts::BASE_PAGE_SIZE_spec() == 4096);
+    assert(PagingConsts::PTE_SIZE_spec() == 8);
+    assert(nr_subpage_per_huge::<PagingConsts>() == 512);
+    assert(4096usize << 0usize == 0x1000usize && 4096usize << 9usize == 0x200000usize
+        && 4096usize << 18usize == 0x40000000usize && 4096usize << 27usize == 0x8000000000usize
+        && 4096usize << 36usize == 0x1000000000000usize) by (bit_vector);
+    assert(level == 1 || level == 2 || level == 3 || level == 4);
 }
 
 pub const fn align_down(x: usize, align: usize) -> (res: usize)

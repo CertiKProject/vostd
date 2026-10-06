@@ -62,7 +62,7 @@ impl<C: PageTableConfig> PageTableNode<C> {
             Tracked(slot_perm): Tracked<&vstd::simple_pptr::PointsTo<MetaSlot>>,
             Tracked(perm) : Tracked<&PointsTo<MetaSlotStorage, PageTablePageMeta<C>>>
     )]
-    pub fn level(&self) -> PagingLevel
+    pub fn level(&self) -> (res: PagingLevel)
         requires
             self.ptr == slot_perm.pptr(),
             slot_perm.is_init(),
@@ -72,6 +72,8 @@ impl<C: PageTableConfig> PageTableNode<C> {
             perm.pptr().addr == slot_own.storage@.addr(),
             perm.is_init(),
             perm.wf(),
+        ensures
+            res == perm.value().level,
     {
         #[verus_spec(with Tracked(slot_own), Tracked(slot_perm), Tracked(perm))]
         let meta = self.meta();
@@ -146,11 +148,23 @@ impl<'a, C: PageTableConfig> PageTableNodeRef<'a, C> {
     /// An atomic mode guard is required to
     ///  1. prevent deadlocks;
     ///  2. provide a lifetime (`'rcu`) that the nodes are guaranteed to outlive.
+    ///
+    /// The returned pointer is the one whose permission the node's owner
+    /// holds, so the caller can read the guard through `owner.guard_perm`.
     #[rustc_allow_incoherent_impl]
+    #[verus_spec(
+        with Tracked(owner): Tracked<&EntryOwner<'rcu, C>>
+    )]
     #[verifier::external_body]
     #[verusfmt::skip]
-    pub fn lock<'rcu, A: InAtomicMode>(self, _guard: &'rcu A) -> PPtr<PageTableGuard<'rcu, C>>
-        where 'a: 'rcu {
+    pub fn lock<'rcu, A: InAtomicMode>(self, _guard: &'rcu A) -> (res: PPtr<PageTableGuard<'rcu, C>>)
+        where 'a: 'rcu
+        requires
+            owner.inv(),
+            owner.guard_perm@.value().inner.inner.ptr == self.inner.ptr,
+        ensures
+            res == owner.guard_perm@.pptr(),
+    {
         unimplemented!()
         // TODO: axiomatize locks
         /*        while self
@@ -175,12 +189,43 @@ impl<'a, C: PageTableConfig> PageTableNodeRef<'a, C> {
     /// Calling this function when a guard is already created is undefined behavior
     /// unless that guard was already forgotten.
     #[rustc_allow_incoherent_impl]
+    #[verus_spec(
+        with Tracked(owner): Tracked<&EntryOwner<'rcu, C>>
+    )]
     #[verifier::external_body]
     #[verusfmt::skip]
-    pub fn make_guard_unchecked<'rcu, A: InAtomicMode>(self, _guard: &'rcu A) -> PPtr<PageTableGuard<'rcu, C>>
-        where 'a: 'rcu {
+    pub fn make_guard_unchecked<'rcu, A: InAtomicMode>(self, _guard: &'rcu A) -> (res: PPtr<PageTableGuard<'rcu, C>>)
+        where 'a: 'rcu
+        requires
+            owner.inv(),
+            owner.guard_perm@.value().inner.inner.ptr == self.inner.ptr,
+        ensures
+            res == owner.guard_perm@.pptr(),
+    {
         unimplemented!()
         //        PageTableGuard { inner: self }
+
+    }
+}
+
+impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
+    /// Releases the lock of the node.
+    ///
+    /// This is the `Drop` of the original `PageTableGuard`: in this port guards
+    /// live behind a [`PPtr`], so dropping the pointer releases nothing and the
+    /// lock protocol unlocks explicitly.
+    #[rustc_allow_incoherent_impl]
+    #[verus_spec(
+        with Tracked(owner): Tracked<&EntryOwner<'rcu, C>>
+    )]
+    #[verifier::external_body]
+    pub fn unlock(guard: PPtr<Self>)
+        requires
+            owner.inv(),
+            owner.guard_perm@.pptr() == guard,
+    {
+        unimplemented!()
+        //        self.inner.meta().lock.store(0, Ordering::Release);
 
     }
 }
@@ -194,14 +239,17 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
     /// [`nr_subpage_per_huge<C>`].
     #[rustc_allow_incoherent_impl]
     #[verus_spec(
-        with Tracked(owner) : Tracked<EntryOwner<C>>,
+        with Tracked(owner) : Tracked<&EntryOwner<'rcu, C>>,
             Tracked(slot_own) : Tracked<&MetaSlotOwner>
     )]
-    pub fn entry<'slot>(guard: PPtr<Self>, idx: usize) -> Entry<'rcu, C>
+    pub fn entry<'slot>(guard: PPtr<Self>, idx: usize) -> (res: Entry<'rcu, C>)
         requires
             owner.inv(),
             owner.relate_slot_owner(slot_own),
             owner.guard_perm@.pptr() == guard,
+        ensures
+            res.idx == idx,
+            res.node == guard,
     {
         //        assert!(idx < nr_subpage_per_huge::<C>());
         // SAFETY: The index is within the bound.
@@ -212,7 +260,7 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
     /// Gets the number of valid PTEs in the node.
     #[rustc_allow_incoherent_impl]
     #[verus_spec(
-        with Tracked(owner) : Tracked<EntryOwner<C>>,
+        with Tracked(owner) : Tracked<&EntryOwner<'rcu, C>>,
             Tracked(slot_own) : Tracked<&MetaSlotOwner>
     )]
     pub fn nr_children(&self) -> u16
@@ -232,14 +280,16 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
     /// Returns if the page table node is detached from its parent.
     #[rustc_allow_incoherent_impl]
     #[verus_spec(
-        with Tracked(owner) : Tracked<EntryOwner<C>>,
+        with Tracked(owner) : Tracked<&EntryOwner<'rcu, C>>,
             Tracked(slot_own) : Tracked<&MetaSlotOwner>
     )]
-    pub fn stray_mut(&mut self) -> PCell<bool>
+    pub fn stray_mut(&self) -> (res: PCell<bool>)
         requires
-            old(self).inner.inner.ptr == owner.slot_perm@.pptr(),
+            self.inner.inner.ptr == owner.slot_perm@.pptr(),
             owner.inv(),
             owner.relate_slot_owner(slot_own),
+        ensures
+            res == owner.node_own.meta_perm@.value().stray,
     {
         // SAFETY: The lock is held so we have an exclusive access.
         #[verus_spec(with Tracked(slot_own), Tracked(owner.slot_perm.borrow()), Tracked(owner.node_own.meta_perm.borrow()))]
@@ -258,7 +308,7 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
     /// The caller must ensure that the index is within the bound.
     #[rustc_allow_incoherent_impl]
     #[verus_spec(
-        with Tracked(owner) : Tracked<NodeOwner<C>>,
+        with Tracked(owner) : Tracked<&NodeOwner<C>>,
             Tracked(slot_own) : Tracked<&MetaSlotOwner>,
             Tracked(slot_perm) : Tracked<&vstd::simple_pptr::PointsTo<MetaSlot>>
     )]
