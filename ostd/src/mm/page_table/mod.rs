@@ -441,13 +441,20 @@ pub(super) unsafe fn page_walk<C: PageTableConfig>(root_paddr: Paddr, vaddr: Vad
 /// # Safety
 ///
 /// The safety preconditions are same as those of [`AtomicUsize::from_ptr`].
+#[verus_spec(
+    with Tracked(perm): Tracked<&vstd_extra::array_ptr::PointsTo<E, CONST_NR_ENTRIES>>
+)]
 #[verifier::external_body]
 pub fn load_pte<E: PageTableEntryTrait>(
     ptr: vstd_extra::array_ptr::ArrayPtr<E, CONST_NR_ENTRIES>,
     ordering: Ordering,
-) -> E
+) -> (res: E)
     requires
         ptr.index < CONST_NR_ENTRIES,
+        perm.is_pptr(ptr),
+        perm.is_init(ptr.index as int),
+    ensures
+        res == perm.value()[ptr.index as int],
 {
     unimplemented!()/*    // SAFETY: The safety is upheld by the caller.
     let atomic = unsafe { AtomicUsize::from_ptr(ptr.cast()) };
@@ -461,12 +468,24 @@ pub fn load_pte<E: PageTableEntryTrait>(
 /// # Safety
 ///
 /// The safety preconditions are same as those of [`AtomicUsize::from_ptr`].
+#[verus_spec(
+    with Tracked(perm): Tracked<&mut vstd_extra::array_ptr::PointsTo<E, CONST_NR_ENTRIES>>
+)]
 #[verifier::external_body]
 pub fn store_pte<E: PageTableEntryTrait>(
     ptr: vstd_extra::array_ptr::ArrayPtr<E, CONST_NR_ENTRIES>,
     new_val: E,
     ordering: Ordering,
-) {
+)
+    requires
+        ptr.index < CONST_NR_ENTRIES,
+        old(perm).is_pptr(ptr),
+        old(perm).is_init_all(),
+    ensures
+        perm.addr() == old(perm).addr(),
+        perm.is_init_all(),
+        perm.value() == old(perm).value().update(ptr.index as int, new_val),
+{
     unimplemented!()/*    let new_raw = new_val.as_usize();
     // SAFETY: The safety is upheld by the caller.
     let atomic = unsafe { AtomicUsize::from_ptr(ptr.cast()) };

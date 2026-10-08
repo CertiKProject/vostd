@@ -5,6 +5,7 @@ use vstd_extra::array_ptr;
 
 use super::*;
 use crate::mm::frame::*;
+use crate::prelude::*;
 
 verus! {
 
@@ -13,10 +14,15 @@ pub tracked struct EntryOwner<'rcu, C: PageTableConfig> {
     pub guard_perm: Tracked<PointsTo<PageTableGuard<'rcu, C>>>,
     pub children_perm: Option<array_ptr::PointsTo<Entry<'rcu, C>, CONST_NR_ENTRIES>>,
     pub slot_perm: Tracked<PointsTo<MetaSlot>>,
+    /// Permission for the node's array of page-table entries, i.e. the
+    /// contents of the page-table page itself.
+    pub pte_perm: Tracked<array_ptr::PointsTo<C::E, CONST_NR_ENTRIES>>,
 }
 
 impl<'rcu, C: PageTableConfig> Inv for EntryOwner<'rcu, C> {
     open spec fn inv(&self) -> bool {
+        &&& self.pte_perm@.is_init_all()
+        &&& self.pte_perm@.addr() == paddr_to_vaddr(self.paddr())
         &&& self.guard_perm@.is_init()
         &&& self.guard_perm@.value().inner.inner.ptr == self.slot_perm@.pptr()
         &&& self.guard_perm@.value().inner.inner.wf(&self.node_own)
@@ -50,6 +56,22 @@ impl<'rcu, C: PageTableConfig> EntryOwner<'rcu, C> {
     /// Whether the node has been detached from its parent.
     pub open spec fn is_stray(self) -> bool {
         self.node_own.meta_own.stray@.value()
+    }
+
+    /// The node's page-table entries.
+    pub open spec fn ptes(self) -> Seq<C::E> {
+        self.pte_perm@.value()
+    }
+
+    /// Entry `i` points to a child page-table node.
+    pub open spec fn pte_is_node(self, i: int) -> bool {
+        let pte = self.ptes()[i];
+        pte.is_present() && !pte.is_last(self.level())
+    }
+
+    /// The physical address of the child that entry `i` points to.
+    pub open spec fn child_paddr(self, i: int) -> Paddr {
+        self.ptes()[i].paddr()
     }
 
     /// The owner's slot permission agrees with the slot owner that `regions`
@@ -89,11 +111,11 @@ impl<'rcu, C: PageTableConfig> InvView for EntryOwner<'rcu, C> {
 impl<'rcu, C: PageTableConfig> OwnerOf for Entry<'rcu, C> {
     type Owner = EntryOwner<'rcu, C>;
 
+    /// The entry was read from the node that `owner` owns.
     open spec fn wf(&self, owner: &Self::Owner) -> bool {
         &&& self.idx < NR_ENTRIES()
-        &&& self.pte.paddr() % PAGE_SIZE() == 0
-        &&& self.pte.paddr() < MAX_PADDR()
         &&& self.node == owner.guard_perm@.pptr()
+        &&& self.pte == owner.ptes()[self.idx as int]
     }
 }
 

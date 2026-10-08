@@ -380,6 +380,7 @@ impl<'rcu, C: PageTableConfig, A: InAtomicMode> Cursor<'rcu, C, A> {
     )]
     fn cur_entry(&mut self) -> Entry<'rcu, C>
         requires
+            locking::config_is_x86_64::<C>(),
             1 <= old(self).level <= 4,
             old(self).path[old(self).level as int - 1] is Some,
             old(pt_own).tree.root.value.tree_node.tracked_is_some(),

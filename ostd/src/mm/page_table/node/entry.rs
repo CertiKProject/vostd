@@ -72,10 +72,10 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'rcu, C> {
             owner.inv(),
             old(regions).inv(),
             owner.in_region(*old(regions)),
-            // A child page table must be a forgotten (raw) frame handle.
+            // A child page table lives in a valid frame.
             self.pte.is_present() && !self.pte.is_last(owner.level()) ==> {
-                &&& old(regions).dropped_slots.contains_key(frame_to_index(self.pte.paddr()))
-                &&& !old(regions).slots.contains_key(frame_to_index(self.pte.paddr()))
+                &&& self.pte.paddr() % PAGE_SIZE() == 0
+                &&& self.pte.paddr() < MAX_PADDR()
             },
         ensures
             res is PageTable <==> (self.pte.is_present() && !self.pte.is_last(owner.level())),
@@ -83,8 +83,7 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'rcu, C> {
             res is PageTable ==> res->PageTable_0.inner.ptr.addr() == frame_to_meta(
                 self.pte.paddr(),
             ),
-            regions.slot_owners == old(regions).slot_owners,
-            regions.inv(),
+            *regions == *old(regions),
     {
         let guard = self.node.borrow(Tracked(owner.guard_perm.borrow()));
 
@@ -138,7 +137,7 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'rcu, C> {
         //  2. We replace the PTE with a new one, which differs only in
         //     `PageProperty`, so the level still matches the current
         //     page table node.
-        #[verus_spec(with Tracked(&mut owner.node_own), Tracked(slot_own), Tracked(owner.slot_perm.borrow()))]
+        #[verus_spec(with Tracked(&mut owner.node_own), Tracked(slot_own), Tracked(owner.slot_perm.borrow()), Tracked(owner.pte_perm.borrow_mut()))]
         guard.write_pte(self.idx, self.pte);
 
         self.node.put(Tracked(owner.guard_perm.borrow_mut()), guard)
@@ -163,6 +162,10 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'rcu, C> {
         requires
             old(self).wf(old(owner)),
             old(owner).inv(),
+            old(self).pte.is_present() && !old(self).pte.is_last(old(owner).level()) ==> {
+                &&& old(self).pte.paddr() % PAGE_SIZE() == 0
+                &&& old(self).pte.paddr() < MAX_PADDR()
+            },
             !old(regions).slots.contains_key(frame_to_index(old(self).pte.paddr())),
             old(regions).dropped_slots.contains_key(frame_to_index(old(self).pte.paddr())),
             new_child is PageTable,
@@ -248,8 +251,14 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'rcu, C> {
             self.node == old(self).node,
             // Allocation only fails if the entry is present or the node is a leaf.
             !old(self).pte.is_present() && old(owner).level() > 1 ==> res is Some,
-            res is None ==> *child_own is None && *self == *old(self),
+            res is None ==> *child_own is None && *self == *old(self) && owner.ptes() == old(
+                owner,
+            ).ptes(),
             res is Some ==> {
+                // The parent's entry now points to the child; the child is empty.
+                &&& owner.ptes() == old(owner).ptes().update(old(self).idx as int, self.pte)
+                &&& forall|i: int|
+                    0 <= i < NR_ENTRIES() ==> !(#[trigger] child_own.unwrap().ptes()[i]).is_present()
                 &&& *child_own is Some
                 &&& child_own.unwrap().inv()
                 &&& child_own.unwrap().in_region(*regions)
@@ -366,12 +375,14 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'rcu, C> {
         requires
             owner.inv(),
             owner.guard_perm@.pptr() == guard,
+            idx < NR_ENTRIES(),
         ensures
             res.idx == idx,
             res.node == guard,
+            res.pte == owner.ptes()[idx as int],
     {
         // SAFETY: The index is within the bound.
-        #[verus_spec(with Tracked(&owner.node_own), Tracked(slot_own), Tracked(owner.slot_perm.borrow()))]
+        #[verus_spec(with Tracked(&owner.node_own), Tracked(slot_own), Tracked(owner.slot_perm.borrow()), Tracked(owner.pte_perm.borrow()))]
         let pte = guard.borrow(Tracked(owner.guard_perm.borrow())).read_pte(idx);
         Self { pte, idx, node: guard }
     }

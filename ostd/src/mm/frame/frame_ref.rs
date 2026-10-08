@@ -2,6 +2,7 @@
 use core::{marker::PhantomData, mem::ManuallyDrop, ops::Deref, ptr::NonNull};
 
 use vstd::prelude::*;
+use vstd::simple_pptr::PPtr;
 
 use vstd_extra::manually_drop::*;
 use vstd_extra::ownership::*;
@@ -31,26 +32,21 @@ impl<M: AnyFrameMeta> FrameRef<'_, M> {
         requires
             raw % PAGE_SIZE() == 0,
             raw < MAX_PADDR(),
-            !old(regions).slots.contains_key(frame_to_index(raw)),
-            old(regions).dropped_slots.contains_key(frame_to_index(raw)),
         ensures
             res.inner.ptr.addr() == frame_to_meta(raw),
             res.inner.paddr() == raw,
-            regions.slot_owners == old(regions).slot_owners,
-            old(regions).inv() ==> regions.inv(),
+            *regions == *old(regions),
     {
         proof {
             lemma_paddr_to_meta_biinjective(raw);
         }
-        #[verus_spec(with Tracked(regions))]
-        let frame = Frame::from_raw(raw);
-        Self {
-            // SAFETY: The caller ensures the safety.
-            inner:   /*ManuallyDrop::new(unsafe {*/
-            frame  /*})*/
-            ,
-            _marker: PhantomData,
-        }
+        // A `FrameRef` is a borrow: it does not take over the frame's slot
+        // permission (the original wraps the restored handle in `ManuallyDrop`
+        // for exactly this reason), so the metadata region is left untouched.
+        let vaddr = frame_to_meta(raw);
+        // SAFETY: The caller ensures the safety.
+        let frame = Frame::<M> { ptr: PPtr::from_addr(vaddr), _marker: PhantomData };
+        Self { inner: frame, _marker: PhantomData }
     }
 }
 

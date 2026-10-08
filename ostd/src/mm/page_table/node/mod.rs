@@ -247,9 +247,11 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
             owner.inv(),
             owner.relate_slot_owner(slot_own),
             owner.guard_perm@.pptr() == guard,
+            idx < NR_ENTRIES(),
         ensures
             res.idx == idx,
             res.node == guard,
+            res.pte == owner.ptes()[idx as int],
     {
         //        assert!(idx < nr_subpage_per_huge::<C>());
         // SAFETY: The index is within the bound.
@@ -310,10 +312,11 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
     #[verus_spec(
         with Tracked(owner) : Tracked<&NodeOwner<C>>,
             Tracked(slot_own) : Tracked<&MetaSlotOwner>,
-            Tracked(slot_perm) : Tracked<&vstd::simple_pptr::PointsTo<MetaSlot>>
+            Tracked(slot_perm) : Tracked<&vstd::simple_pptr::PointsTo<MetaSlot>>,
+            Tracked(pte_perm) : Tracked<&array_ptr::PointsTo<C::E, CONST_NR_ENTRIES>>
     )]
     #[verusfmt::skip]
-    pub fn read_pte(&self, idx: usize) -> C::E
+    pub fn read_pte(&self, idx: usize) -> (res: C::E)
         requires
             self.inner.inner.ptr == slot_perm.pptr(),
             owner.inv(),
@@ -323,6 +326,10 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
             slot_perm.addr() == slot_own.self_addr,
             meta_to_frame(slot_perm.addr()) < VMALLOC_BASE_VADDR() - LINEAR_MAPPING_BASE_VADDR(),
             idx < NR_ENTRIES(),
+            pte_perm.addr() == paddr_to_vaddr(self.inner.inner.paddr()),
+            pte_perm.is_init_all(),
+        ensures
+            res == pte_perm.value()[idx as int],
     {
         // debug_assert!(idx < nr_subpage_per_huge::<C>());
         let ptr = vstd_extra::array_ptr::ArrayPtr::<C::E, CONST_NR_ENTRIES>::from_addr(
@@ -335,7 +342,9 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
         // SAFETY:
         // - The page table node is alive. The index is inside the bound, so the page table entry is valid.
         // - All page table entries are aligned and accessed with atomic operations only.
-        load_pte(ptr.add(idx), Ordering::Relaxed)
+        #[verus_spec(with Tracked(pte_perm))]
+        let pte = crate::mm::page_table::load_pte(ptr.add(idx), Ordering::Relaxed);
+        pte
     }
 
     /// Writes a page table entry at a given index.
@@ -355,7 +364,8 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
     #[verus_spec(
         with Tracked(owner) : Tracked<&mut NodeOwner<C>>,
             Tracked(slot_own) : Tracked<&MetaSlotOwner>,
-            Tracked(slot_perm) : Tracked<&vstd::simple_pptr::PointsTo<MetaSlot>>
+            Tracked(slot_perm) : Tracked<&vstd::simple_pptr::PointsTo<MetaSlot>>,
+            Tracked(pte_perm) : Tracked<&mut array_ptr::PointsTo<C::E, CONST_NR_ENTRIES>>
     )]
     #[verusfmt::skip]
     pub fn write_pte(&mut self, idx: usize, pte: C::E)
@@ -368,6 +378,14 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
             slot_perm.addr() == slot_own.self_addr,
             meta_to_frame(slot_perm.addr()) < VMALLOC_BASE_VADDR() - LINEAR_MAPPING_BASE_VADDR(),
             idx < NR_ENTRIES(),
+            old(pte_perm).addr() == paddr_to_vaddr(old(self).inner.inner.paddr()),
+            old(pte_perm).is_init_all(),
+        ensures
+            *self == *old(self),
+            *owner == *old(owner),
+            pte_perm.addr() == old(pte_perm).addr(),
+            pte_perm.is_init_all(),
+            pte_perm.value() == old(pte_perm).value().update(idx as int, pte),
     {
         // debug_assert!(idx < nr_subpage_per_huge::<C>());
         let ptr = vstd_extra::array_ptr::ArrayPtr::<C::E, CONST_NR_ENTRIES>::from_addr(
@@ -380,7 +398,8 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
         // SAFETY:
         // - The page table node is alive. The index is inside the bound, so the page table entry is valid.
         // - All page table entries are aligned and accessed with atomic operations only.
-        store_pte(ptr.add(idx), pte, Ordering::Release)
+        #[verus_spec(with Tracked(pte_perm))]
+        crate::mm::page_table::store_pte(ptr.add(idx), pte, Ordering::Release);
     }
 
     /// Gets the mutable reference to the number of valid PTEs in the node.
