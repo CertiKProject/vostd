@@ -16,8 +16,7 @@
 //!
 //! Each owner also carries the permission for its node's entry array, and
 //! `owners_wf` ties the entries to the map: a present non-leaf entry points to
-//! an owned node one level down, live when its parent is live, with a unique
-//! parent. No fact is admitted.
+//! an owned node one level down, live when its parent is live. No fact is admitted.
 use core::{marker::PhantomData, ops::Range, sync::atomic::Ordering};
 
 use vstd::arithmetic::div_mod::*;
@@ -27,6 +26,7 @@ use vstd::prelude::*;
 use vstd::simple_pptr::*;
 
 use vstd_extra::array_ptr::*;
+use vstd_extra::ghost_tree::Node;
 use vstd_extra::ownership::*;
 use vstd_extra::prelude::lemma_usize_ilog2_to32;
 
@@ -348,18 +348,6 @@ pub open spec fn node_children_wf<'rcu, C: PageTableConfig>(
         }
 }
 
-/// A page-table node is pointed to by at most one entry: the owned nodes
-/// form a forest.
-pub open spec fn unique_parent<'rcu, C: PageTableConfig>(
-    owners: Map<Paddr, EntryOwner<'rcu, C>>,
-) -> bool {
-    forall|pa1: Paddr, i1: int, pa2: Paddr, i2: int|
-        owners.contains_key(pa1) && owners.contains_key(pa2) && 0 <= i1 < NR_ENTRIES() && 0 <= i2
-            < NR_ENTRIES() && #[trigger] owners[pa1].pte_is_node(i1)
-            && #[trigger] owners[pa2].pte_is_node(i2) && owners[pa1].child_paddr(i1)
-            == owners[pa2].child_paddr(i2) ==> pa1 == pa2 && i1 == i2
-}
-
 /// `owners` is a consistent ownership map: every owner is well formed, filed
 /// under the physical address of the node it owns, agrees with the metadata
 /// region about the node's slot, and its entries point to owned children.
@@ -367,22 +355,9 @@ pub open spec fn owners_wf<'rcu, C: PageTableConfig>(
     owners: Map<Paddr, EntryOwner<'rcu, C>>,
     regions: MetaRegionOwners,
 ) -> bool {
-    &&& forall|pa: Paddr| #[trigger]
+    forall|pa: Paddr| #[trigger]
         owners.contains_key(pa) ==> owners[pa].inv() && owners[pa].paddr() == pa
             && owners[pa].in_region(regions) && node_children_wf(owners, pa)
-    &&& unique_parent(owners)
-}
-
-/// Every entry pointing at the node owned under `pa` belongs to a stray
-/// node. In particular this holds for a node that was just unlinked from
-/// its parent.
-pub open spec fn parents_stray<'rcu, C: PageTableConfig>(
-    owners: Map<Paddr, EntryOwner<'rcu, C>>,
-    pa: Paddr,
-) -> bool {
-    forall|q: Paddr, i: int|
-        owners.contains_key(q) && 0 <= i < NR_ENTRIES() && #[trigger] owners[q].pte_is_node(i)
-            && owners[q].child_paddr(i) == pa ==> owners[q].is_stray()
 }
 
 /// `owners_wf` only looks at the slot owners of the region.
@@ -452,32 +427,6 @@ pub proof fn lemma_pte_child<'rcu, C: PageTableConfig>(
     let child_pa = owners[pa].child_paddr(i);
     assert(node_children_wf(owners, pa));
     lemma_owner_slot(owners, regions, child_pa);
-}
-
-/// With a unique parent, the children of a stray node have only stray
-/// parents.
-pub proof fn lemma_child_parents_stray<'rcu, C: PageTableConfig>(
-    owners: Map<Paddr, EntryOwner<'rcu, C>>,
-    regions: MetaRegionOwners,
-    pa: Paddr,
-    i: int,
-)
-    requires
-        owners_wf(owners, regions),
-        owners.contains_key(pa),
-        0 <= i < NR_ENTRIES(),
-        owners[pa].pte_is_node(i),
-        owners[pa].is_stray(),
-    ensures
-        parents_stray(owners, owners[pa].child_paddr(i)),
-{
-    let child_pa = owners[pa].child_paddr(i);
-    assert forall|q: Paddr, j: int|
-        owners.contains_key(q) && 0 <= j < NR_ENTRIES() && #[trigger] owners[q].pte_is_node(j)
-            && owners[q].child_paddr(j) == child_pa implies owners[q].is_stray() by {
-        assert(unique_parent(owners));
-        assert(q == pa && j == i);
-    }
 }
 
 /// Allocating a child: the parent's entry `idx` now points to a fresh,
@@ -575,103 +524,6 @@ pub proof fn lemma_owners_wf_alloc<'rcu, C: PageTableConfig>(
                 }
             }
         }
-    }
-
-    assert forall|pa1: Paddr, i1: int, pa2: Paddr, i2: int|
-        after.contains_key(pa1) && after.contains_key(pa2) && 0 <= i1 < NR_ENTRIES() && 0 <= i2
-            < NR_ENTRIES() && #[trigger] after[pa1].pte_is_node(i1)
-            && #[trigger] after[pa2].pte_is_node(i2) && after[pa1].child_paddr(i1)
-            == after[pa2].child_paddr(i2) implies pa1 == pa2 && i1 == i2 by {
-        assert(pa1 != child_pa) by {
-            if pa1 == child_pa {
-                assert(!child.ptes()[i1].is_present());
-            }
-        }
-        assert(pa2 != child_pa) by {
-            if pa2 == child_pa {
-                assert(!child.ptes()[i2].is_present());
-            }
-        }
-        let new1 = pa1 == parent_pa && i1 == idx;
-        let new2 = pa2 == parent_pa && i2 == idx;
-        if new1 && new2 {
-        } else if new1 {
-            // `(pa2, i2)` is an old entry pointing at the fresh child: impossible.
-            assert(before.contains_key(pa2));
-            assert(before[pa2].pte_is_node(i2));
-            assert(before[pa2].child_paddr(i2) == child_pa);
-        } else if new2 {
-            assert(before.contains_key(pa1));
-            assert(before[pa1].pte_is_node(i1));
-            assert(before[pa1].child_paddr(i1) == child_pa);
-        } else {
-            assert(before.contains_key(pa1));
-            assert(before.contains_key(pa2));
-            assert(before[pa1].pte_is_node(i1));
-            assert(before[pa2].pte_is_node(i2));
-            assert(before[pa1].child_paddr(i1) == before[pa2].child_paddr(i2));
-            assert(unique_parent(before));
-        }
-    }
-}
-
-/// Marking a node stray whose parents are all stray keeps the map well
-/// formed: the node's own children are no longer constrained, and nothing
-/// live points at it.
-pub proof fn lemma_owners_wf_mark_stray<'rcu, C: PageTableConfig>(
-    before: Map<Paddr, EntryOwner<'rcu, C>>,
-    regions: MetaRegionOwners,
-    pa: Paddr,
-    own: EntryOwner<'rcu, C>,
-)
-    requires
-        owners_wf(before, regions),
-        before.contains_key(pa),
-        own.inv(),
-        own.paddr() == pa,
-        own.in_region(regions),
-        own.level() == before[pa].level(),
-        own.ptes() == before[pa].ptes(),
-        own.is_stray(),
-        parents_stray(before, pa),
-    ensures
-        owners_wf(before.insert(pa, own), regions),
-{
-    let after = before.insert(pa, own);
-    assert forall|i: int| 0 <= i < NR_ENTRIES() implies #[trigger] own.pte_is_node(i)
-        == before[pa].pte_is_node(i) by {}
-
-    assert forall|q: Paddr| #[trigger] after.contains_key(q) implies after[q].inv()
-        && after[q].paddr() == q && after[q].in_region(regions) && node_children_wf(after, q) by {
-        assert(before.contains_key(q));
-        assert(node_children_wf(before, q));
-        assert forall|i: int| 0 <= i < NR_ENTRIES() && #[trigger] after[q].pte_is_node(i) implies {
-            let c = after[q].child_paddr(i);
-            &&& after.contains_key(c)
-            &&& after[c].level() + 1 == after[q].level()
-            &&& !after[q].is_stray() ==> !after[c].is_stray()
-        } by {
-            assert(before[q].pte_is_node(i));
-            let c = before[q].child_paddr(i);
-            assert(before.contains_key(c));
-            if c == pa {
-                // `q` points at `pa`, so `q` is stray.
-                assert(before[q].is_stray());
-            } else {
-                assert(after[c] == before[c]);
-            }
-        }
-    }
-
-    assert forall|pa1: Paddr, i1: int, pa2: Paddr, i2: int|
-        after.contains_key(pa1) && after.contains_key(pa2) && 0 <= i1 < NR_ENTRIES() && 0 <= i2
-            < NR_ENTRIES() && #[trigger] after[pa1].pte_is_node(i1)
-            && #[trigger] after[pa2].pte_is_node(i2) && after[pa1].child_paddr(i1)
-            == after[pa2].child_paddr(i2) implies pa1 == pa2 && i1 == i2 by {
-        assert(before[pa1].pte_is_node(i1));
-        assert(before[pa2].pte_is_node(i2));
-        assert(before[pa1].child_paddr(i1) == before[pa2].child_paddr(i2));
-        assert(unique_parent(before));
     }
 }
 
@@ -1569,87 +1421,109 @@ fn dfs_release_lock<'rcu, C: PageTableConfig, A: InAtomicMode>(
     }
 }
 
-/// What `dfs_mark_stray_and_unlock` leaves alone: every node stays owned
-/// with the same entries, level and permissions; stray flags only ever get
-/// set.
-pub open spec fn only_marks_stray<'rcu, C: PageTableConfig>(
-    before: Map<Paddr, EntryOwner<'rcu, C>>,
-    after: Map<Paddr, EntryOwner<'rcu, C>>,
-) -> bool {
-    &&& forall|q: Paddr| #[trigger] after.contains_key(q) <==> before.contains_key(q)
-    &&& forall|q: Paddr| #[trigger]
-        after.contains_key(q) ==> {
-            &&& after[q].ptes() == before[q].ptes()
-            &&& after[q].level() == before[q].level()
-            &&& after[q].guard_perm == before[q].guard_perm
-            &&& after[q].slot_perm == before[q].slot_perm
-            &&& (before[q].is_stray() ==> after[q].is_stray())
-        }
+/// A page-table owner sub-tree: each node holds the owner of one page-table
+/// node, and child `i` is the sub-tree under entry `i`. This is the ghost
+/// shape of `PageTableOwner`'s tree.
+pub type OwnerNode<'rcu, C> = Node<OwnerInTree<'rcu, C>, CONST_NR_ENTRIES, CONST_NR_LEVELS>;
+
+/// The owner held at the root of `n`.
+pub open spec fn node_owner<'rcu, C: PageTableConfig>(n: OwnerNode<'rcu, C>) -> EntryOwner<
+    'rcu,
+    C,
+> {
+    n.value.tree_node.unwrap()
 }
 
-/// Re-filing an owner with only its stray flag set is `only_marks_stray`.
-pub proof fn lemma_only_marks_stray_mark<'rcu, C: PageTableConfig>(
-    before: Map<Paddr, EntryOwner<'rcu, C>>,
-    after: Map<Paddr, EntryOwner<'rcu, C>>,
-    pa: Paddr,
-)
-    requires
-        before.contains_key(pa),
-        after == before.insert(pa, after[pa]),
-        after[pa].ptes() == before[pa].ptes(),
-        after[pa].level() == before[pa].level(),
-        after[pa].guard_perm == before[pa].guard_perm,
-        after[pa].slot_perm == before[pa].slot_perm,
-        after[pa].is_stray(),
-    ensures
-        only_marks_stray(before, after),
+/// `n` is a well-formed owner sub-tree rooted at a node of level `lv`: every
+/// node is owned and agrees with the region, and the children of a node are
+/// exactly the sub-trees its page-table entries point to, one level down.
+pub open spec fn subtree_wf<'rcu, C: PageTableConfig>(
+    n: OwnerNode<'rcu, C>,
+    regions: MetaRegionOwners,
+    lv: nat,
+) -> bool
+    decreases lv,
 {
-}
-
-/// `only_marks_stray` composes.
-pub proof fn lemma_only_marks_stray_trans<'rcu, C: PageTableConfig>(
-    a: Map<Paddr, EntryOwner<'rcu, C>>,
-    b: Map<Paddr, EntryOwner<'rcu, C>>,
-    c: Map<Paddr, EntryOwner<'rcu, C>>,
-)
-    requires
-        only_marks_stray(a, b),
-        only_marks_stray(b, c),
-    ensures
-        only_marks_stray(a, c),
-{
-    assert forall|q: Paddr| #[trigger] c.contains_key(q) implies {
-        &&& c[q].ptes() == a[q].ptes()
-        &&& c[q].level() == a[q].level()
-        &&& c[q].guard_perm == a[q].guard_perm
-        &&& c[q].slot_perm == a[q].slot_perm
-        &&& (a[q].is_stray() ==> c[q].is_stray())
-    } by {
-        assert(b.contains_key(q));
+    let own = node_owner(n);
+    &&& n.value.tree_node is Some
+    &&& own.inv()
+    &&& own.in_region(regions)
+    &&& own.level() == lv
+    &&& 1 <= lv <= 4
+    &&& n.children.len() == NR_ENTRIES()
+    &&& forall|i: int|
+        0 <= i < NR_ENTRIES() ==> (#[trigger] n.children[i] is Some <==> own.pte_is_node(i))
+    &&& if lv <= 1 {
+        forall|i: int| 0 <= i < NR_ENTRIES() ==> #[trigger] n.children[i] is None
+    } else {
+        forall|i: int|
+            0 <= i < NR_ENTRIES() && #[trigger] n.children[i] is Some ==> {
+                &&& node_owner(n.children[i].unwrap()).paddr() == own.child_paddr(i)
+                &&& subtree_wf(n.children[i].unwrap(), regions, (lv - 1) as nat)
+            }
     }
+}
+
+/// Every node of `n` that is marked stray has all its children marked
+/// stray, at every depth.
+pub open spec fn stray_propagates<'rcu, C: PageTableConfig>(n: OwnerNode<'rcu, C>, lv: nat) -> bool
+    decreases lv,
+{
+    if lv == 0 {
+        true
+    } else {
+        node_owner(n).is_stray() ==> forall|i: int|
+            0 <= i < NR_ENTRIES() && #[trigger] n.children[i] is Some ==> {
+                &&& node_owner(n.children[i].unwrap()).is_stray()
+                &&& stray_propagates(n.children[i].unwrap(), (lv - 1) as nat)
+            }
+    }
+}
+
+/// An owner that agrees with the region relates to the region's slot owner,
+/// and its frame is a valid physical page whose metadata slot is the owner's.
+pub proof fn lemma_owner_frame<'rcu, C: PageTableConfig>(
+    own: EntryOwner<'rcu, C>,
+    regions: MetaRegionOwners,
+)
+    requires
+        regions.inv(),
+        own.in_region(regions),
+    ensures
+        regions.slot_owners.contains_key(frame_to_index(own.paddr())),
+        own.relate_slot_owner(&regions.slot_owners[frame_to_index(own.paddr())]),
+        own.paddr() % PAGE_SIZE() == 0,
+        own.paddr() < MAX_PADDR(),
+        own.paddr() < VMALLOC_BASE_VADDR() - LINEAR_MAPPING_BASE_VADDR(),
+        frame_to_meta(own.paddr()) == own.slot_perm@.pptr().addr(),
+{
+    own.lemma_in_region_relates(regions);
+    lemma_max_paddr_range();
+    lemma_meta_to_paddr_biinjective(own.slot_perm@.pptr().addr());
 }
 
 /// Marks all the nodes in the sub-tree rooted at the node as stray, and
 /// returns the num of pages mapped within the sub-tree.
 ///
 /// It must be called upon the node after the node is removed from the parent
-/// page table (`parents_stray` below). It also unlocks the nodes in the
-/// sub-tree.
+/// page table. It also unlocks the nodes in the sub-tree.
 ///
 /// This function returns the number of physical frames mapped in the sub-tree.
 ///
 /// The caller must ensure that all the nodes in the sub-tree are locked
-/// and all guards are forgotten.
+/// and all guards are forgotten. In the ghost model the caller hands over the
+/// owner sub-tree (`owner`), which is exclusive: nobody else can reach these
+/// nodes' owners while the call runs.
 ///
 /// This function must not be called upon a shared node, e.g., the second-
 /// top level nodes that the kernel space and user space share.
 ///
 /// In the protocol this is what makes a concurrent traversal that reaches a
 /// recycled node notice it and retry: every node of the detached sub-tree is
-/// flagged stray before its lock is released.
+/// flagged stray before its lock is released. The postcondition states this
+/// as: the root is stray, and every stray node has stray children.
 #[verus_spec(
-    with Ghost(pa): Ghost<Paddr>,
-        Tracked(owners): Tracked<&mut Map<Paddr, EntryOwner<'a, C>>>,
+    with Tracked(owner): Tracked<&mut OwnerNode<'a, C>>,
         Tracked(regions): Tracked<&mut MetaRegionOwners>
 )]
 pub fn dfs_mark_stray_and_unlock<'a, C: PageTableConfig, A: InAtomicMode>(
@@ -1659,28 +1533,32 @@ pub fn dfs_mark_stray_and_unlock<'a, C: PageTableConfig, A: InAtomicMode>(
     requires
         config_is_x86_64::<C>(),
         old(regions).inv(),
-        owners_wf(*old(owners), *old(regions)),
-        owns_guard(*old(owners), pa, sub_tree),
-        1 <= old(owners)[pa].level() <= 4,
-        parents_stray(*old(owners), pa),
+        subtree_wf(*old(owner), *old(regions), node_owner(*old(owner)).level() as nat),
+        node_owner(*old(owner)).guard_perm@.pptr() == sub_tree,
     ensures
         *regions == *old(regions),
-        owners_wf(*owners, *regions),
-        only_marks_stray(*old(owners), *owners),
-        owners[pa].is_stray(),
-        num_frames <= max_frames(old(owners)[pa].level()),
-    decreases old(owners)[pa].level(),
+        subtree_wf(*owner, *regions, node_owner(*old(owner)).level() as nat),
+        node_owner(*owner).is_stray(),
+        stray_propagates(*owner, node_owner(*old(owner)).level() as nat),
+        node_owner(*owner).guard_perm == node_owner(*old(owner)).guard_perm,
+        node_owner(*owner).slot_perm == node_owner(*old(owner)).slot_perm,
+        node_owner(*owner).level() == node_owner(*old(owner)).level(),
+        num_frames <= max_frames(node_owner(*old(owner)).level()),
+    decreases node_owner(*old(owner)).level(),
 {
     proof {
         lemma_config_is_x86_64::<C>();
-        lemma_owner_slot(*owners, *regions, pa);
     }
+    let ghost old_root = *owner;
+    let ghost lv = node_owner(old_root).level() as nat;
 
-    // Mark this node stray. Its owner is taken out of the map while the flag
-    // is written.
-    let ghost owners0 = *owners;
-    let tracked mut cur_own = owners.tracked_remove(pa);
-    let tracked slot_own = regions.slot_owners.tracked_borrow(frame_to_index(pa));
+    // Mark this node stray. Its owner is taken out of the tree node while
+    // the flag is written.
+    let tracked mut cur_own = owner.value.tree_node.tracked_take();
+    proof {
+        lemma_owner_frame(cur_own, *regions);
+    }
+    let tracked slot_own = regions.slot_owners.tracked_borrow(frame_to_index(cur_own.paddr()));
     let sub_tree_val = sub_tree.borrow(Tracked(cur_own.guard_perm.borrow()));
     #[verus_spec(with Tracked(&cur_own), Tracked(slot_own))]
     let stray_cell = sub_tree_val.stray_mut();
@@ -1690,16 +1568,15 @@ pub fn dfs_mark_stray_and_unlock<'a, C: PageTableConfig, A: InAtomicMode>(
     );
     #[verus_spec(with Tracked(slot_own), Tracked(cur_own.slot_perm.borrow()), Tracked(cur_own.node_own.meta_perm.borrow()))]
     let level = sub_tree_val.level();
-    let ghost own_g = cur_own;
     proof {
-        owners.tracked_insert(pa, cur_own);
-        assert(*owners =~= owners0.insert(pa, own_g));
-        lemma_owners_wf_mark_stray(owners0, *regions, pa, own_g);
-        lemma_only_marks_stray_mark(owners0, *owners, pa);
+        owner.value.tree_node = Some(cur_own);
     }
+    let ghost marked = node_owner(*owner);
+    assert(marked.ptes() == node_owner(old_root).ptes());
+    assert(owner.children == old_root.children);
 
     if level == 1 {
-        let tracked cur_own = owners.tracked_borrow(pa);
+        let tracked cur_own = owner.value.tree_node.tracked_borrow();
         let sub_tree_val = sub_tree.borrow(Tracked(cur_own.guard_perm.borrow()));
         #[verus_spec(with Tracked(cur_own), Tracked(slot_own))]
         let nr_children = sub_tree_val.nr_children();
@@ -1708,6 +1585,10 @@ pub fn dfs_mark_stray_and_unlock<'a, C: PageTableConfig, A: InAtomicMode>(
         PageTableGuard::<'a, C>::unlock(sub_tree);
         proof {
             lemma_max_frames_bounded(1);
+            assert forall|i: int| 0 <= i < NR_ENTRIES() implies (
+            #[trigger] owner.children[i] is Some <==> marked.pte_is_node(i)) by {
+                assert(old_root.children[i] is Some <==> node_owner(old_root).pte_is_node(i));
+            }
         }
         return nr_children as usize;
     }
@@ -1720,59 +1601,89 @@ pub fn dfs_mark_stray_and_unlock<'a, C: PageTableConfig, A: InAtomicMode>(
             config_is_x86_64::<C>(),
             i <= end,
             end == 512,
-            1 < level <= 4,
+            2 <= level <= 4,
+            level == lv,
             *regions == *old(regions),
             regions.inv(),
-            owners_wf(*owners, *regions),
-            only_marks_stray(*old(owners), *owners),
-            owns_guard(*owners, pa, sub_tree),
-            owners[pa].is_stray(),
-            level == owners[pa].level(),
-            level == old(owners)[pa].level(),
+            subtree_wf(old_root, *regions, lv),
+            old_root == *old(owner),
+            lv == node_owner(*old(owner)).level(),
+            owner.value.tree_node is Some,
+            node_owner(*owner) == marked,
+            marked.inv(),
+            marked.in_region(*regions),
+            marked.is_stray(),
+            marked.level() == lv,
+            marked.ptes() == node_owner(old_root).ptes(),
+            marked.guard_perm == node_owner(old_root).guard_perm,
+            marked.slot_perm == node_owner(old_root).slot_perm,
+            marked.guard_perm@.pptr() == sub_tree,
+            owner.children.len() == 512,
+            // Not yet visited: unchanged.
+            forall|j: int| i <= j < 512 ==> #[trigger] owner.children[j] == old_root.children[j],
+            // Visited: same shape, and the whole child sub-tree is stray.
+            forall|j: int|
+                0 <= j < i ==> (#[trigger] owner.children[j] is Some
+                    <==> old_root.children[j] is Some),
+            forall|j: int|
+                0 <= j < i && #[trigger] owner.children[j] is Some ==> {
+                    &&& node_owner(owner.children[j].unwrap()).paddr() == marked.child_paddr(j)
+                    &&& subtree_wf(owner.children[j].unwrap(), *regions, (lv - 1) as nat)
+                    &&& node_owner(owner.children[j].unwrap()).is_stray()
+                    &&& stray_propagates(owner.children[j].unwrap(), (lv - 1) as nat)
+                },
             num_frames <= i * max_frames((level - 1) as PagingLevel),
         decreases end - i,
     {
         proof {
             lemma_config_is_x86_64::<C>();
-            lemma_owner_slot(*owners, *regions, pa);
         }
-        let tracked cur_own = owners.tracked_borrow(pa);
-        let tracked slot_own = regions.slot_owners.tracked_borrow(frame_to_index(pa));
+        let ghost ii = i as int;
+        let tracked cur_own = owner.value.tree_node.tracked_borrow();
+        proof {
+            lemma_owner_frame(*cur_own, *regions);
+        }
+        let tracked slot_own = regions.slot_owners.tracked_borrow(frame_to_index(cur_own.paddr()));
         #[verus_spec(with Tracked(cur_own), Tracked(slot_own))]
         let child = PageTableGuard::<'a, C>::entry(sub_tree, i);
 
         proof {
-            if cur_own.pte_is_node(i as int) {
-                lemma_pte_child(*owners, *regions, pa, i as int);
-                lemma_child_parents_stray(*owners, *regions, pa, i as int);
+            assert(owner.children[ii] == old_root.children[ii]);
+            assert(old_root.children[ii] is Some <==> node_owner(old_root).pte_is_node(ii));
+            if marked.pte_is_node(ii) {
+                let c = old_root.children[ii].unwrap();
+                assert(subtree_wf(c, *regions, (lv - 1) as nat));
+                assert(node_owner(c).in_region(*regions));
             }
         }
         #[verus_spec(with Tracked(cur_own), Tracked(regions))]
         let child_ref = child.to_ref();
         match child_ref {
             ChildRef::PageTable(pt) => {
-                let ghost child_pa = pt.inner.paddr();
+                let ghost before = *owner;
+                let tracked mut child_node = owner.tracked_take_child(ii);
+                let ghost c_old = child_node;
                 proof {
-                    lemma_owner_slot(*owners, *regions, child_pa);
+                    assert(subtree_wf(c_old, *regions, (lv - 1) as nat));
+                    assert(node_owner(c_old).level() == lv - 1);
+                    assert(node_owner(c_old).level() < node_owner(*old(owner)).level());
                 }
-                let tracked child_own = owners.tracked_borrow(child_pa);
+                let tracked child_own = child_node.value.tree_node.tracked_borrow();
+                proof {
+                    lemma_owner_frame(*child_own, *regions);
+                }
                 assert(pt.inner.ptr == child_own.slot_perm@.pptr());
                 // The node is locked and the new guard is unique.
                 #[verus_spec(with Tracked(child_own))]
                 let locked_pt = pt.make_guard_unchecked(rcu_guard);
 
-                let ghost owners_before = *owners;
                 // All the nodes in the sub-tree are locked and all guards are forgotten.
-                #[verus_spec(with Ghost(child_pa), Tracked(owners), Tracked(regions))]
+                #[verus_spec(with Tracked(&mut child_node), Tracked(regions))]
                 let frames_below = dfs_mark_stray_and_unlock(rcu_guard, locked_pt);
 
                 proof {
-                    // The recursion only sets stray flags below; this node is untouched.
-                    assert(owners.contains_key(pa));
-                    assert(owners[pa].guard_perm == owners_before[pa].guard_perm);
-                    assert(owners[pa].level() == owners_before[pa].level());
-                    assert(owners[pa].is_stray());
-                    lemma_only_marks_stray_trans(*old(owners), owners_before, *owners);
+                    owner.tracked_put_child(ii, child_node);
+                    assert(owner.children =~= before.children.update(ii, Some(child_node)));
                     lemma_max_frames_bounded(level);
                     lemma_mul_inequality(i as int + 1, 512, max_frames((level - 1) as PagingLevel));
                     lemma_mul_is_distributive_add_other_way(
@@ -1798,12 +1709,18 @@ pub fn dfs_mark_stray_and_unlock<'a, C: PageTableConfig, A: InAtomicMode>(
     }
 
     // Dropping the guard releases the lock of this node.
-    let tracked cur_own = owners.tracked_borrow(pa);
+    let tracked cur_own = owner.value.tree_node.tracked_borrow();
     #[verus_spec(with Tracked(cur_own))]
     PageTableGuard::<'a, C>::unlock(sub_tree);
 
     proof {
         lemma_max_frames_bounded(level);
+        assert forall|j: int| 0 <= j < NR_ENTRIES() implies (#[trigger] owner.children[j] is Some
+            <==> marked.pte_is_node(j)) by {
+            assert(old_root.children[j] is Some <==> node_owner(old_root).pte_is_node(j));
+        }
+        assert(subtree_wf(*owner, *regions, lv));
+        assert(stray_propagates(*owner, lv));
     }
     num_frames
 }

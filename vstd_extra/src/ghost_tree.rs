@@ -389,6 +389,210 @@ impl<T: TreeNodeValue, const N: usize, const L: usize> Node<T, N, L> {
         admit()
     }
 
+    /// Borrows the `i`-th child.
+    pub proof fn tracked_borrow_child(tracked &self, i: int) -> (tracked ret: &Self)
+        requires
+            0 <= i < self.children.len(),
+            self.children[i] is Some,
+        ensures
+            *ret == self.children[i].unwrap(),
+    {
+        self.children.tracked_borrow(i).tracked_borrow()
+    }
+
+    /// Takes the `i`-th child out, leaving `None` in its slot.
+    pub proof fn tracked_take_child(tracked &mut self, i: int) -> (tracked ret: Self)
+        requires
+            0 <= i < old(self).children.len(),
+            old(self).children[i] is Some,
+        ensures
+            ret == old(self).children[i].unwrap(),
+            self.value == old(self).value,
+            self.level == old(self).level,
+            self.children == old(self).children.update(i, None),
+    {
+        let tracked opt = self.children.tracked_remove(i);
+        self.children.tracked_insert(i, None);
+        assert(self.children =~= old(self).children.update(i, None));
+        opt.tracked_unwrap()
+    }
+
+    /// Puts `child` into the `i`-th slot, replacing whatever was there.
+    pub proof fn tracked_put_child(tracked &mut self, i: int, tracked child: Self)
+        requires
+            0 <= i < old(self).children.len(),
+        ensures
+            self.value == old(self).value,
+            self.level == old(self).level,
+            self.children == old(self).children.update(i, Some(child)),
+    {
+        let tracked _old = self.children.tracked_remove(i);
+        self.children.tracked_insert(i, Some(child));
+        assert(self.children =~= old(self).children.update(i, Some(child)));
+    }
+
+    /// Every step of `path` leads to a present child.
+    pub open spec fn has_path(self, path: Seq<usize>) -> bool
+        decreases path.len(),
+    {
+        if path.len() == 0 {
+            true
+        } else {
+            let i = path[0] as int;
+            &&& 0 <= i < self.children.len()
+            &&& self.children[i] is Some
+            &&& self.children[i].unwrap().has_path(path.drop_first())
+        }
+    }
+
+    /// The node reached by following `path`.
+    pub open spec fn node_at(self, path: Seq<usize>) -> Self
+        recommends
+            self.has_path(path),
+        decreases path.len(),
+    {
+        if path.len() == 0 {
+            self
+        } else {
+            self.children[path[0] as int].unwrap().node_at(path.drop_first())
+        }
+    }
+
+    /// The tree with the slot at non-empty `path` set to `slot`.
+    pub open spec fn set_at(self, path: Seq<usize>, slot: Option<Self>) -> Self
+        recommends
+            path.len() > 0,
+            self.has_path(path.drop_last()),
+        decreases path.len(),
+    {
+        let i = path[0] as int;
+        if path.len() <= 1 {
+            Node { children: self.children.update(i, slot), ..self }
+        } else {
+            Node {
+                children: self.children.update(
+                    i,
+                    Some(self.children[i].unwrap().set_at(path.drop_first(), slot)),
+                ),
+                ..self
+            }
+        }
+    }
+
+    /// Borrows the node at `path`.
+    pub proof fn tracked_borrow_at(tracked &self, path: Seq<usize>) -> (tracked ret: &Self)
+        requires
+            self.has_path(path),
+        ensures
+            *ret == self.node_at(path),
+        decreases path.len(),
+    {
+        if path.len() == 0 {
+            self
+        } else {
+            let tracked child = self.tracked_borrow_child(path[0] as int);
+            child.tracked_borrow_at(path.drop_first())
+        }
+    }
+
+    /// Takes the sub-tree at non-empty `path` out, leaving `None` in its slot.
+    pub proof fn tracked_take_at(tracked &mut self, path: Seq<usize>) -> (tracked ret: Self)
+        requires
+            path.len() > 0,
+            old(self).has_path(path),
+        ensures
+            ret == old(self).node_at(path),
+            *self == old(self).set_at(path, None),
+        decreases path.len(),
+    {
+        let i = path[0] as int;
+        if path.len() == 1 {
+            assert(path.drop_first().len() == 0);
+            let tracked ret = self.tracked_take_child(i);
+            assert(old(self).children[i].unwrap().node_at(path.drop_first()) == old(
+                self,
+            ).children[i].unwrap());
+            assert(ret == old(self).node_at(path));
+            assert(*self == old(self).set_at(path, None));
+            ret
+        } else {
+            let ghost before = *self;
+            let tracked mut child = self.tracked_take_child(i);
+            let tracked ret = child.tracked_take_at(path.drop_first());
+            self.tracked_put_child(i, child);
+            assert(self.children =~= before.children.update(i, Some(child)));
+            assert(ret == old(self).node_at(path));
+            assert(*self == old(self).set_at(path, None));
+            ret
+        }
+    }
+
+    /// Puts `node` into the slot at non-empty `path`.
+    pub proof fn tracked_put_at(tracked &mut self, path: Seq<usize>, tracked node: Self)
+        requires
+            path.len() > 0,
+            old(self).has_path(path.drop_last()),
+            0 <= path.last() < old(self).node_at(path.drop_last()).children.len(),
+        ensures
+            *self == old(self).set_at(path, Some(node)),
+        decreases path.len(),
+    {
+        let i = path[0] as int;
+        if path.len() == 1 {
+            assert(path.drop_last().len() == 0);
+            self.tracked_put_child(i, node);
+            assert(*self == old(self).set_at(path, Some(node)));
+        } else {
+            assert(path.drop_last()[0] == path[0]);
+            assert(path.drop_last().drop_first() =~= path.drop_first().drop_last());
+            assert(path.drop_first().last() == path.last());
+            let ghost before = *self;
+            let tracked mut child = self.tracked_take_child(i);
+            child.tracked_put_at(path.drop_first(), node);
+            self.tracked_put_child(i, child);
+            assert(self.children =~= before.children.update(i, Some(child)));
+            assert(*self == old(self).set_at(path, Some(node)));
+        }
+    }
+
+    /// After `set_at`, the slot at `path` holds `slot` and every other node
+    /// is the one it was.
+    pub proof fn lemma_set_at(self, path: Seq<usize>, slot: Option<Self>)
+        requires
+            path.len() > 0,
+            self.has_path(path.drop_last()),
+            0 <= path.last() < self.node_at(path.drop_last()).children.len(),
+        ensures
+            self.set_at(path, slot).has_path(path.drop_last()),
+            self.set_at(path, slot).node_at(path.drop_last()).children == self.node_at(
+                path.drop_last(),
+            ).children.update(path.last() as int, slot),
+            self.set_at(path, slot).node_at(path.drop_last()).value == self.node_at(
+                path.drop_last(),
+            ).value,
+            self.set_at(path, slot).node_at(path.drop_last()).level == self.node_at(
+                path.drop_last(),
+            ).level,
+            self.set_at(path, slot).value == self.value,
+            self.set_at(path, slot).level == self.level,
+            forall|j: int|
+                0 <= j < self.children.len() && j != path[0] as int ==> (#[trigger] self.set_at(
+                    path,
+                    slot,
+                ).children[j]) == self.children[j],
+        decreases path.len(),
+    {
+        let i = path[0] as int;
+        if path.len() == 1 {
+            assert(path.drop_last().len() == 0);
+        } else {
+            assert(path.drop_last()[0] == path[0]);
+            assert(path.drop_last().drop_first() =~= path.drop_first().drop_last());
+            assert(path.drop_first().last() == path.last());
+            self.children[i].unwrap().lemma_set_at(path.drop_first(), slot);
+        }
+    }
+
     pub proof fn axiom_max_depth_positive()
         ensures
             Self::max_depth() > 0,
