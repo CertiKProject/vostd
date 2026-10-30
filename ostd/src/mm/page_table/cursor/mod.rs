@@ -3622,13 +3622,10 @@ impl<'rcu, C: PageTableConfig, A: InAtomicMode> CursorMut<'rcu, C, A> {
                 }
                 // SAFETY: We must have locked this node.
 
-                let tracked mut old_node_owner = {
-                    let tracked old_child_value = old_child_owner.tracked_borrow_mut_value();
-                    old_child_value.tracked_take_node()
-                };
+                let ghost old_node = old_child_owner.value().node();
 
                 #[verus_spec(with
-                    Tracked(&old_node_owner.frame_permission),
+                    Tracked(&old_child_owner.tracked_borrow_value().tracked_borrow_node().frame_permission),
                     Tracked(regions)
                 )]
                 let borrow_pt = pt.borrow_with_permission();
@@ -3642,27 +3639,29 @@ impl<'rcu, C: PageTableConfig, A: InAtomicMode> CursorMut<'rcu, C, A> {
                     );
                 }
                 let locked_pt = unsafe {
-                    #[verus_spec(with Tracked(&old_node_owner), Tracked(guards))]
+                    #[verus_spec(with Tracked(old_child_owner.tracked_borrow_value().tracked_borrow_node()), Tracked(guards))]
                     borrow_pt.make_guard_unchecked(rcu_guard)
                 };
 
                 proof {
                     owner.lemma_map_children_implies(
                         CursorOwner::node_unlocked(guards0),
-                        CursorOwner::node_unlocked_except(*guards, old_node_owner.slot_vaddr()),
+                        CursorOwner::node_unlocked_except(*guards, old_node.slot_vaddr()),
                     );
                 }
 
                 let ghost guards1 = *guards;
-                let ghost locked_addr = old_node_owner.slot_vaddr();
+                let ghost locked_addr = old_node.slot_vaddr();
                 let ghost owner_before_dfs = *owner;
 
                 // SAFETY:
                 //  - We checked that we are not unmapping shared kernel page table nodes.
                 //  - We must have locked the entire sub-tree since the range is locked.
                 let ghost subtree_count = PageTableOwner::<C>(owner0.cur_subtree())@.mappings.len();
+                let tracked mut old_pt_owner = PageTableOwner(old_child_owner);
                 let num_frames = unsafe {
-                    #[verus_spec(with Tracked(owner), Tracked(guards), Ghost(locked_addr), Ghost(subtree_count))]
+                    #[verus_spec(with Tracked(&mut old_pt_owner), Tracked(guards), Tracked(regions),
+                                      Ghost(locked_addr), Ghost(subtree_count))]
                     locking::dfs_mark_stray_and_unlock(rcu_guard, &locked_pt)
                 };
 
@@ -3737,7 +3736,8 @@ impl<'rcu, C: PageTableConfig, A: InAtomicMode> CursorMut<'rcu, C, A> {
                 }
                 let ghost regions_before_clone = *regions;
                 proof_decl! {
-                    let tracked NodeOwner { frame_permission, .. } = old_node_owner;
+                    let tracked NodeOwner { frame_permission, .. } =
+                        old_pt_owner.0.tracked_borrow_mut_value().tracked_take_node();
                 }
                 #[cfg(verus_keep_ghost_body)]
                 {

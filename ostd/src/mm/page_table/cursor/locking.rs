@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 //! Implementation of the locking protocol.
 use vstd::prelude::*;
-use vstd_extra::{array_ptr::*, ghost_tree::*, ownership::*};
+use vstd_extra::{array_ptr::*, drop_tracking::TrackDrop, ghost_tree::*, ownership::*};
 
 use crate::specs::{
     mm::{
@@ -674,6 +674,11 @@ unsafe fn dfs_release_lock<'rcu, C: PageTableConfig, A: InAtomicMode>(
     }
 }
 
+/// The owner held at the root of `n`.
+pub open spec fn node_owner<C: PageTableConfig>(n: PageTableOwner<C>) -> EntryOwner<C> {
+    n.0.value()
+}
+
 /// Marks all the nodes in the sub-tree rooted at the node as stray, and
 /// returns the num of pages mapped within the sub-tree.
 ///
@@ -690,90 +695,324 @@ unsafe fn dfs_release_lock<'rcu, C: PageTableConfig, A: InAtomicMode>(
 /// This function must not be called upon a shared node, e.g., the second-
 /// top level nodes that the kernel space and user space share.
 #[verus_spec(res =>
-    with Tracked(owner): Tracked<&mut CursorOwner<'a, C>>,
+    with Tracked(owner): Tracked<&mut PageTableOwner<C>>,
         Tracked(guards): Tracked<&mut Guards>,
+        Tracked(regions): Tracked<&mut MetaRegionOwners>,
         Ghost(locked_addr): Ghost<usize>,
         Ghost(subtree_mappings_count): Ghost<nat>
     requires
         old(owner).inv(),
-        // The locked_addr must be the address that was locked (held in guards)
+        // `sub_tree` is the guard of the subtree's root node.
+        old(owner).0.value().node().relate_guard(*sub_tree),
+        locked_addr == old(owner).0.value().node().slot_vaddr(),
         old(guards).lock_held(locked_addr),
+        subtree_mappings_count == old(owner)@.mappings.len(),
+        old(regions).inv(),
     ensures
-        // The return value equals the number of mappings in the subtree.
-        // This connects the physical DFS frame count to the ghost view_rec mappings count.
+        // The number of frames equals the number of mappings in the subtree.
         res as nat == subtree_mappings_count,
-        final(owner).inv(),
-        final(owner).guard_level == old(owner).guard_level,
-        final(owner).level == old(owner).level,
-        final(owner).va == old(owner).va,
-        final(owner).barrier_va == old(owner).barrier_va,
-        final(owner).prefix == old(owner).prefix,
-        final(owner).popped_too_high == old(owner).popped_too_high,
-        // Preserve the guard for each continuation level
-        final(owner).level <= 4 ==> final(owner).continuations[3].guard == old(owner).continuations[3].guard,
-        final(owner).level <= 3 ==> final(owner).continuations[2].guard == old(owner).continuations[2].guard,
-        final(owner).level <= 2 ==> final(owner).continuations[1].guard == old(owner).continuations[1].guard,
-        final(owner).level == 1 ==> final(owner).continuations[0].guard == old(owner).continuations[0].guard,
-        final(owner).continuations[final(owner).level - 1].children[final(owner).continuations[final(owner).level - 1].idx as int]->0.value().is_absent(),
-        // entry_own at current level is preserved
-        final(owner).continuations[final(owner).level - 1].entry_own == old(owner).continuations[old(owner).level - 1].entry_own,
-        // Children at current level are preserved
-        forall |i: int| 0 <= i < NR_ENTRIES ==>
-            #[trigger]
-            final(owner).continuations[final(owner).level - 1].children[i] == old(owner).continuations[old(owner).level - 1].children[i],
-        // Continuations at higher levels are completely preserved
-        forall |lvl: int| #![trigger final(owner).continuations[lvl]]
-            final(owner).level <= lvl < NR_LEVELS ==> final(owner).continuations[lvl] == old(owner).continuations[lvl],
-        // Guards postconditions:
-        // 1. Everything that was unlocked before is still unlocked (no new locks added)
+        final(owner).0.value().is_node(),
+        // The caller takes this back to clone the page-table node.
+        final(owner).0.value().node().frame_permission
+            == old(owner).0.value().node().frame_permission,
+        final(regions).inv(),
+        final(regions).slots == old(regions).slots,
+        final(regions).slot_owners == old(regions).slot_owners,
+        // 1. Everything that was unlocked before is still unlocked.
         forall |addr: usize| old(guards).unlocked(addr) ==> final(guards).unlocked(addr),
-        // 2. The locked address is now unlocked
+        // 2. The locked address is now unlocked.
         final(guards).unlocked(locked_addr),
-        // 3. Other locked addresses remain locked
-        forall |addr: usize| addr != locked_addr && old(guards).lock_held(addr) ==> final(guards).lock_held(addr),
+        // 3. Other locked addresses remain locked.
+        forall |addr: usize| addr != locked_addr && old(guards).lock_held(addr)
+            ==> final(guards).lock_held(addr),
+    decreases old(owner).0.value().node().level(),
 )]
-#[verifier::external_body]
 pub unsafe fn dfs_mark_stray_and_unlock<'a, C: PageTableConfig, A: InAtomicMode>(
     rcu_guard: &A,
     sub_tree: &PageTableGuard<'a, C>,
 ) -> usize {
-    unimplemented!();
-    /*
-    let mut sub_tree_val = sub_tree.take(Tracked(guard_perm));
-    let stray_mut = sub_tree_val.stray_mut();
-    let tracked node_owner = entry_own.tracked_take_node();
-    let stray = stray_mut.take(Tracked(&mut node_owner.as_node.meta_own.stray));
+    // Mark the node as stray. The lock is held, so we have exclusive access.
+    let tracked node_own = owner.0.tracked_borrow_mut_value().tracked_borrow_mut_node();
+    #[verus_spec(with
+        Tracked(Some(node_own.frame_permission.tracked_borrow())),
+        Tracked(&())
+    )]
+    let meta = sub_tree.meta();
+    let _was_stray = meta.stray.replace(Tracked(&mut node_own.meta_own.stray), true);
 
-    stray_mut.put(Tracked(&mut node_owner.as_node.meta_own.stray), true);
+    let tracked node_own = owner.0.tracked_borrow_value().tracked_borrow_node();
+    #[verus_spec(with Tracked(node_own))]
+    let level = sub_tree.level();
 
-    proof {
-        entry_own.tracked_put_node(node_owner);
+    if level == 1 {
+        let tracked node_own = owner.0.tracked_borrow_value().tracked_borrow_node();
+        #[verus_spec(with Tracked(node_own))]
+        let nr_children = sub_tree.nr_children();
+        // Dropping the guard releases the lock.
+        proof {
+            let tracked _obl = (*sub_tree).tracked_redeem(guards);
+        }
+        return nr_children as usize;
     }
 
-    if sub_tree_val.level() == 1 {
-        return sub_tree_val.nr_children() as usize;
-    }
-    sub_tree.put(Tracked(guard_perm), sub_tree_val);
-
-    let mut num_frames = 0;
-
+    let mut num_frames: usize = 0;
     let end = nr_subpage_per_huge::<C>();
-    for i in 0..end {
-        let child = PageTableGuard::entry(sub_tree, i);
-        match child.to_ref() {
+    let mut i: usize = 0;
+    while i < end
+        invariant
+            true,
+        decreases end - i,
+    {
+        let ghost ii = i as int;
+        let tracked node_own = owner.0.tracked_borrow_value().tracked_borrow_node();
+        let tracked child_entry_own = owner.0.tracked_borrow_child(ii).tracked_borrow_value();
+        // `entry` needs `&mut PageTableGuard`, so read the PTE directly instead.
+        let pte = unsafe {
+            #[verus_spec(with Tracked(node_own), Tracked(&*regions))]
+            sub_tree.read_pte(i)
+        };
+        let child_ref = unsafe {
+            #[verus_spec(with Tracked(regions), Tracked(child_entry_own))]
+            ChildRef::<'a, C>::from_pte(&pte, level)
+        };
+        match child_ref {
             ChildRef::PageTable(pt) => {
+                let tracked mut child_owner = PageTableOwner(owner.0.tracked_take_child(ii));
+                let ghost child_locked_addr = child_owner.0.value().node().slot_vaddr();
+                let ghost child_count = child_owner@.mappings.len();
                 // SAFETY: The caller ensures that the node is locked and the new guard is unique.
-                let locked_pt = unsafe { pt.make_guard_unchecked(rcu_guard) };
-                // SAFETY: The caller ensures that all the nodes in the sub-tree are locked and all
-                // guards are forgotten.
-                num_frames += unsafe { dfs_mark_stray_and_unlock(rcu_guard, locked_pt) };
+                let locked_pt = unsafe {
+                    #[verus_spec(with
+                        Tracked(child_owner.0.tracked_borrow_value().tracked_borrow_node()),
+                        Tracked(guards)
+                    )]
+                    pt.make_guard_unchecked(rcu_guard)
+                };
+                // SAFETY: The caller ensures that all the nodes in the sub-tree are locked and
+                // all guards are forgotten.
+                #[verus_spec(with
+                    Tracked(&mut child_owner),
+                    Tracked(guards),
+                    Tracked(regions),
+                    Ghost(child_locked_addr),
+                    Ghost(child_count)
+                )]
+                let frames_below = dfs_mark_stray_and_unlock(rcu_guard, &locked_pt);
+                proof {
+                    let tracked PageTableOwner(child) = child_owner;
+                    owner.0.tracked_put_child(ii, child);
+                }
+                num_frames = num_frames + frames_below;
             },
             ChildRef::None | ChildRef::Frame(_, _, _) => {},
         }
+        i = i + 1;
     }
-
-    num_frames*/
+    // Dropping the guard releases the lock.
+    proof {
+        let tracked _obl = (*sub_tree).tracked_redeem(guards);
+    }
+    num_frames
 }
+
+//  pub fn dfs_mark_stray_and_unlock<'a, C: PageTableConfig, A: InAtomicMode>(
+//      rcu_guard: &'a A,
+//      sub_tree: PPtr<PageTableGuard<'a, C>>,
+//  ) -> (num_frames: usize)
+//      requires
+//          config_is_x86_64::<C>(),
+//          old(regions).inv(),
+//          subtree_wf(*old(owner), *old(regions), node_owner(*old(owner)).level() as nat),
+//          node_owner(*old(owner)).guard_perm@.pptr() == sub_tree,
+//      ensures
+//          *regions == *old(regions),
+//          subtree_wf(*owner, *regions, node_owner(*old(owner)).level() as nat),
+//          node_owner(*owner).is_stray(),
+//          stray_propagates(*owner, node_owner(*old(owner)).level() as nat),
+//          node_owner(*owner).guard_perm == node_owner(*old(owner)).guard_perm,
+//          node_owner(*owner).slot_perm == node_owner(*old(owner)).slot_perm,
+//          node_owner(*owner).level() == node_owner(*old(owner)).level(),
+//          num_frames <= max_frames(node_owner(*old(owner)).level()),
+//      decreases node_owner(*old(owner)).level(),
+//  {
+//      proof {
+//          lemma_config_is_x86_64::<C>();
+//      }
+//      let ghost old_root = *owner;
+//      let ghost lv = node_owner(old_root).level() as nat;
+//  
+//      // Mark this node stray. Its owner is taken out of the tree node while
+//      // the flag is written.
+//      let tracked mut cur_own = owner.value.tree_node.tracked_take();
+//      proof {
+//          lemma_owner_frame(cur_own, *regions);
+//      }
+//      let tracked slot_own = regions.slot_owners.tracked_borrow(frame_to_index(cur_own.paddr()));
+//      let sub_tree_val = sub_tree.borrow(Tracked(cur_own.guard_perm.borrow()));
+//      #[verus_spec(with Tracked(&cur_own), Tracked(slot_own))]
+//      let stray_cell = sub_tree_val.stray_mut();
+//      let _was_stray = stray_cell.replace(
+//          Tracked(cur_own.node_own.meta_own.stray.borrow_mut()),
+//          true,
+//      );
+//      #[verus_spec(with Tracked(slot_own), Tracked(cur_own.slot_perm.borrow()), Tracked(cur_own.node_own.meta_perm.borrow()))]
+//      let level = sub_tree_val.level();
+//      proof {
+//          owner.value.tree_node = Some(cur_own);
+//      }
+//      let ghost marked = node_owner(*owner);
+//      assert(marked.ptes() == node_owner(old_root).ptes());
+//      assert(owner.children == old_root.children);
+//  
+//      if level == 1 {
+//          let tracked cur_own = owner.value.tree_node.tracked_borrow();
+//          let sub_tree_val = sub_tree.borrow(Tracked(cur_own.guard_perm.borrow()));
+//          #[verus_spec(with Tracked(cur_own), Tracked(slot_own))]
+//          let nr_children = sub_tree_val.nr_children();
+//          // Dropping the guard releases the lock.
+//          #[verus_spec(with Tracked(cur_own))]
+//          PageTableGuard::<'a, C>::unlock(sub_tree);
+//          proof {
+//              lemma_max_frames_bounded(1);
+//              assert forall|i: int| 0 <= i < NR_ENTRIES() implies (
+//              #[trigger] owner.children[i] is Some <==> marked.pte_is_node(i)) by {
+//                  assert(old_root.children[i] is Some <==> node_owner(old_root).pte_is_node(i));
+//              }
+//          }
+//          return nr_children as usize;
+//      }
+//      let mut num_frames: usize = 0;
+//  
+//      let end = nr_subpage_per_huge::<C>();
+//      let mut i: usize = 0;
+//      while i < end
+//          invariant
+//              config_is_x86_64::<C>(),
+//              i <= end,
+//              end == 512,
+//              2 <= level <= 4,
+//              level == lv,
+//              *regions == *old(regions),
+//              regions.inv(),
+//              subtree_wf(old_root, *regions, lv),
+//              old_root == *old(owner),
+//              lv == node_owner(*old(owner)).level(),
+//              owner.value.tree_node is Some,
+//              node_owner(*owner) == marked,
+//              marked.inv(),
+//              marked.in_region(*regions),
+//              marked.is_stray(),
+//              marked.level() == lv,
+//              marked.ptes() == node_owner(old_root).ptes(),
+//              marked.guard_perm == node_owner(old_root).guard_perm,
+//              marked.slot_perm == node_owner(old_root).slot_perm,
+//              marked.guard_perm@.pptr() == sub_tree,
+//              owner.children.len() == 512,
+//              // Not yet visited: unchanged.
+//              forall|j: int| i <= j < 512 ==> #[trigger] owner.children[j] == old_root.children[j],
+//              // Visited: same shape, and the whole child sub-tree is stray.
+//              forall|j: int|
+//                  0 <= j < i ==> (#[trigger] owner.children[j] is Some
+//                      <==> old_root.children[j] is Some),
+//              forall|j: int|
+//                  0 <= j < i && #[trigger] owner.children[j] is Some ==> {
+//                      &&& node_owner(owner.children[j].unwrap()).paddr() == marked.child_paddr(j)
+//                      &&& subtree_wf(owner.children[j].unwrap(), *regions, (lv - 1) as nat)
+//                      &&& node_owner(owner.children[j].unwrap()).is_stray()
+//                      &&& stray_propagates(owner.children[j].unwrap(), (lv - 1) as nat)
+//                  },
+//              num_frames <= i * max_frames((level - 1) as PagingLevel),
+//          decreases end - i,
+//      {
+//          proof {
+//              lemma_config_is_x86_64::<C>();
+//          }
+//          let ghost ii = i as int;
+//          let tracked cur_own = owner.value.tree_node.tracked_borrow();
+//          proof {
+//              lemma_owner_frame(*cur_own, *regions);
+//          }
+//          let tracked slot_own = regions.slot_owners.tracked_borrow(frame_to_index(cur_own.paddr()));
+//          #[verus_spec(with Tracked(cur_own), Tracked(slot_own))]
+//          let child = PageTableGuard::<'a, C>::entry(sub_tree, i);
+//  
+//          proof {
+//              assert(owner.children[ii] == old_root.children[ii]);
+//              assert(old_root.children[ii] is Some <==> node_owner(old_root).pte_is_node(ii));
+//              if marked.pte_is_node(ii) {
+//                  let c = old_root.children[ii].unwrap();
+//                  assert(subtree_wf(c, *regions, (lv - 1) as nat));
+//                  assert(node_owner(c).in_region(*regions));
+//              }
+//          }
+//          #[verus_spec(with Tracked(cur_own), Tracked(regions))]
+//          let child_ref = child.to_ref();
+//          match child_ref {
+//              ChildRef::PageTable(pt) => {
+//                  let ghost before = *owner;
+//                  let tracked mut child_node = owner.tracked_take_child(ii);
+//                  let ghost c_old = child_node;
+//                  proof {
+//                      assert(subtree_wf(c_old, *regions, (lv - 1) as nat));
+//                      assert(node_owner(c_old).level() == lv - 1);
+//                      assert(node_owner(c_old).level() < node_owner(*old(owner)).level());
+//                  }
+//                  let tracked child_own = child_node.value.tree_node.tracked_borrow();
+//                  proof {
+//                      lemma_owner_frame(*child_own, *regions);
+//                  }
+//                  assert(pt.inner.ptr == child_own.slot_perm@.pptr());
+//                  // The node is locked and the new guard is unique.
+//                  #[verus_spec(with Tracked(child_own))]
+//                  let locked_pt = pt.make_guard_unchecked(rcu_guard);
+//  
+//                  // All the nodes in the sub-tree are locked and all guards are forgotten.
+//                  #[verus_spec(with Tracked(&mut child_node), Tracked(regions))]
+//                  let frames_below = dfs_mark_stray_and_unlock(rcu_guard, locked_pt);
+//  
+//                  proof {
+//                      owner.tracked_put_child(ii, child_node);
+//                      assert(owner.children =~= before.children.update(ii, Some(child_node)));
+//                      lemma_max_frames_bounded(level);
+//                      lemma_mul_inequality(i as int + 1, 512, max_frames((level - 1) as PagingLevel));
+//                      lemma_mul_is_distributive_add_other_way(
+//                          max_frames((level - 1) as PagingLevel),
+//                          i as int,
+//                          1,
+//                      );
+//                  }
+//                  num_frames = num_frames + frames_below;
+//              },
+//              ChildRef::None | ChildRef::Frame(_, _, _) => {
+//                  proof {
+//                      lemma_max_frames_bounded(level);
+//                      lemma_mul_inequality(
+//                          i as int,
+//                          i as int + 1,
+//                          max_frames((level - 1) as PagingLevel),
+//                      );
+//                  }
+//              },
+//          }
+//          i = i + 1;
+//      }
+
+//     // Dropping the guard releases the lock of this node.
+//     let tracked cur_own = owner.value.tree_node.tracked_borrow();
+//     #[verus_spec(with Tracked(cur_own))]
+//     PageTableGuard::<'a, C>::unlock(sub_tree);
+// 
+//     proof {
+//         lemma_max_frames_bounded(level);
+//         assert forall|j: int| 0 <= j < NR_ENTRIES() implies (#[trigger] owner.children[j] is Some
+//             <==> marked.pte_is_node(j)) by {
+//             assert(old_root.children[j] is Some <==> node_owner(old_root).pte_is_node(j));
+//         }
+//         assert(subtree_wf(*owner, *regions, lv));
+//         assert(stray_propagates(*owner, lv));
+//     }
+//     num_frames
+// }
 
 /// Spec-level ceiling division: `ceil(x / d)` for non-negative `x` and positive `d`.
 pub open spec fn ceil_div(x: int, d: int) -> int

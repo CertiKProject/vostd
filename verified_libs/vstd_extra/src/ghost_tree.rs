@@ -431,6 +431,34 @@ impl<T: TreeNodeValue<L>, const N: usize, const L: usize> TreeNode<T, N, L> {
         }
     }
 
+    /// Moves the `i`-th child out, leaving `None` in its slot.
+    pub proof fn tracked_take_child(tracked &mut self, i: int) -> (tracked ret: Self)
+        requires
+            0 <= i < old(self).children().len(),
+            old(self).children()[i] is Some,
+        ensures
+            ret == old(self).children()[i]->0,
+            *final(self) == old(self).remove(i),
+    {
+        lemma_update_is_remove_insert(self.children@, i, None);
+        let tracked child = self.children.tracked_remove(i).tracked_unwrap();
+        self.children.tracked_insert(i, None);
+        child
+    }
+
+    /// Puts `child` into the empty `i`-th slot.
+    pub proof fn tracked_put_child(tracked &mut self, i: int, tracked child: Self)
+        requires
+            0 <= i < old(self).children().len(),
+            old(self).children()[i] is None,
+        ensures
+            *final(self) == old(self).insert(i, child),
+    {
+        lemma_update_is_remove_insert(self.children@, i, Some(child));
+        let tracked _ = self.children.tracked_remove(i);
+        self.children.tracked_insert(i, Some(child));
+    }
+
     pub proof fn tracked_borrow_value(tracked &self) -> (tracked res: &T)
         ensures
             *res == self.value(),
