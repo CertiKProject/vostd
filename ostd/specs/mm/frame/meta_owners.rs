@@ -4,14 +4,22 @@
 //! - The primitives for MetaSlot.
 use vstd::prelude::*;
 
-use vstd::{atomic::*, cell::pcell_maybe_uninit, simple_pptr::*};
+use vstd::{
+    atomic::*,
+    atomic_ghost::{AtomicInvariantPredicate, AtomicU8},
+    cell::{CellId, pcell_maybe_uninit},
+    simple_pptr::*,
+};
 use vstd_extra::{
     cast_ptr::{self, Repr},
     ghost_tree::TreePath,
     ownership::*,
 };
 
-use crate::specs::{arch::NR_ENTRIES, mm::frame::linked_list::linked_list_owners::StoredLink};
+use crate::specs::{
+    arch::NR_ENTRIES,
+    mm::{frame::linked_list::linked_list_owners::StoredLink, page_table::node::PageMetaOwner},
+};
 
 use crate::mm::{
     Paddr, PagingLevel, Vaddr,
@@ -90,11 +98,36 @@ pub axiom fn axiom_mmio_paddr_huge_page_closed(pa: Paddr, page_size: usize, offs
         is_mmio_paddr((pa + offset) as Paddr) == is_mmio_paddr(pa),
 ;
 
+/// The invariant of the page table node lock (see [`PageTableLock`]).
+pub struct PageTableLockPred;
+
+impl AtomicInvariantPredicate<(CellId, CellId), u8, Option<PageMetaOwner>> for PageTableLockPred {
+    /// When the lock is free (`0`), it stores the permissions to the node's
+    /// `nr_children` and `stray` cells, whose ids are given by the constant.
+    /// When it is held (`1`), the permissions have been handed to the lock holder.
+    open spec fn atomic_inv(k: (CellId, CellId), v: u8, g: Option<PageMetaOwner>) -> bool {
+        match g {
+            None => v == 1,
+            Some(owner) => {
+                &&& v == 0
+                &&& owner.inv()
+                &&& owner.nr_children.id() == k.0
+                &&& owner.stray.id() == k.1
+            },
+        }
+    }
+}
+
+/// The lock of a page table node. It carries the [`PageMetaOwner`] of the
+/// node while unlocked. Only the parts of the node owner that do not depend on
+/// the `PageTableConfig` are stored, since the stored metadata is not generic.
+pub type PageTableLock = AtomicU8<(CellId, CellId), Option<PageMetaOwner>, PageTableLockPred>;
+
 pub struct StoredPageTablePageMeta {
     pub nr_children: pcell_maybe_uninit::PCell<u16>,
     pub stray: pcell_maybe_uninit::PCell<bool>,
     pub level: PagingLevel,
-    pub lock: PAtomicU8,
+    pub lock: PageTableLock,
 }
 
 pub enum MetaSlotStorage {

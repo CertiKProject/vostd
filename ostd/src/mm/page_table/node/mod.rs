@@ -38,7 +38,7 @@ pub use entry::*;
 use vstd::cell::pcell_maybe_uninit;
 use vstd::prelude::*;
 
-use vstd::atomic::PAtomicU8;
+use vstd::atomic_ghost::*;
 use vstd_extra::array_ptr;
 use vstd_extra::cast_ptr::*;
 use vstd_extra::drop_tracking::{Drop as VerifiedDrop, TrackDrop};
@@ -59,7 +59,8 @@ use crate::specs::mm::{
     frame::{
         mapping::{frame_to_index, lemma_frame_to_index_injective, meta_to_index},
         meta_owners::{
-            MetaSlotOwner, MetaSlotStorage, MetadataPerms, typed_meta_value, typed_meta_wf,
+            MetaSlotOwner, MetaSlotStorage, MetadataPerms, PageTableLock, typed_meta_value,
+            typed_meta_wf,
         },
         meta_region_owners::MetaRegionOwners,
     },
@@ -100,7 +101,7 @@ pub struct PageTablePageMeta<C: PageTableConfig> {
     /// referenced by page tables of different levels.
     pub level: PagingLevel,
     /// The lock for the page table page.
-    pub lock: PAtomicU8,
+    pub lock: PageTableLock,
     pub _phantom: core::marker::PhantomData<C>,
 }
 
@@ -670,7 +671,92 @@ impl<'a, C: PageTableConfig> PageTableNodeRef<'a, C> {
     pub fn lock<'rcu, A: InAtomicMode>(self, _guard: &'rcu A) -> PageTableGuard<'rcu, C> where
         'a: 'rcu,
      {
-        unimplemented!()
+        /*        while self
+                    .meta()
+                    .lock
+                    .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                    .is_err()
+                {
+                    core::hint::spin_loop();
+                }
+         */
+
+       unimplemented!()
+    }
+
+
+    /// Experimental: a spin-lock-style version of [`Self::lock`].
+    ///
+    /// Modeled on `SpinLock::acquire_lock` in `sync/spin.rs`: acquiring the lock
+    /// transfers the [`PageMetaOwner`] (the permissions for `nr_children` and `stray`)
+    /// out of the lock and hands it to the caller.
+    #[verus_spec(res =>
+        with Tracked(points_to): Tracked<&vstd::simple_pptr::PointsTo<MetaSlot>>,
+            Tracked(metadata_perms): Tracked<&MetadataPerms>,
+            Tracked(guards): Tracked<&mut Guards<'rcu>>
+            -> meta_own: Tracked<PageMetaOwner>,
+        requires
+            self.inner@.ptr.addr() == points_to.addr(),
+            typed_meta_wf::<PageTablePageMeta<C>>(*points_to, *metadata_perms, ()),
+            typed_meta_value::<PageTablePageMeta<C>>(*metadata_perms, ()).lock_wf(),
+            old(guards).unlocked(self.inner@.ptr.addr()),
+        ensures
+            meta_own@.inv(),
+            typed_meta_value::<PageTablePageMeta<C>>(*metadata_perms, ()).wf(meta_own@),
+            res.inner == self,
+            final(guards).lock_held(self.inner@.ptr.addr()),
+            Self::locks_preserved_except(self.inner@.ptr.addr(), *old(guards), *final(guards)),
+    )]
+    #[verifier::exec_allows_no_decreases_clause]
+    pub fn lock_experiment<'rcu, A: InAtomicMode>(self, _guard: &'rcu A) -> PageTableGuard<'rcu, C> where
+        'a: 'rcu,
+     {
+        proof_decl!{
+            let tracked mut meta_own: Option<PageMetaOwner> = None;
+        }
+        #[verus_spec(with
+            Tracked(points_to),
+            Tracked(metadata_perms),
+            Tracked(&())
+        )]
+        let meta = self.meta();
+
+        loop
+            invariant_except_break
+                meta_own is None,
+            invariant
+                meta == typed_meta_value::<PageTablePageMeta<C>>(*metadata_perms, ()),
+                meta.lock_wf(),
+            ensures
+                meta_own is Some,
+                meta_own->Some_0.inv(),
+                meta.wf(meta_own->Some_0),
+        {
+            let res = atomic_with_ghost! {
+                meta.lock => compare_exchange(0, 1);
+                returning res;
+                ghost g => {
+                    if res is Ok {
+                        meta_own = Some(g.tracked_take());
+                    }
+                }
+            };
+            if res.is_ok() {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+
+        let guard = PageTableGuard::<'rcu, C> { inner: self };
+
+        proof_decl!{
+            let tracked meta_own = meta_own.tracked_unwrap();
+        }
+        proof {
+            guards.guards = guards.guards.insert(self.inner@.ptr.addr());
+        }
+        proof_with!{ |= Tracked(meta_own) }
+        guard
     }
 
     /// Creates a new [`PageTableGuard`] without checking if the page table lock is held.
@@ -934,12 +1020,22 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
 }*/
 
 impl<C: PageTableConfig> PageTablePageMeta<C> {
-    pub fn new(level: PagingLevel) -> Self {
+    pub fn new(level: PagingLevel) -> (res: Self)
+        ensures
+            res.lock_wf(),
+    {
+        let (nr_children, Tracked(nr_children_perm)) = pcell_maybe_uninit::PCell::new(0);
+        let (stray, Tracked(stray_perm)) = pcell_maybe_uninit::PCell::new(false);
+        let tracked meta_own = PageMetaOwner { nr_children: nr_children_perm, stray: stray_perm };
         Self {
-            nr_children: pcell_maybe_uninit::PCell::new(0).0,
-            stray: pcell_maybe_uninit::PCell::new(false).0,
+            lock: PageTableLock::new(
+                Ghost((nr_children.id(), stray.id())),
+                0,
+                Tracked(Some(meta_own)),
+            ),
+            nr_children,
+            stray,
             level,
-            lock: PAtomicU8::new(0).0,
             _phantom: PhantomData,
         }
     }

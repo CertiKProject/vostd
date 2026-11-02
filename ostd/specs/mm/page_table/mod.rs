@@ -2025,6 +2025,8 @@ impl AbstractVaddr {
                     + aligned.rec_compute_vaddr(4)) as Vaddr);
             };
             assert(aligned.rec_compute_vaddr(2) == 0) by {
+                assert(self.align_down(4).index[2] == 0);
+                assert(aligned.index[2] == 0);
                 assert(aligned.rec_compute_vaddr(2) == (aligned.index[2] * page_size(3)
                     + aligned.rec_compute_vaddr(3)) as Vaddr);
             };

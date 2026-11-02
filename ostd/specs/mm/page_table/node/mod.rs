@@ -83,6 +83,12 @@ impl<'rcu, C: PageTableConfig> TrackDrop for PageTableGuard<'rcu, C> {
 }
 
 impl<C: PageTableConfig> PageTablePageMeta<C> {
+    /// The lock is well-formed and guards the permissions of this node's metadata cells.
+    pub open spec fn lock_wf(self) -> bool {
+        &&& self.lock.well_formed()
+        &&& self.lock.constant() == (self.nr_children.id(), self.stray.id())
+    }
+
     pub open spec fn into_spec(self) -> StoredPageTablePageMeta {
         StoredPageTablePageMeta {
             nr_children: self.nr_children,
