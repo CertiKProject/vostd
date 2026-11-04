@@ -591,6 +591,21 @@ impl<T, const TOTAL: usize> CountResource<T, TOTAL> {
         joined.validate();
     }
 
+    /// A vacant pool and a [`Count`] cannot share a location.
+    pub proof fn lemma_vacant_excludes_frac(tracked &mut self, tracked frac: &Count<T, TOTAL>)
+        requires
+            old(self).is_resource_vacant(),
+        ensures
+            *final(self) == *old(self),
+            final(self).id() != frac.id(),
+    {
+        use_type_invariant(&*self);
+        use_type_invariant(frac);
+        if self.id() == frac.id() {
+            let _ = self.r.validate_with_shared(&frac.r);
+        }
+    }
+
     /// Borrows the resource while the associated storage slot is occupied.
     pub proof fn tracked_borrow(tracked &self) -> (tracked res: &T)
         requires
