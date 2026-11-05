@@ -8,6 +8,7 @@ use vstd::{
     atomic::*,
     atomic_ghost::{AtomicInvariantPredicate, AtomicU8},
     cell::{CellId, pcell_maybe_uninit},
+    resource::{Loc, ghost_var::GhostVarAuth},
     simple_pptr::*,
 };
 use vstd_extra::{
@@ -98,30 +99,84 @@ pub axiom fn axiom_mmio_paddr_huge_page_closed(pa: Paddr, page_size: usize, offs
         is_mmio_paddr((pa + offset) as Paddr) == is_mmio_paddr(pa),
 ;
 
-/// The invariant of the page table node lock (see [`PageTableLock`]).
-pub struct PageTableLockPred;
+/// The raw byte representation of a node's PTEs, as recorded by the PTE-model
+/// ghost variable. One `Seq<u8>` per entry, so that it does not depend on the
+/// `PageTableConfig`.
+pub type PteBytes = Seq<Seq<u8>>;
 
-impl AtomicInvariantPredicate<(CellId, CellId), u8, Option<PageMetaOwner>> for PageTableLockPred {
-    /// When the lock is free (`0`), it stores the permissions to the node's
-    /// `nr_children` and `stray` cells, whose ids are given by the constant.
-    /// When it is held (`1`), the permissions have been handed to the lock holder.
-    open spec fn atomic_inv(k: (CellId, CellId), v: u8, g: Option<PageMetaOwner>) -> bool {
+/// Number of entries among the first `n` of `s` that satisfy `f`.
+pub open spec fn count_where_upto(f: spec_fn(Seq<u8>) -> bool, s: PteBytes, n: int) -> int
+    decreases n,
+{
+    if n <= 0 {
+        0
+    } else {
+        count_where_upto(f, s, n - 1) + if f(s[n - 1]) {
+            1int
+        } else {
+            0int
+        }
+    }
+}
+
+/// Number of entries of `s` that satisfy `f`.
+pub open spec fn count_where(f: spec_fn(Seq<u8>) -> bool, s: PteBytes) -> int {
+    count_where_upto(f, s, s.len() as int)
+}
+
+/// The constant of a page table node lock. Fixed when the node is created.
+///
+/// The predicate cannot mention the `PageTableConfig` (the stored metadata is
+/// not generic), so the config-specific interpretation of PTEs is carried here
+/// as a ghost function. [`PageTablePageMeta::lock_wf`] pins it down.
+///
+/// [`PageTablePageMeta::lock_wf`]: crate::mm::page_table::PageTablePageMeta::lock_wf
+pub ghost struct PtLockConst {
+    /// The id of the node's `nr_children` cell.
+    pub nr_children_id: CellId,
+    /// The id of the node's `stray` cell.
+    pub stray_id: CellId,
+    /// The id of the node's PTE-model ghost variable.
+    pub pte_model_id: Loc,
+    /// Whether a PTE, given by its bytes, is present.
+    pub is_present: spec_fn(Seq<u8>) -> bool,
+}
+
+/// What a page table node lock holds while it is free. It is handed to whoever
+/// acquires the lock.
+pub tracked struct PtLockPayload {
+    /// The permissions for the `nr_children` and `stray` cells.
+    pub meta: PageMetaOwner,
+    /// The authoritative half of the PTE model. The other half
+    /// (`NodeOwner::pte_view`) stays with the page table tree.
+    pub pte_auth: GhostVarAuth<PteBytes>,
+}
+
+/// The invariant of the page table node lock (see [`PageTableLock`]).
+pub struct PtLockPred;
+
+impl AtomicInvariantPredicate<PtLockConst, u8, Option<PtLockPayload>> for PtLockPred {
+    /// When the lock is free (`0`), it stores the [`PtLockPayload`], whose ids
+    /// match the constant, and whose `nr_children` counts the present PTEs in the
+    /// PTE model. When it is held (`1`), the payload is with the lock holder.
+    open spec fn atomic_inv(k: PtLockConst, v: u8, g: Option<PtLockPayload>) -> bool {
         match g {
             None => v == 1,
-            Some(owner) => {
+            Some(p) => {
                 &&& v == 0
-                &&& owner.inv()
-                &&& owner.nr_children.id() == k.0
-                &&& owner.stray.id() == k.1
+                &&& p.meta.inv()
+                &&& p.meta.nr_children.id() == k.nr_children_id
+                &&& p.meta.stray.id() == k.stray_id
+                &&& p.pte_auth.id() == k.pte_model_id
+                &&& p.meta.nr_children.value() == count_where(k.is_present, p.pte_auth@)
             },
         }
     }
 }
 
-/// The lock of a page table node. It carries the [`PageMetaOwner`] of the
-/// node while unlocked. Only the parts of the node owner that do not depend on
-/// the `PageTableConfig` are stored, since the stored metadata is not generic.
-pub type PageTableLock = AtomicU8<(CellId, CellId), Option<PageMetaOwner>, PageTableLockPred>;
+/// The lock of a page table node. It carries the [`PtLockPayload`] of the node
+/// while unlocked.
+pub type PageTableLock = AtomicU8<PtLockConst, Option<PtLockPayload>, PtLockPred>;
 
 pub struct StoredPageTablePageMeta {
     pub nr_children: pcell_maybe_uninit::PCell<u16>,

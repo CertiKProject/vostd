@@ -339,6 +339,8 @@ impl<'rcu, C: PageTableConfig> CursorOwner<'rcu, C> {
             self.cur_entry_owner().is_node(),
             // The child node's guard relates to the new guard
             self.cur_entry_owner().node().relate_guard(guard),
+            // The child node's lock is held
+            self.cur_entry_owner().node().is_locked(),
             // Guard distinctness: the new guard points to a different node than all existing continuations
             forall|i: int|
                 #![trigger self.continuations[i]]
@@ -466,6 +468,17 @@ impl<'rcu, C: PageTableConfig> CursorOwner<'rcu, C> {
                 };
                 assert(false);
             }
+        };
+
+        // `only_current_locked` says the current child node is held.
+        assert(cur_entry.node().is_locked()) by {
+            let g = CursorOwner::<'rcu, C>::node_unlocked_except(guards, cur_entry_addr);
+            assert(old_cont.map_children(g));
+            assert(old_cont.children[old_cont.idx as int] is Some);
+            assert(old_cont.children[old_cont.idx as int]->0.subtree_satisfies(
+                old_cont.path().push_tail(old_cont.idx as int),
+                g,
+            ));
         };
 
         self.push_level_owner_preserves_inv(guard);

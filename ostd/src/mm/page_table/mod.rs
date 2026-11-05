@@ -14,7 +14,9 @@ use crate::specs::task::InAtomicMode;
 use crate::mm::frame::meta::{REF_COUNT_MAX, REF_COUNT_UNIQUE, REF_COUNT_UNUSED};
 use crate::mm::kspace::kvirt_area::disable_preempt;
 use crate::specs::mm::{
-    frame::{mapping::frame_to_index, meta_region_owners::MetaRegionOwners},
+    frame::{
+        mapping::frame_to_index, meta_owners::PtLockPayload, meta_region_owners::MetaRegionOwners,
+    },
     page_table::{
         is_valid_range_spec, nr_pte_index_bits_spec, pte_index_bit_offset_spec,
         top_level_index_width_spec, vaddr_range_spec,
@@ -1001,19 +1003,29 @@ impl PageTable<KernelPtConfig> {
             assert(kernel_owner.0.value().metaregion_sound(*regions));
         }
         let ghost regions_before_self_borrow: MetaRegionOwners = *regions;
+        // The kernel root is only read below, so its lock payload is not needed.
+        // It is not given back either, since the guard is not dropped (there is
+        // no `Drop` for `PageTableGuard` yet).
+        proof_decl! {
+            let tracked _root_lock_payload: PtLockPayload;
+            let tracked new_lock_payload: PtLockPayload;
+        }
         let mut root_node = {
             #[verus_spec(with Tracked(regions))]
             let root_ref = self.root.borrow();
-            #[verus_spec(with Tracked(root_owner), Tracked(guards))]
+            #[verus_spec(with Tracked(root_owner), Tracked(&*regions), Tracked(guards) => Tracked(_root_lock_payload))]
             root_ref.lock(preempt_guard)
         };
         let ghost regions_after_kroot_borrow: MetaRegionOwners = *regions;
         let mut new_node: PageTableGuard<'rcu, UserPtConfig> = {
             #[verus_spec(with Tracked(regions))]
             let new_ref = new_root.borrow();
-            #[verus_spec(with Tracked(&new_node_owner), Tracked(guards))]
+            #[verus_spec(with Tracked(&new_node_owner), Tracked(&*regions), Tracked(guards) => Tracked(new_lock_payload))]
             new_ref.lock(preempt_guard)
         };
+        proof {
+            new_node_owner.tracked_install_lock_payload(new_lock_payload);
+        }
         proof {
             let kern_idx = crate::specs::mm::frame::mapping::frame_to_index(
                 kernel_owner.0.value().meta_slot_paddr().unwrap(),
@@ -1121,6 +1133,7 @@ impl PageTable<KernelPtConfig> {
                 kernel_owner.metaregion_sound(*regions),
                 // The new node owner's invariants and guard relation.
                 new_node_owner.inv(),
+                new_node_owner.is_locked(),
                 new_node_owner.relate_guard(new_node),
                 regions.contains(new_node_owner.slot_index),
             decreases KernelPtConfig::TOP_LEVEL_INDEX_RANGE().end - i,
@@ -1289,6 +1302,8 @@ impl<C: PageTableConfig> PageTable<C> {
             final(owner)@->0.inv(),
             (final(owner)@->0).0.value().is_node(),
             (final(owner)@->0).0.value().is_node(),
+            // The root's lock is free: its payload is still in the lock.
+            !(final(owner)@->0).0.value().node().is_locked(),
             r.root.ptr.addr() == (final(owner)@->0).0.value().node().meta_vaddr(),
             (final(owner)@->0).0.value().metaregion_sound(*final(regions)),
             final(regions).inv(),

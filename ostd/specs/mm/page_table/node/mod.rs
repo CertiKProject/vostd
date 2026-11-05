@@ -86,7 +86,9 @@ impl<C: PageTableConfig> PageTablePageMeta<C> {
     /// The lock is well-formed and guards the permissions of this node's metadata cells.
     pub open spec fn lock_wf(self) -> bool {
         &&& self.lock.well_formed()
-        &&& self.lock.constant() == (self.nr_children.id(), self.stray.id())
+        &&& self.lock.constant().nr_children_id == self.nr_children.id()
+        &&& self.lock.constant().stray_id == self.stray.id()
+        &&& self.lock.constant().is_present == (|b: Seq<u8>| raw_is_present::<C::E>(b))
     }
 
     pub open spec fn into_spec(self) -> StoredPageTablePageMeta {

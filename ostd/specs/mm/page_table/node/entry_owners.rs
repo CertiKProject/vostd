@@ -10,7 +10,7 @@ use crate::specs::{
     mm::{
         frame::{
             mapping::{frame_to_index, index_to_meta, meta_to_index},
-            meta_owners::PageUsage,
+            meta_owners::{PageUsage, PtLockPayload},
             meta_region_owners::MetaRegionOwners,
         },
         page_table::{node::entry_view::*, *},
@@ -179,6 +179,34 @@ impl<C: PageTableConfig> EntryOwner<C> {
             *final(self) == (EntryOwner { kind: EntryOwnerKind::Node(node), ..*old(self) }),
     {
         self.kind = EntryOwnerKind::Node(node);
+    }
+
+    /// Moves the payload obtained by locking this entry's node into the node's owner.
+    /// See [`NodeOwner::tracked_install_lock_payload`].
+    pub proof fn tracked_install_node_lock_payload(tracked &mut self, tracked payload: PtLockPayload)
+        requires
+            old(self).kind is Node,
+            old(self).node().inv(),
+            !old(self).node().is_locked(),
+            payload.meta.inv(),
+            payload.pte_auth.id() == old(self).node().pte_view.id(),
+            payload.pte_auth@ == old(self).node().pte_view@,
+        ensures
+            final(self).kind is Node,
+            final(self).node().inv(),
+            final(self).node().is_locked(),
+            final(self).node().meta() == payload.meta,
+            final(self).node().pte_view == old(self).node().pte_view,
+            final(self).node().children_perm == old(self).node().children_perm,
+            final(self).node().level == old(self).node().level,
+            final(self).node().tree_level == old(self).node().tree_level,
+            final(self).node().slot_index == old(self).node().slot_index,
+            final(self).path == old(self).path,
+            final(self).parent_level == old(self).parent_level,
+    {
+        let tracked mut node = self.tracked_take_node();
+        node.tracked_install_lock_payload(payload);
+        self.tracked_put_node(node);
     }
 
     pub proof fn tracked_borrow_node(tracked &self) -> (tracked res: &NodeOwner<C>)

@@ -330,6 +330,8 @@ impl<'rcu, C: PageTableConfig> CursorContinuation<'rcu, C> {
         &&& self.entry_own.is_node()
         &&& self.entry_own.inv()
         &&& self.entry_own.node().relate_guard(self.guard)
+        // The cursor holds the lock of every node on its path.
+        &&& self.entry_own.node().is_locked()
         &&& self.tree_level == INC_LEVELS - self.level() - 1
         &&& self.tree_level < INC_LEVELS - 1
         &&& self.path().len() == self.tree_level
@@ -518,6 +520,7 @@ impl<'rcu, C: PageTableConfig> CursorContinuation<'rcu, C> {
             self.entry_own.is_node(),
             self.entry_own.inv(),
             self.entry_own.node().relate_guard(self.guard),
+            self.entry_own.node().is_locked(),
             self.entry_own.node().level == parent_old.level,
             self.entry_own.node().tree_level == parent_old.tree_level,
             // Other PTEs preserved (operation only touched the entry at idx)
@@ -806,7 +809,14 @@ impl<'rcu, C: PageTableConfig> CursorOwner<'rcu, C> {
         TreePath<NR_ENTRIES>,
     ) -> bool) {
         |owner: EntryOwner<C>, path: TreePath<NR_ENTRIES>|
-            owner.is_node() ==> guards.unlocked(owner.node().meta_vaddr())
+            owner.is_node() ==> {
+                &&& guards.unlocked(owner.node().meta_vaddr())
+                // No guard exists for the node, but its lock is held by this
+                // cursor, so its lock payload is in the owner. (As elsewhere in
+                // the cursor model, the cursor is treated as owning its whole
+                // tree; see `lock_range`.)
+                &&& owner.node().is_locked()
+            }
     }
 
     pub open spec fn node_unlocked_except(guards: Guards<'rcu>, addr: usize) -> (spec_fn(
@@ -814,9 +824,12 @@ impl<'rcu, C: PageTableConfig> CursorOwner<'rcu, C> {
         TreePath<NR_ENTRIES>,
     ) -> bool) {
         |owner: EntryOwner<C>, path: TreePath<NR_ENTRIES>|
-            owner.is_node() ==> owner.node().meta_vaddr() != addr ==> guards.unlocked(
-                owner.node().meta_vaddr(),
-            )
+            owner.is_node() ==> {
+                &&& owner.node().meta_vaddr() != addr ==> guards.unlocked(
+                    owner.node().meta_vaddr(),
+                )
+                &&& owner.node().is_locked()
+            }
     }
 
     pub open spec fn map_full_tree(
