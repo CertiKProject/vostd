@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 //! Implementation of the locking protocol.
-use core::{marker::PhantomData, mem::ManuallyDrop, ops::Range, sync::atomic::Ordering};
+use core::{marker::PhantomData, ops::Range, sync::atomic::Ordering};
+
+use vstd_extra::drop_tracking::{DropObligation, ManuallyDrop, TrackDrop};
 
 use vstd::prelude::*;
 
@@ -19,6 +21,7 @@ use crate::mm::{
 use vstd_extra::array_ptr::*;
 
 use crate::mm::page_table::*;
+use crate::specs::mm::frame::meta_owners::PtLockPayload;
 use crate::specs::mm::frame::meta_region_owners::MetaRegionOwners;
 use crate::specs::mm::page_table::node::Guards;
 use crate::specs::mm::page_table::node::entry_owners::EntryOwner;
@@ -49,6 +52,12 @@ pub assume_specification<Idx: Clone>[ Range::<Idx>::clone ](range: &Range<Idx>) 
         // Per-config tightening; see `Cursor::new`. Pulled through to the
         // cursor's `LOCKED_END_BOUND_spec` invariant.
         va.end <= C::LOCKED_END_BOUND_spec(),
+        crate::specs::mm::page_table::is_valid_range_spec::<C>(*va),
+        // The range ends well below the top of the address space, so the
+        // child ranges computed while locking do not overflow.
+        va.end + page_size(NR_LEVELS as PagingLevel) <= usize::MAX,
+        // This thread holds no guard on any node of the page table.
+        pt_own.0.subtree_satisfies(pt_own.0.value().path, node_unguarded::<C>(*old(guards))),
     ensures
         ret.0.invariants(*ret.1, *final(regions), *final(guards)),
         (*ret.1).in_locked_range(),
@@ -139,6 +148,9 @@ pub fn lock_range<'rcu, C: PageTableConfig, A: InAtomicMode>(
         start_idx as usize,
         root_guard,
     );
+    proof {
+        assert(cursor_own.continuations[NR_LEVELS - 1].as_subtree() =~= pt_own.0);
+    }
 
     // Retry if the candidate subtree became stray before we acquired its lock.
     let mut subtree_root = None;
@@ -148,6 +160,9 @@ pub fn lock_range<'rcu, C: PageTableConfig, A: InAtomicMode>(
                 &&& cursor_own.level == NR_LEVELS
                 &&& cursor_own.continuations.dom().contains(NR_LEVELS - 1)
                 &&& cursor_own.continuations[NR_LEVELS - 1].all_some()
+                &&& cursor_own.continuations[NR_LEVELS - 1].as_subtree() == pt_own.0
+                &&& cursor_own.continuations[NR_LEVELS - 1].path() == pt_own.0.value().path
+                &&& *guards == *old(guards)
             },
             subtree_root is Some ==> {
                 &&& regions.inv()
@@ -166,6 +181,12 @@ pub fn lock_range<'rcu, C: PageTableConfig, A: InAtomicMode>(
                 &&& guards.lock_held(
                     cursor_own.continuations[cursor_own.level - 1]
                         .entry_own.node().meta_vaddr(),
+                )
+                &&& locked_subtree_ready(
+                    cursor_own.continuations[cursor_own.level - 1],
+                    *va,
+                    *regions,
+                    *guards,
                 )
             },
     )]
@@ -194,7 +215,20 @@ pub fn lock_range<'rcu, C: PageTableConfig, A: InAtomicMode>(
     }
     let cur_node_va = va.start.align_down(page_size(guard_level + 1));
 
-    #[verus_spec(with Tracked(cont.entry_own), Tracked(guards), Tracked(regions))]
+    let ghost cont0 = cont;
+    let tracked mut locked_subtree = OwnerSubtree::<C>::tracked_new(
+        cont.entry_own,
+        cont.tree_level,
+        cont.children,
+    );
+    proof {
+        use crate::specs::mm::page_table::cursor::page_size_lemmas::*;
+        assert(locked_subtree == cont0.as_subtree());
+        cont0.as_page_table_owner_pt_inv();
+        lemma_page_size_monotone(guard_level, NR_LEVELS as PagingLevel);
+        assert(dfs_range_ok(guard_level, cur_node_va, *va));
+    }
+    #[verus_spec(with Tracked(&mut locked_subtree), Tracked(guards), Tracked(regions))]
     dfs_acquire_lock(guard, &mut subtree_root, cur_node_va, va.clone());
 
     let mut path = [None, None, None, None];
@@ -254,6 +288,35 @@ pub fn unlock_range<C: PageTableConfig, A: InAtomicMode>(cursor: &mut Cursor<'_,
 
 }
 
+/// What [`try_traverse_and_lock_subtree_root`] guarantees about the subtree
+/// it locked, beyond the continuation invariant: the facts
+/// [`dfs_acquire_lock`] needs.
+pub open spec fn locked_subtree_ready<'rcu, C: PageTableConfig>(
+    cont: CursorContinuation<'rcu, C>,
+    va: Range<Vaddr>,
+    regions: MetaRegionOwners,
+    guards: Guards<'rcu>,
+) -> bool {
+    let t = cont.as_subtree();
+    let level = cont.entry_own.node().level;
+    let ps_up = page_size((level + 1) as PagingLevel);
+    let node_va = vstd_extra::arithmetic::nat_align_down(va.start as nat, ps_up as nat) as Vaddr;
+    &&& cont.all_some()
+    &&& PageTableOwner(t).metaregion_sound(regions)
+    &&& children_unguarded(t, guards)
+    &&& 1 <= level <= NR_LEVELS
+    // The locked node covers the range.
+    &&& va.end <= node_va + ps_up
+    // The range stays clear of borrowed (shared) entries.
+    &&& forall|i: int|
+        0 <= i < NR_ENTRIES ==> !(#[trigger] t.child(i)).value().is_borrowed() || !(idx_range_spec(
+            level,
+            node_va,
+            va.start,
+            va.end,
+        ).0 <= i < idx_range_spec(level, node_va, va.start, va.end).1)
+}
+
 /// Finds and locks an intermediate page table node that covers the range.
 ///
 /// If that node (or any of its ancestors) does not exist, we need to lock
@@ -271,6 +334,11 @@ pub fn unlock_range<C: PageTableConfig, A: InAtomicMode>(cursor: &mut Cursor<'_,
         old(cursor_own).level == NR_LEVELS,
         old(cursor_own).continuations.dom().contains(NR_LEVELS - 1),
         old(cursor_own).continuations[NR_LEVELS - 1].all_some(),
+        old(cursor_own).continuations[NR_LEVELS - 1].as_subtree().subtree_satisfies(
+            old(cursor_own).continuations[NR_LEVELS - 1].path(),
+            node_unguarded::<C>(*old(guards)),
+        ),
+        crate::specs::mm::page_table::is_valid_range_spec::<C>(*va),
     ensures
         r is None ==> {
             &&& *final(cursor_own) == *old(cursor_own)
@@ -295,6 +363,12 @@ pub fn unlock_range<C: PageTableConfig, A: InAtomicMode>(cursor: &mut Cursor<'_,
             &&& cont.entry_own.node().relate_guard(cont.guard)
             &&& cont.entry_own.metaregion_sound(*final(regions))
         },
+        r is Some ==> locked_subtree_ready(
+            final(cursor_own).continuations[final(cursor_own).level - 1],
+            *va,
+            *final(regions),
+            *final(guards),
+        ),
         // The subtree root is lock_held in guards.
         r is Some ==> final(guards).lock_held(
             final(cursor_own).continuations[final(cursor_own).level - 1]
@@ -513,66 +587,443 @@ fn try_traverse_and_lock_subtree_root<'rcu, C: PageTableConfig, A: InAtomicMode>
     Some(pt_guard)
 }
 
+/// The range conditions under which `dfs_acquire_lock` visits a node at
+/// `level` covering `[node_va, node_va + page_size(level + 1))`.
+pub open spec fn dfs_range_ok(level: PagingLevel, node_va: Vaddr, va_range: Range<Vaddr>) -> bool {
+    &&& 1 <= level <= NR_LEVELS
+    &&& node_va <= va_range.start
+    &&& va_range.start < va_range.end
+    &&& va_range.end <= node_va + page_size((level + 1) as PagingLevel)
+    &&& node_va % page_size((level + 1) as PagingLevel) == 0
+    &&& va_range.end + page_size(level) <= usize::MAX
+}
+
+/// Every page-table node below `t` whose range overlaps `[va_start, va_end)`
+/// holds its lock payload: exactly the nodes `dfs_acquire_lock` locks.
+pub open spec fn dfs_locked_below<C: PageTableConfig>(
+    t: OwnerSubtree<C>,
+    node_va: int,
+    va_start: int,
+    va_end: int,
+    depth: nat,
+) -> bool
+    decreases depth,
+{
+    depth > 0 && t.value().is_node() && t.value().node().level > 1 ==> {
+        let ps = page_size(t.value().node().level) as int;
+        forall|i: int|
+            #![trigger t.child(i)]
+            (va_start - node_va) / ps <= i < ceil_div(va_end - node_va, ps) && t.child(
+                i,
+            ).value().is_node() ==> {
+                let cva = node_va + i * ps;
+                &&& t.child(i).value().node().is_locked()
+                &&& dfs_locked_below(
+                    t.child(i),
+                    cva,
+                    if va_start < cva {
+                        cva
+                    } else {
+                        va_start
+                    },
+                    if va_end < cva + ps {
+                        va_end
+                    } else {
+                        cva + ps
+                    },
+                    (depth - 1) as nat,
+                )
+            }
+    }
+}
+
+/// [`idx_range_spec`]'s casts are exact.
+proof fn lemma_idx_range_spec_exact(level: PagingLevel, node_va: Vaddr, va_range: Range<Vaddr>)
+    requires
+        dfs_range_ok(level, node_va, va_range),
+    ensures
+        idx_range_spec(level, node_va, va_range.start, va_range.end).0 as int == (va_range.start
+            - node_va) / (page_size(level) as int),
+        idx_range_spec(level, node_va, va_range.start, va_range.end).1 as int == ceil_div(
+            va_range.end - node_va,
+            page_size(level) as int,
+        ),
+{
+    use crate::specs::mm::page_table::cursor::page_size_lemmas::*;
+    use vstd::arithmetic::div_mod::*;
+    lemma_page_size_spec_values();
+    let ps = page_size(level) as int;
+    let x = va_range.start - node_va;
+    let y = va_range.end - node_va + ps - 1;
+    lemma_div_is_ordered_by_denominator(x, 1, ps);
+    lemma_div_is_ordered_by_denominator(y, 1, ps);
+    lemma_div_pos_is_pos(x, ps);
+    lemma_div_pos_is_pos(y, ps);
+    assert(y / ps <= y / 1);
+    assert(y < usize::MAX);
+}
+
+/// The child ranges `dfs_acquire_lock` recurses on are well-formed.
+proof fn lemma_dfs_child_range(level: PagingLevel, node_va: Vaddr, va_range: Range<Vaddr>, i: int)
+    requires
+        dfs_range_ok(level, node_va, va_range),
+        level > 1,
+        (va_range.start - node_va) / (page_size(level) as int) <= i < ceil_div(
+            va_range.end - node_va,
+            page_size(level) as int,
+        ),
+        i < NR_ENTRIES,
+    ensures
+        ({
+            let ps = page_size(level) as int;
+            let cva = node_va + i * ps;
+            let cs = if va_range.start < cva {
+                cva
+            } else {
+                va_range.start as int
+            };
+            let ce = if va_range.end < cva + ps {
+                va_range.end as int
+            } else {
+                cva + ps
+            };
+            &&& cva + ps <= usize::MAX
+            &&& dfs_range_ok((level - 1) as PagingLevel, cva as Vaddr, (cs as Vaddr)..(ce as Vaddr))
+        }),
+{
+    use crate::specs::mm::page_table::cursor::page_size_lemmas::*;
+    use vstd::arithmetic::div_mod::*;
+    lemma_page_size_spec_values();
+    lemma_page_size_divides(level, (level + 1) as PagingLevel);
+    let ps = page_size(level) as int;
+    let psl = page_size((level - 1) as PagingLevel) as int;
+    let psu = page_size((level + 1) as PagingLevel) as int;
+    let v = node_va as int;
+    let s = va_range.start as int;
+    let e = va_range.end as int;
+    let cva = v + i * ps;
+    lemma_fundamental_div_mod(s - v, ps);
+    lemma_fundamental_div_mod(e - v + ps - 1, ps);
+    let q1 = (s - v) / ps;
+    let q2 = (e - v + ps - 1) / ps;
+    assert(s < cva + ps && cva < e) by (nonlinear_arith)
+        requires
+            s - v == ps * q1 + (s - v) % ps,
+            0 <= (s - v) % ps < ps,
+            e - v + ps - 1 == ps * q2 + (e - v + ps - 1) % ps,
+            0 <= (e - v + ps - 1) % ps < ps,
+            q1 <= i < q2,
+            cva == v + i * ps,
+            ps > 0,
+    ;
+    lemma_fundamental_div_mod(v, psu);
+    lemma_fundamental_div_mod(psu, ps);
+    assert(cva % ps == 0) by {
+        let k = v / psu;
+        let m = psu / ps;
+        assert(cva == (m * k + i) * ps) by (nonlinear_arith)
+            requires
+                v == psu * k + v % psu,
+                v % psu == 0,
+                psu == ps * m + psu % ps,
+                psu % ps == 0,
+                cva == v + i * ps,
+        ;
+        lemma_mod_multiples_basic(m * k + i, ps);
+    }
+}
+
 /// Acquires the locks for the given range in the sub-tree rooted at the node.
 ///
 /// `cur_node_va` must be the virtual address of the `cur_node`. The `va_range`
 /// must be within the range of the `cur_node`. The range must not be empty.
 ///
 /// The function will forget all the [`PageTableGuard`] objects in the sub-tree.
+///
+/// # Verified Properties
+/// ## Preconditions
+/// - `subtree` is the owner of the sub-tree rooted at `cur_node`, sound with
+///   respect to `regions`, and no node strictly below its root has a live guard.
+/// - The range is within the node's range (see [`dfs_range_ok`]).
+/// ## Postconditions
+/// - Every page-table node below the root that overlaps the range holds its
+///   lock payload ([`dfs_locked_below`]); the payloads come from the nodes'
+///   locks.
+/// - The child guards are forgotten, so `guards` is unchanged.
 #[verus_spec(
-    with Tracked(entry_own): Tracked<EntryOwner<C>>,
+    with Tracked(subtree): Tracked<&mut OwnerSubtree<C>>,
         Tracked(guards): Tracked<&mut Guards<'rcu>>,
         Tracked(regions): Tracked<&mut MetaRegionOwners>
     requires
-        entry_own.is_node(),
-        entry_own.inv(),
-        entry_own.node().relate_guard(*cur_node),
-        old(guards).lock_held(entry_own.node().meta_vaddr()),
-        cur_node_va <= va_range.start,
-        va_range.start < va_range.end,
+        PageTableOwner(*old(subtree)).pt_inv(),
+        PageTableOwner(*old(subtree)).metaregion_sound(*old(regions)),
+        old(subtree).value().is_node(),
+        old(subtree).value().node().relate_guard(*old(cur_node)),
+        children_unguarded(*old(subtree), *old(guards)),
+        dfs_range_ok(old(subtree).value().node().level, cur_node_va, va_range),
+        // Borrowed (shared) entries only occur at the top level, and the range
+        // stays clear of them.
+        forall|i: int| 0 <= i < NR_ENTRIES ==> !(#[trigger] old(subtree).child(i)).value().is_borrowed()
+            || !(idx_range_spec(old(subtree).value().node().level, cur_node_va, va_range.start, va_range.end).0 <= i
+                < idx_range_spec(old(subtree).value().node().level, cur_node_va, va_range.start, va_range.end).1),
         old(regions).inv(),
     ensures
-        // The root node is still lock_held (not ManuallyDrop'd by this fn).
-        final(guards).lock_held(entry_own.node().meta_vaddr()),
-        // All other locks are preserved: addresses not in this subtree are unchanged.
-        forall |addr: usize|
-            addr != entry_own.node().meta_vaddr()
-            && old(guards).guards.contains(addr) ==>
-            #[trigger] final(guards).guards.contains(addr),
-        // Addresses not in old guards don't appear in final guards
-        // (acquire + ManuallyDrop is a no-op on the guards set for child addrs).
-        forall |addr: usize|
-            !old(guards).guards.contains(addr) ==>
-            !#[trigger] final(guards).guards.contains(addr),
-        // regions preserved
+        PageTableOwner(*final(subtree)).pt_inv(),
+        PageTableOwner(*final(subtree)).metaregion_sound(*final(regions)),
+        final(subtree).value() == old(subtree).value(),
+        final(subtree).level() == old(subtree).level(),
+        dfs_locked_below(
+            *final(subtree),
+            cur_node_va as int,
+            va_range.start as int,
+            va_range.end as int,
+            (INC_LEVELS - final(subtree).level()) as nat,
+        ),
+        *final(guards) == *old(guards),
+        *final(cur_node) == *old(cur_node),
         final(regions).inv(),
         final(regions).slot_owners == old(regions).slot_owners,
+        forall|k: int| old(regions).slots.contains_key(k) ==> #[trigger] final(regions).slots.contains_key(k),
+        forall|k: int| old(regions).slots.contains_key(k) ==> old(regions).slots[k] == #[trigger] final(regions).slots[k],
 )]
-#[verifier::external_body]
+#[verifier::exec_allows_no_decreases_clause]
+#[verifier::loop_isolation(false)]
 fn dfs_acquire_lock<'rcu, C: PageTableConfig, A: InAtomicMode>(
-    guard: &A,
+    guard: &'rcu A,
     cur_node: &mut PageTableGuard<'rcu, C>,
     cur_node_va: Vaddr,
     va_range: Range<Vaddr>,
 ) {
-    let cur_level = cur_node.level();
+    let ghost root = subtree.value();
+    proof {
+        assert(regions.contains(root.node().slot_index));
+    }
+    let cur_level = {
+        let tracked node_owner = subtree.tracked_borrow_value().tracked_borrow_node();
+        #[verus_spec(with Tracked(node_owner), Tracked(&*regions))]
+        cur_node.level()
+    };
     if cur_level == 1 {
         return;
     }
     let idx_range = dfs_get_idx_range::<C>(cur_level, cur_node_va, &va_range);
-    for i in idx_range {
-        let child = cur_node.entry(i);
-        match child.to_ref() {
+    let ghost s0 = idx_range.start as int;
+    let ghost e0 = idx_range.end as int;
+    let ghost ps = page_size(cur_level) as int;
+    proof {
+        lemma_idx_range_spec_exact(cur_level, cur_node_va, va_range);
+    }
+    let ghost depth = (INC_LEVELS - subtree.level()) as nat;
+    let ghost old_children = subtree.children();
+    let ghost guards0 = *guards;
+    let ghost regions0 = *regions;
+    for i in idx_range
+        invariant
+            s0 <= i <= e0 <= NR_ENTRIES,
+            cur_level == root.node().level,
+            ps == page_size(cur_level) as int,
+            depth == INC_LEVELS - subtree.level(),
+            PageTableOwner(*subtree).pt_inv(),
+            PageTableOwner(*subtree).metaregion_sound(*regions),
+            subtree.value() == root,
+            subtree.level() == old(subtree).level(),
+            *cur_node == *old(cur_node),
+            *guards == guards0,
+            guards0 == *old(guards),
+            regions0 == *old(regions),
+            root == old(subtree).value(),
+            old_children == old(subtree).children(),
+            regions.inv(),
+            regions.slot_owners == regions0.slot_owners,
+            forall|k: int| regions0.slots.contains_key(k) ==> #[trigger] regions.slots.contains_key(k),
+            forall|k: int| regions0.slots.contains_key(k) ==> regions0.slots[k] == #[trigger] regions.slots[k],
+            forall|j: int| i <= j < NR_ENTRIES ==> #[trigger] subtree.children()[j] == old_children[j],
+            forall|j: int|
+                #![trigger subtree.child(j)]
+                s0 <= j < i && subtree.child(j).value().is_node() ==> {
+                    let cva = cur_node_va + j * ps;
+                    &&& subtree.child(j).value().node().is_locked()
+                    &&& dfs_locked_below(
+                        subtree.child(j),
+                        cva,
+                        if va_range.start < cva {
+                            cva
+                        } else {
+                            va_range.start as int
+                        },
+                        if va_range.end < cva + ps {
+                            va_range.end as int
+                        } else {
+                            cva + ps
+                        },
+                        (depth - 1) as nat,
+                    )
+                },
+    {
+        let ghost cur_children = subtree.children();
+        let ghost regions_i = *regions;
+        proof {
+            PageTableOwner(*subtree).pt_inv_unroll(i as int);
+            assert(subtree.child(i as int) == old(subtree).child(i as int));
+            subtree.lemma_subtree_satisfies_unroll_once(
+                root.path,
+                PageTableOwner::<C>::metaregion_sound_pred(*regions),
+                i as int,
+            );
+        }
+        let ghost child0 = subtree.child(i as int);
+        let child = {
+            let tracked parent_owner = subtree.tracked_borrow_value().tracked_borrow_node();
+            let tracked child_owner = subtree.tracked_borrow_child(i as int).tracked_borrow_value();
+            #[verus_spec(with Tracked(parent_owner), Tracked(child_owner), Tracked(&*regions))]
+            cur_node.entry(i)
+        };
+        let child_ref = {
+            let tracked parent_owner = subtree.tracked_borrow_value().tracked_borrow_node();
+            let tracked child_owner = subtree.tracked_borrow_child(i as int).tracked_borrow_value();
+            #[verus_spec(with Tracked(child_owner), Tracked(parent_owner), Tracked(regions))]
+            child.to_ref()
+        };
+        proof {
+            PageTableOwner::<C>::metaregion_sound_preserved_slot_owners_eq_subtree(
+                *subtree,
+                root.path,
+                regions_i,
+                *regions,
+            );
+        }
+        match child_ref {
             ChildRef::PageTable(pt) => {
-                let mut pt_guard = pt.lock(guard);
+                let ghost t0 = *subtree;
+                let ghost regions1 = *regions;
+                let ghost path_i = root.path.push_tail(i as int);
+                proof {
+                    t0.lemma_subtree_satisfies_unroll_once(
+                        root.path,
+                        PageTableOwner::<C>::metaregion_sound_pred(regions1),
+                        i as int,
+                    );
+                    assert(old(subtree).has_child(i as int));
+                    assert(child0.subtree_satisfies(path_i, node_unguarded::<C>(guards0)));
+                    assert(guards0.unlocked(child0.value().node().meta_vaddr()));
+                }
+                proof_decl! {
+                    let tracked lock_payload: PtLockPayload;
+                    let tracked guard_obl: DropObligation<usize>;
+                }
+                let mut pt_guard = {
+                    let tracked child_owner = subtree.tracked_borrow_child(i as int).tracked_borrow_value().tracked_borrow_node();
+                    #[verus_spec(with Tracked(child_owner), Tracked(&*regions), Tracked(guards) => Tracked(lock_payload))]
+                    pt.lock(guard)
+                };
+                let ghost guards1 = *guards;
+                proof {
+                    lemma_dfs_child_range(cur_level, cur_node_va, va_range, i as int);
+                }
                 let child_node_va = cur_node_va + i * page_size(cur_level);
                 let child_node_va_end = child_node_va + page_size(cur_level);
                 let va_start = va_range.start.max(child_node_va);
                 let va_end = va_range.end.min(child_node_va_end);
-                dfs_acquire_lock(guard, &mut pt_guard, child_node_va, va_start..va_end);
+                proof {
+                    let ghost meta_value = child0.value().node().meta_value(*regions);
+                    let tracked c = subtree.tracked_borrow_mut_child(i as int);
+                    c.tracked_borrow_mut_value().tracked_install_fresh_node_lock_payload(
+                        lock_payload,
+                        meta_value,
+                    );
+                    PageTableOwner::<C>::lemma_replace_root_value(child0, *c, *regions);
+                    guard_obl = pt_guard.tracked_redeem(guards);
+                    assert forall|x: usize| #[trigger] guards.guards.contains(x) == guards0.guards.contains(x) by {
+                        if guards0.lock_held(x) {
+                            assert(guards1.lock_held(x));
+                        } else {
+                            assert(guards0.unlocked(x));
+                        }
+                    }
+                    assert(guards.guards =~= guards0.guards);
+                    // No node below the child has a guard.
+                    assert forall|j: int|
+                        0 <= j < NR_ENTRIES && #[trigger] c.has_child(j) implies c.child(j).subtree_satisfies(
+                        c.value().path.push_tail(j),
+                        node_unguarded::<C>(*guards),
+                    ) by {
+                        child0.lemma_subtree_satisfies_unroll_once(
+                            path_i,
+                            node_unguarded::<C>(guards0),
+                            j,
+                        );
+                    }
+                    // Below the top level, no entry is borrowed.
+                    assert forall|j: int| 0 <= j < NR_ENTRIES implies !(#[trigger] c.child(j)).value().is_borrowed() by {
+                        PageTableOwner(*c).pt_inv_unroll(j);
+                    }
+                }
+
+                let ghost c_inst = subtree.child(i as int);
+                proof {
+                    assert(va_start == (if va_range.start < child_node_va {
+                        child_node_va
+                    } else {
+                        va_range.start
+                    }));
+                    assert(va_end == (if va_range.end < child_node_va_end {
+                        va_range.end
+                    } else {
+                        child_node_va_end
+                    }));
+                }
+                {
+                    let tracked c = subtree.tracked_borrow_mut_child(i as int);
+                    #[verus_spec(with Tracked(c), Tracked(guards), Tracked(regions))]
+                    dfs_acquire_lock(guard, &mut pt_guard, child_node_va, va_start..va_end);
+                }
+                proof_with!(Tracked(guard_obl));
                 let _ = ManuallyDrop::new(pt_guard);
+                proof {
+                    let ghost c2 = subtree.child(i as int);
+                    PageTableOwner::<C>::metaregion_sound_preserved_slot_owners_eq_subtree(
+                        t0,
+                        root.path,
+                        regions1,
+                        *regions,
+                    );
+                    PageTableOwner::<C>::lemma_replace_child(t0, i as int, c2, *regions);
+                    assert(*subtree == t0.insert(i as int, c2));
+                    assert(subtree.child(i as int) == c2);
+                    assert(c2.value() == c_inst.value());
+                    assert(c2.level() == subtree.level() + 1);
+                    assert forall|j: int|
+                        #![trigger subtree.child(j)]
+                        s0 <= j < i + 1 && subtree.child(j).value().is_node() implies {
+                            let cva = cur_node_va + j * ps;
+                            &&& subtree.child(j).value().node().is_locked()
+                            &&& dfs_locked_below(
+                                subtree.child(j),
+                                cva,
+                                if va_range.start < cva {
+                                    cva
+                                } else {
+                                    va_range.start as int
+                                },
+                                if va_range.end < cva + ps {
+                                    va_range.end as int
+                                } else {
+                                    cva + ps
+                                },
+                                (depth - 1) as nat,
+                            )
+                        } by {
+                        if j != i {
+                            assert(subtree.child(j) == t0.child(j));
+                        }
+                    }
+                }
             },
-            ChildRef::None | ChildRef::Frame(_, _, _) => {},
+            ChildRef::None | ChildRef::Frame(_, _, _) => {
+                proof {
+                    assert(!child0.value().is_node());
+                }
+            },
         }
     }
 }
@@ -751,7 +1202,6 @@ pub open spec fn idx_range_spec(
         va_range.start < va_range.end,
         va_range.end <= cur_node_va + page_size((cur_node_level + 1) as PagingLevel),
         cur_node_va % page_size((cur_node_level + 1) as PagingLevel) == 0,
-        va_range.start % page_size(cur_node_level) == 0,
     ensures
         ret.start == idx_range_spec(cur_node_level, cur_node_va, va_range.start, va_range.end).0,
         ret.end == idx_range_spec(cur_node_level, cur_node_va, va_range.start, va_range.end).1,
@@ -788,77 +1238,23 @@ fn dfs_get_idx_range<C: PagingConstsTrait>(
         let si = va_range.start - cur_node_va;
 
         // -- start_idx < end_idx --
-        // si < xi (non-empty range), si % ai == 0 (both endpoints aligned).
-        // So si/ai < (xi + ai - 1)/ai.
-        //
-        // Proof: si + ai <= xi + ai - 1 + 1 = xi + ai, but more precisely:
-        //   si < xi ==> si <= xi - 1 (integers)
-        //   ==> si + ai - 1 <= xi - 1 + ai - 1 < xi + ai - 1
-        //   ==> (si + ai - 1)/ai <= (xi + ai - 1)/ai  (since si % ai == 0, si/ai = (si+ai-1)/ai)
-        //
-        // Actually the simplest route: si/ai * ai = si < xi <= end_idx * ai.
+        // start_idx * ps <= si < xi <= end_idx * ps, so start_idx < end_idx.
         assert(start_idx < end_idx) by {
-            // si = start_idx * ai (exact division since si % ai == 0)
-            lemma_page_size_divides(cur_node_level, (cur_node_level + 1) as PagingLevel);
-            // Prove si % ai == 0: va_range.start and cur_node_va are both multiples of ps.
-            // cur_node_va % ps == 0: cur_node_va % page_size(level+1) == 0 and ps | page_size(level+1).
-            let psu = page_size((cur_node_level + 1) as PagingLevel) as int;
-            assert(cur_node_va as int % ai == 0) by {
-                // cur_node_va % psu == 0, psu % ai == 0
-                // ==> cur_node_va is a multiple of ai
-                lemma_fundamental_div_mod(cur_node_va as int, psu);
-                lemma_fundamental_div_mod(psu, ai);
-                let k = cur_node_va as int / psu;
-                let m = psu / ai;
-                // lemma gives: cur_node_va == psu * k + (cur_node_va % psu)
-                //              psu == ai * m + (psu % ai)
-                assert(cur_node_va == (m * k) * ai) by (nonlinear_arith)
-                    requires
-                        cur_node_va == psu * k + 0,
-                        psu == ai * m + 0,
-                        cur_node_va as int % psu == 0,
-                        psu % ai == 0,
-                ;
-                lemma_mod_multiples_basic(m * k, ai);
-            };
-            assert(si % ai == 0) by {
-                // va_range.start = si + cur_node_va, both multiples of ai
-                // si % ai + cur_node_va % ai == va_range.start % ai (mod ai)
-                lemma_mod_adds(si, cur_node_va as int, ai);
-                // gives: si%ai + 0 == 0 + ai * ((si%ai + 0)/ai)
-                // so si%ai == ai * (si%ai / ai)
-                // since 0 <= si%ai < ai, si%ai / ai == 0, so si%ai == 0
-            };
-
-            // start_idx * ai = si (exact division since si % ai == 0)
             lemma_fundamental_div_mod(si, ai);
-            // si == ai * (si / ai) + (si % ai) == ai * start_idx + 0
-            vstd::arithmetic::mul::lemma_mul_is_commutative(ai, si / ai);
-
-            // end_idx * ai >= xi: ceil_div(xi, ai) * ai >= xi
             lemma_fundamental_div_mod(xi + ai - 1, ai);
-            let qi = (xi + ai - 1) / ai;
-            let ri = (xi + ai - 1) % ai;
-            // xi + ai - 1 == ai * qi + ri
-            vstd::arithmetic::mul::lemma_mul_is_commutative(ai, qi);
-            assert(qi * ai >= xi) by (nonlinear_arith)
+            let q1 = si / ai;
+            let r1 = si % ai;
+            let q2 = (xi + ai - 1) / ai;
+            let r2 = (xi + ai - 1) % ai;
+            assert(q1 < q2) by (nonlinear_arith)
                 requires
-                    xi + ai - 1 == qi * ai + ri,
-                    0 <= ri < ai,
+                    si == ai * q1 + r1,
+                    xi + ai - 1 == ai * q2 + r2,
+                    0 <= r1 < ai,
+                    0 <= r2 < ai,
+                    0 <= si < xi,
                     ai > 0,
             ;
-
-            assert(start_idx * ai < end_idx * ai) by (nonlinear_arith)
-                requires
-                    start_idx * ai == si,
-                    end_idx * ai >= xi,
-                    si < xi,
-            ;
-            vstd::arithmetic::mul::lemma_mul_strict_inequality_converse(
-                start_idx as int,
-                end_idx as int,
-                ai,
-            );
         };
 
         // -- end_idx <= NR_ENTRIES --

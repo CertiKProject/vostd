@@ -436,6 +436,13 @@ impl KVirtArea {
              Tracked(regions): Tracked<&mut MetaRegionOwners>,
              Tracked(guards): Tracked<&mut Guards<'a>>,
         requires
+            // This thread holds no guard on the kernel page table.
+            owner.pt_owner.0.subtree_satisfies(
+                owner.pt_owner.0.value().path,
+                crate::specs::mm::page_table::cursor::owners::node_unguarded::<KernelPtConfig>(
+                    *old(guards),
+                ),
+            ),
             Self::map_frames_bounds_panic_condition(area_size, map_offset, frames.len())
                 ==> may_panic(),
             kvirt_alloc_oom_condition(area_size) ==> may_panic(),
@@ -507,6 +514,10 @@ impl KVirtArea {
 
         let ghost pre_cursor_regions: MetaRegionOwners = *regions;
 
+        proof {
+            crate::specs::mm::page_table::cursor::page_size_lemmas::lemma_page_size_spec_values();
+            assert(FRAME_METADATA_BASE_VADDR <= 0xffff_e000_0000_0000usize) by (compute_only);
+        }
         #[verus_spec(with Tracked(owner.pt_owner), Ghost(root_guard), Tracked(regions), Tracked(guards))]
         let cursor_res = page_table.cursor_mut(preempt_guard, &cursor_range);
 
@@ -759,6 +770,13 @@ impl KVirtArea {
              Tracked(regions): Tracked<&mut MetaRegionOwners>,
              Tracked(guards): Tracked<&mut Guards<'a>>,
         requires
+            // This thread holds no guard on the kernel page table.
+            owner.pt_owner.0.subtree_satisfies(
+                owner.pt_owner.0.value().path,
+                crate::specs::mm::page_table::cursor::owners::node_unguarded::<KernelPtConfig>(
+                    *old(guards),
+                ),
+            ),
     // **Precise form** (post Phases A/B/C). Bounds are caller-
     // provable; OOM uses the implication form.
 
@@ -820,6 +838,10 @@ impl KVirtArea {
             // Save regions state before cursor_mut so postcondition trigger can fire.
             let ghost pre_cursor_regions: MetaRegionOwners = *regions;
 
+            proof {
+                crate::specs::mm::page_table::cursor::page_size_lemmas::lemma_page_size_spec_values();
+                assert(FRAME_METADATA_BASE_VADDR <= 0xffff_e000_0000_0000usize) by (compute_only);
+            }
             #[verus_spec(with Tracked(owner.pt_owner), Ghost(root_guard), Tracked(regions), Tracked(guards))]
             let cursor_res = page_table.cursor_mut(preempt_guard, &va_range);
 

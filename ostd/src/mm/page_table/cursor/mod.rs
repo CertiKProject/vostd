@@ -294,6 +294,15 @@ impl<'rcu, C: PageTableConfig, A: InAtomicMode> Cursor<'rcu, C, A> {
             // (UserPtConfig) get this for free since the default bound is
             // `usize::MAX + 1`.
             0 < va.end <= C::LOCKED_END_BOUND_spec(),
+            // See `lock_range`: no child range computed while locking overflows,
+            // and this thread holds no guard on the page table.
+            crate::specs::mm::page_table::is_valid_range_spec::<C>(*va) ==> va.end + page_size(
+                NR_LEVELS as PagingLevel,
+            ) <= usize::MAX,
+            pt_own.0.subtree_satisfies(
+                pt_own.0.value().path,
+                crate::specs::mm::page_table::cursor::owners::node_unguarded::<C>(*old(guards)),
+            ),
         ensures
             Self::cursor_new_success_conditions(*va) ==> {
                 &&& r is Ok
@@ -2256,6 +2265,15 @@ impl<'rcu, C: PageTableConfig, A: InAtomicMode> CursorMut<'rcu, C, A> {
             pt_own.0.value().node().relate_guard(root_guard),
             // Per-config tightening; see `Cursor::new`.
             0 < va.end <= C::LOCKED_END_BOUND_spec(),
+            // See `lock_range`: no child range computed while locking overflows,
+            // and this thread holds no guard on the page table.
+            crate::specs::mm::page_table::is_valid_range_spec::<C>(*va) ==> va.end + page_size(
+                NR_LEVELS as PagingLevel,
+            ) <= usize::MAX,
+            pt_own.0.subtree_satisfies(
+                pt_own.0.value().path,
+                crate::specs::mm::page_table::cursor::owners::node_unguarded::<C>(*old(guards)),
+            ),
         ensures
             Cursor::<C, A>::cursor_new_success_conditions(*va) ==> {
                 &&& r is Ok

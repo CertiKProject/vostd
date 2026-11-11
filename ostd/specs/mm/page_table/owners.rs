@@ -598,6 +598,127 @@ impl<C: PageTableConfig> PageTableOwner<C> {
         &&& self.pt_inv_at_depth((INC_LEVELS - self.0.level()) as nat)
     }
 
+    /// Replacing the root value of a node subtree by one that differs only in its
+    /// lock state keeps the subtree's invariants.
+    pub proof fn lemma_replace_root_value(
+        t: OwnerSubtree<C>,
+        t2: OwnerSubtree<C>,
+        regions: MetaRegionOwners,
+    )
+        requires
+            PageTableOwner(t).pt_inv(),
+            PageTableOwner(t).metaregion_sound(regions),
+            t.value().is_node(),
+            t2.level() == t.level(),
+            t2.children() == t.children(),
+            t2.value().is_node(),
+            t2.value().inv(),
+            t2.value().path == t.value().path,
+            t2.value().parent_level == t.value().parent_level,
+            t2.value().node().children_perm == t.value().node().children_perm,
+            t2.value().node().level == t.value().node().level,
+            t2.value().node().tree_level == t.value().node().tree_level,
+            t2.value().node().slot_index == t.value().node().slot_index,
+            t2.value().metaregion_sound(regions),
+        ensures
+            PageTableOwner(t2).pt_inv(),
+            PageTableOwner(t2).metaregion_sound(regions),
+    {
+        assert(<EntryOwner<C> as TreeNodeValue<INC_LEVELS>>::la_inv(t.value(), t.level()));
+        assert(t2.inv());
+        let depth = (INC_LEVELS - t.level()) as nat;
+        assert(depth > 0);
+        assert forall|i: int| 0 <= i < NR_ENTRIES implies #[trigger] t2.has_child(i)
+            && PageTableOwner::<C>::pt_edge_at(t2, i) && PageTableOwner(t2.child(i)).pt_inv_at_depth(
+            (depth - 1) as nat,
+        ) by {
+            PageTableOwner(t).pt_inv_unroll(i);
+            assert(t2.child(i) == t.child(i));
+        }
+        Self::lemma_pt_inv_intro(t2);
+        assert forall|i: int|
+            0 <= i < t2.children().len() && #[trigger] t2.has_child(i) implies t2.child(
+            i,
+        ).subtree_satisfies(t2.value().path.push_tail(i), PageTableOwner::<C>::metaregion_sound_pred(regions)) by {
+            assert(t.has_child(i));
+        }
+    }
+
+    /// Replacing child `i` of a node subtree by a sound subtree for the same
+    /// entry keeps the parent's invariants.
+    pub proof fn lemma_replace_child(
+        t: OwnerSubtree<C>,
+        i: int,
+        c2: OwnerSubtree<C>,
+        regions: MetaRegionOwners,
+    )
+        requires
+            PageTableOwner(t).pt_inv(),
+            PageTableOwner(t).metaregion_sound(regions),
+            t.value().is_node(),
+            0 <= i < NR_ENTRIES,
+            PageTableOwner(c2).pt_inv(),
+            PageTableOwner(c2).metaregion_sound(regions),
+            c2.level() == t.level() + 1,
+            c2.value().path == t.child(i).value().path,
+            c2.value().parent_level == t.child(i).value().parent_level,
+            c2.value().match_pte(
+                t.value().node().children_perm.value()[i],
+                t.value().node().level,
+            ),
+        ensures
+            PageTableOwner(t.insert(i, c2)).pt_inv(),
+            PageTableOwner(t.insert(i, c2)).metaregion_sound(regions),
+    {
+        let t2 = t.insert(i, c2);
+        PageTableOwner(t).pt_inv_unroll(i);
+        assert(<EntryOwner<C> as TreeNodeValue<INC_LEVELS>>::la_inv(t.value(), t.level()));
+        assert(t2.inv());
+        let depth = (INC_LEVELS - t.level()) as nat;
+        assert(depth > 0);
+        assert forall|j: int| 0 <= j < NR_ENTRIES implies #[trigger] t2.has_child(j)
+            && PageTableOwner::<C>::pt_edge_at(t2, j) && PageTableOwner(t2.child(j)).pt_inv_at_depth(
+            (depth - 1) as nat,
+        ) by {
+            if j != i {
+                PageTableOwner(t).pt_inv_unroll(j);
+                assert(t2.child(j) == t.child(j));
+            } else {
+                assert(t2.child(j) == c2);
+            }
+        }
+        Self::lemma_pt_inv_intro(t2);
+        assert forall|j: int|
+            0 <= j < t2.children().len() && #[trigger] t2.has_child(j) implies t2.child(
+            j,
+        ).subtree_satisfies(t2.value().path.push_tail(j), PageTableOwner::<C>::metaregion_sound_pred(regions)) by {
+            if j != i {
+                assert(t.has_child(j));
+            }
+        }
+    }
+
+    /// Introduces `pt_inv` for a node subtree from its per-child facts.
+    pub proof fn lemma_pt_inv_intro(owner: OwnerSubtree<C>)
+        requires
+            owner.inv(),
+            owner.value().is_node(),
+            forall|i: int| 0 <= i < NR_ENTRIES ==> #[trigger] owner.has_child(i)
+                && Self::pt_edge_at(owner, i) && PageTableOwner(owner.child(i)).pt_inv_at_depth(
+                ((INC_LEVELS - owner.level()) as nat - 1) as nat),
+        ensures
+            PageTableOwner(owner).pt_inv(),
+    {
+        let depth = (INC_LEVELS - owner.level()) as nat;
+        assert(<EntryOwner<C> as TreeNodeValue<INC_LEVELS>>::la_inv(owner.value(), owner.level()));
+        assert forall|i: int| 0 <= i < NR_ENTRIES implies #[trigger] owner.has_child(i)
+            && Self::pt_edge_at(owner, i) && PageTableOwner(owner.child(i)).pt_inv_at_depth(
+            (depth - 1) as nat,
+        ) by {
+            assert(owner.has_child(i));
+        };
+    }
+
     pub proof fn pt_inv_unroll(self, i: int)
         requires
             self.pt_inv(),

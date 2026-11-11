@@ -1618,9 +1618,11 @@ impl AbstractVaddr {
         crate::arch::mm::lemma_nr_subpage_per_huge_eq_nr_entries();
         vstd_extra::external::ilog2::lemma_usize_ilog2_to32();
         let path = self.to_path(level);
+        crate::specs::mm::page_table::cursor::page_size_lemmas::lemma_page_size_spec_values();
         if level == 3 {
             let aligned = self.align_down(4);
             self.align_down_shape(4);
+            assert(aligned.index[0] == 0 && aligned.index[1] == 0 && aligned.index[2] == 0);
             self.to_path_index(3, 0);
             path.lemma_index_satisfies_elem_inv(0);
             assert(vaddr(path) == path[0] * 0x80_0000_0000usize) by {

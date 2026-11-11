@@ -209,6 +209,44 @@ impl<C: PageTableConfig> EntryOwner<C> {
         self.tracked_put_node(node);
     }
 
+    /// Like [`Self::tracked_install_node_lock_payload`], for a payload just
+    /// taken from the node's lock, without knowing that the owner is unlocked:
+    /// if the owner already held the payload, the two payloads' `nr_children`
+    /// permissions would share a cell, which is impossible.
+    pub proof fn tracked_install_fresh_node_lock_payload(
+        tracked &mut self,
+        tracked payload: PtLockPayload,
+        meta_value: PageTablePageMeta<C>,
+    )
+        requires
+            old(self).kind is Node,
+            old(self).node().inv(),
+            payload.meta.inv(),
+            payload.pte_auth.id() == old(self).node().pte_view.id(),
+            payload.pte_auth@ == old(self).node().pte_view@,
+            meta_value.wf(payload.meta),
+            old(self).node().is_locked() ==> meta_value.wf(old(self).node().meta()),
+        ensures
+            final(self).kind is Node,
+            final(self).node().inv(),
+            final(self).node().is_locked(),
+            final(self).node().meta() == payload.meta,
+            final(self).node().pte_view == old(self).node().pte_view,
+            final(self).node().children_perm == old(self).node().children_perm,
+            final(self).node().level == old(self).node().level,
+            final(self).node().tree_level == old(self).node().tree_level,
+            final(self).node().slot_index == old(self).node().slot_index,
+            final(self).path == old(self).path,
+            final(self).parent_level == old(self).parent_level,
+    {
+        let tracked mut payload = payload;
+        if self.node().is_locked() {
+            let tracked held = self.tracked_borrow_node().tracked_borrow_meta();
+            payload.meta.nr_children.is_exclusive(&held.nr_children);
+        }
+        self.tracked_install_node_lock_payload(payload);
+    }
+
     pub proof fn tracked_borrow_node(tracked &self) -> (tracked res: &NodeOwner<C>)
         requires
             self.kind is Node,

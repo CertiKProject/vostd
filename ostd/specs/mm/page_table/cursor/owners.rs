@@ -608,6 +608,26 @@ impl<'rcu, C: PageTableConfig> CursorContinuation<'rcu, C> {
     }
 }
 
+/// No node in the subtree has a live guard.
+pub open spec fn node_unguarded<'rcu, C: PageTableConfig>(guards: Guards<'rcu>) -> spec_fn(
+    EntryOwner<C>,
+    TreePath<NR_ENTRIES>,
+) -> bool {
+    |e: EntryOwner<C>, p: TreePath<NR_ENTRIES>| e.is_node() ==> guards.unlocked(e.node().meta_vaddr())
+}
+
+/// No node strictly below the root of `t` has a live guard.
+pub open spec fn children_unguarded<'rcu, C: PageTableConfig>(
+    t: OwnerSubtree<C>,
+    guards: Guards<'rcu>,
+) -> bool {
+    forall|i: int|
+        0 <= i < NR_ENTRIES && #[trigger] t.has_child(i) ==> t.child(i).subtree_satisfies(
+            t.value().path.push_tail(i),
+            node_unguarded::<C>(guards),
+        )
+}
+
 pub tracked struct CursorOwner<'rcu, C: PageTableConfig> {
     pub ghost level: PagingLevel,
     pub continuations: Map<int, CursorContinuation<'rcu, C>>,

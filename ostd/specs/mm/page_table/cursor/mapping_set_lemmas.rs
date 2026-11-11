@@ -192,7 +192,7 @@ impl<'rcu, C: PageTableConfig> CursorContinuation<'rcu, C> {
         self.inv_children_unroll_all();
     }
 
-    proof fn as_page_table_owner_pt_inv(self)
+    pub proof fn as_page_table_owner_pt_inv(self)
         requires
             self.inv(),
             self.all_some(),

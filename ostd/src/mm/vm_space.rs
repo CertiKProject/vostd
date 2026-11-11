@@ -228,6 +228,13 @@ impl<'a> VmSpace<'a> {
             self.pt.relates_owner(owner, *old(regions)),
             owner.0.value().node().relate_guard(root_guard),
             va.end > 0,
+            // This thread holds no guard on the page table.
+            owner.0.subtree_satisfies(
+                owner.0.value().path,
+                crate::specs::mm::page_table::cursor::owners::node_unguarded::<UserPtConfig>(
+                    *old(guards),
+                ),
+            ),
         ensures
             crate::mm::page_table::Cursor::<UserPtConfig, G>::cursor_new_success_conditions(*va) ==> (r matches Ok(_) && cursor_owner@ matches Some(_)),
             // On the success branch, the returned cursor owner satisfies
@@ -242,6 +249,10 @@ impl<'a> VmSpace<'a> {
     > {
         proof_decl! {
             let tracked mut out_owner: Option<CursorOwner<'a, UserPtConfig>>;
+        }
+        proof {
+            crate::specs::mm::page_table::lemma_vaddr_range_spec_user();
+            crate::specs::mm::page_table::cursor::page_size_lemmas::lemma_page_size_spec_values();
         }
         match {
             #[verus_spec(with Tracked(owner), Ghost(root_guard), Tracked(regions), Tracked(guards))]
@@ -289,6 +300,13 @@ impl<'a> VmSpace<'a> {
             self.pt.relates_owner(owner, *old(regions)),
             owner.0.value().node().relate_guard(root_guard),
             va.end > 0,
+            // This thread holds no guard on the page table.
+            owner.0.subtree_satisfies(
+                owner.0.value().path,
+                crate::specs::mm::page_table::cursor::owners::node_unguarded::<UserPtConfig>(
+                    *old(guards),
+                ),
+            ),
         ensures
             crate::mm::page_table::Cursor::<UserPtConfig, G>::cursor_new_success_conditions(*va) ==> (r matches Ok(_) && cursor_owner@ matches Some(_)),
             // See `cursor` above for the derivation.
@@ -299,6 +317,10 @@ impl<'a> VmSpace<'a> {
     > {
         proof_decl! {
             let tracked mut out_owner: Option<CursorOwner<'a, UserPtConfig>>;
+        }
+        proof {
+            crate::specs::mm::page_table::lemma_vaddr_range_spec_user();
+            crate::specs::mm::page_table::cursor::page_size_lemmas::lemma_page_size_spec_values();
         }
         match {
             #[verus_spec(with Tracked(owner), Ghost(root_guard), Tracked(regions), Tracked(guards))]
