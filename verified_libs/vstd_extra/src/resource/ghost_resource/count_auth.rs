@@ -591,18 +591,21 @@ impl<T, const TOTAL: usize> CountResource<T, TOTAL> {
         joined.validate();
     }
 
-    /// A vacant pool and a [`Count`] cannot share a location.
-    pub proof fn lemma_vacant_excludes_frac(tracked &mut self, tracked frac: &Count<T, TOTAL>)
-        requires
-            old(self).is_resource_vacant(),
+    /// Two pools cannot share a location.
+    ///
+    /// Each pool holds the authority for its location, and two authorities
+    /// never compose. Allocation does not promise a fresh [`Loc`], so this is
+    /// how a client learns that two separately allocated pools are distinct
+    /// cells.
+    pub proof fn lemma_distinct_authority(tracked &mut self, tracked other: &Self)
         ensures
             *final(self) == *old(self),
-            final(self).id() != frac.id(),
+            final(self).id() != other.id(),
     {
         use_type_invariant(&*self);
-        use_type_invariant(frac);
-        if self.id() == frac.id() {
-            let _ = self.r.validate_with_shared(&frac.r);
+        use_type_invariant(other);
+        if self.id() == other.id() {
+            let _ = self.r.validate_with_shared(&other.r);
         }
     }
 
