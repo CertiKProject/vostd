@@ -570,11 +570,30 @@ pub fn example_round_trip() -> (res: Tracked<ExampleLock>)
         lock = build_tree(1, 7, 9);
     }
     let ghost before = lock.node().view_tree();
+    let ghost original = lock.node();
+    proof {
+        lemma_tree_values(original, before);
+    }
     let Tracked(restored) = publish_tree(Tracked(lock));
     let tracked back;
     proof {
         back = ExampleLock::tracked_from_tree(restored);
         assert(back.node().view_tree() == before);
+        // Read the restored root's children off the shared view.
+        let node = back.node();
+        node.lemma_view_tree_at_fields(2);
+        node.lemma_view_tree_at_child(2, 0);
+        node.lemma_view_tree_at_child(2, 1);
+        assert(node.value() == original.value());
+        assert(node.inv_children());
+        assert(node.child(0).inv_edge(node.value(), 0, node.level()));
+        assert(node.child(1).inv_edge(node.value(), 1, node.level()));
+        assert(leaf_available(node, 0) && leaf_available(node, 1)) by {
+            assert(node.has_child(0) && node.has_child(1));
+            assert(node.child(0).node().inv() && node.child(1).node().inv());
+            assert(node.child(0).node().level() == 1 && node.child(1).node().level() == 1);
+            assert(node.child(0).node().inv_children() && node.child(1).node().inv_children());
+        }
 
         // The restored tree denotes what we started with, so its values read
         // back through the view lemmas.
