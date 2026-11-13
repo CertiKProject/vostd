@@ -94,11 +94,12 @@ impl<C: PageTableConfig> PageTablePageMeta<C> {
     }
 
     /// The parts of the lock constant used only by `flat_tree` reasoning: the
-    /// node's level and how its PTEs name child nodes. Opaque, as most proofs
-    /// about page table metadata do not need them.
+    /// node's level, its flat-tree depth, and how its PTEs name child nodes.
+    /// Opaque, as most proofs about page table metadata do not need them.
     #[verifier::opaque]
     pub open spec fn lock_consts_wf(self) -> bool {
         &&& self.lock.constant().consts.pt_level == self.level
+        &&& self.lock.constant().level == crate::specs::arch::NR_LEVELS - self.level
         &&& self.lock.constant().consts.child_of == raw_child_of_fn::<C::E>()
     }
 

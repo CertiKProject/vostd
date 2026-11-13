@@ -42,7 +42,7 @@ use vstd::atomic_ghost::*;
 use vstd::resource::ghost_var::{GhostVar, GhostVarAuth};
 use vstd_extra::array_ptr;
 use vstd_extra::cast_ptr::*;
-use vstd_extra::drop_tracking::{Drop as VerifiedDrop, TrackDrop};
+use vstd_extra::drop_tracking::{DropObligation, Drop as VerifiedDrop, TrackDrop};
 use vstd_extra::ghost_tree::*;
 use vstd_extra::ownership::*;
 
@@ -993,6 +993,78 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
         proof {
             assert(owner.children_perm.wf());
             owner.tracked_sync_pte_model();
+        }
+    }
+
+    /// Unlocks the page table node, returning its lock cell to the lock.
+    ///
+    /// This is the body of the original `Drop` implementation of
+    /// `PageTableGuard` (commented out below), as an explicit method, since
+    /// Verus does not verify `Drop`.
+    ///
+    /// # Verified Properties
+    /// ## Preconditions
+    /// - `owner` is the owner of this node, holds its lock cell, and is sound with
+    ///   respect to `regions`. In particular `nr_children` counts the present
+    ///   PTEs (`count_consistent`), which the lock's invariant requires.
+    /// - The guard has been redeemed from the [`Guards`] ledger: `obl` is its
+    ///   drop obligation (see [`TrackDrop::tracked_redeem`]). A caller holding a
+    ///   guard recorded in the ledger redeems it first.
+    /// ## Postconditions
+    /// - The cell has moved from `owner` back into the lock; nothing else in
+    ///   `owner` changes.
+    /// ## Key Verification Step
+    /// The lock cannot already hold a cell, since it would have the same lock
+    /// identity as `owner`'s ([`NodeCell::lemma_distinct`]).
+    ///
+    /// [`NodeCell::lemma_distinct`]: vstd_extra::resource::flat_tree::NodeCell::lemma_distinct
+    #[verus_spec(
+        with Tracked(owner): Tracked<&mut NodeOwner<C>>,
+             Tracked(regions): Tracked<&MetaRegionOwners>,
+             Tracked(obl): Tracked<DropObligation<usize>>,
+        requires
+            old(owner).relate_guard(self),
+            old(owner).inv(),
+            old(owner).is_locked(),
+            old(owner).metaregion_sound_node(*regions),
+            regions.inv(),
+            obl.value() == old(owner).meta_vaddr(),
+        ensures
+            *final(owner) == (NodeOwner { lock_cell: None, ..*old(owner) }),
+            final(owner).inv(),
+    )]
+    pub fn unlock(self) {
+        let tracked points_to = regions.slots.tracked_borrow(owner.slot_index);
+        let tracked slot_owner = regions.slot_owners.tracked_borrow(owner.slot_index);
+        #[verus_spec(with
+            Tracked(points_to),
+            Tracked(&slot_owner.metadata_perm),
+            Tracked(&())
+        )]
+        let meta = self.meta();
+
+        proof_decl! {
+            let tracked mut cell = owner.lock_cell.tracked_take();
+        }
+        proof {
+            reveal(PageTablePageMeta::lock_consts_wf);
+            lemma_count_where_pte_bytes::<C::E>(
+                owner.children_perm.value(),
+                owner.children_perm.value().len() as int,
+            );
+            assert(cell.inv_cell());
+        }
+        atomic_with_ghost! {
+            meta.lock => store(0);
+            ghost g => {
+                // The lock cannot already hold a cell: it would have the same
+                // identity as ours.
+                if g is Some {
+                    let tracked other = g.tracked_take();
+                    cell.lemma_distinct(&other);
+                }
+                g = Some(cell);
+            }
         }
     }
 
