@@ -74,6 +74,35 @@ pub open spec fn raw_is_present<E: PageTableEntryTrait>(b: Seq<u8>) -> bool {
     ostd_pod::decode_pod::<E>(b).is_present()
 }
 
+/// The child page table node that a PTE of type `E` at `level`, given by its
+/// bytes, points to: its physical address if it is present and not last.
+pub open spec fn raw_child_of<E: PageTableEntryTrait>(b: Seq<u8>, level: PagingLevel) -> Option<
+    Paddr,
+> {
+    let e = ostd_pod::decode_pod::<E>(b);
+    if e.is_present() && !e.is_last(level) {
+        Some(e.paddr())
+    } else {
+        None
+    }
+}
+
+/// [`raw_child_of`] as a function value, as stored in the lock constant.
+pub open spec fn raw_child_of_fn<E: PageTableEntryTrait>() -> spec_fn(Seq<u8>, PagingLevel) -> Option<Paddr> {
+    |b: Seq<u8>, lv: PagingLevel| raw_child_of::<E>(b, lv)
+}
+
+/// The key of a node's lock is the physical address of the node's frame, the
+/// one whose metadata slot is `slot_index`. Opaque to keep the address
+/// arithmetic out of [`NodeOwner::metaregion_sound_node`] users' contexts.
+#[verifier::opaque]
+pub open spec fn lock_key_wf<C: PageTableConfig>(
+    meta: PageTablePageMeta<C>,
+    slot_index: int,
+) -> bool {
+    meta.lock.constant().key == meta_to_frame(index_to_meta(slot_index))
+}
+
 /// The byte representation of a sequence of PTEs, as recorded by the PTE model.
 pub open spec fn pte_bytes<E: PageTableEntryTrait>(s: Seq<E>) -> PteBytes {
     s.map_values(|e: E| ostd_pod::pod_bytes(e))
@@ -349,7 +378,7 @@ impl<C: PageTableConfig> NodeOwner<C> {
             final(self).tree_level == old(self).tree_level,
             final(self).slot_index == old(self).slot_index,
     {
-        let tracked PtLockPayload { meta, pte_auth } = payload;
+        let tracked PtLockPayload { meta, pte_auth, .. } = payload;
         self.meta_own = Some(meta);
         self.pte_auth = Some(pte_auth);
     }
@@ -406,7 +435,8 @@ impl<C: PageTableConfig> NodeOwner<C> {
         &&& regions.contains(idx)
         &&& self.meta_wf(regions)
         &&& self.meta_value(regions).lock_wf()
-        &&& self.pte_view.id() == self.meta_value(regions).lock.constant().pte_model_id
+        &&& self.pte_view.id() == self.meta_value(regions).lock.constant().consts.pte_model_id
+        &&& lock_key_wf(self.meta_value(regions), self.slot_index)
         &&& self.is_locked() ==> self.meta_value(regions).wf(self.meta())
         &&& self.level == self.meta_value(regions).level
         // A page-table node's slot is tracked with `PageTable` usage (set at

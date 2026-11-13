@@ -21,7 +21,7 @@ use crate::mm::{
 use vstd_extra::array_ptr::*;
 
 use crate::mm::page_table::*;
-use crate::specs::mm::frame::meta_owners::PtLockPayload;
+use crate::specs::mm::frame::meta_owners::PtLockCell;
 use crate::specs::mm::frame::meta_region_owners::MetaRegionOwners;
 use crate::specs::mm::page_table::node::Guards;
 use crate::specs::mm::page_table::node::entry_owners::EntryOwner;
@@ -908,12 +908,12 @@ fn dfs_acquire_lock<'rcu, C: PageTableConfig, A: InAtomicMode>(
                     assert(guards0.unlocked(child0.value().node().meta_vaddr()));
                 }
                 proof_decl! {
-                    let tracked lock_payload: PtLockPayload;
+                    let tracked lock_cell: PtLockCell;
                     let tracked guard_obl: DropObligation<usize>;
                 }
                 let mut pt_guard = {
                     let tracked child_owner = subtree.tracked_borrow_child(i as int).tracked_borrow_value().tracked_borrow_node();
-                    #[verus_spec(with Tracked(child_owner), Tracked(&*regions), Tracked(guards) => Tracked(lock_payload))]
+                    #[verus_spec(with Tracked(child_owner), Tracked(&*regions), Tracked(guards) => Tracked(lock_cell))]
                     pt.lock(guard)
                 };
                 let ghost guards1 = *guards;
@@ -928,7 +928,7 @@ fn dfs_acquire_lock<'rcu, C: PageTableConfig, A: InAtomicMode>(
                     let ghost meta_value = child0.value().node().meta_value(*regions);
                     let tracked c = subtree.tracked_borrow_mut_child(i as int);
                     c.tracked_borrow_mut_value().tracked_install_fresh_node_lock_payload(
-                        lock_payload,
+                        lock_cell.tracked_into_value(),
                         meta_value,
                     );
                     PageTableOwner::<C>::lemma_replace_root_value(child0, *c, *regions);

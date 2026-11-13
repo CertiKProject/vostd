@@ -16,7 +16,7 @@ use crate::mm::{Paddr, PagingConstsTrait, PagingLevel, Vaddr};
 use crate::specs::arch::{NR_ENTRIES, NR_LEVELS, PAGE_SIZE};
 use crate::specs::mm::frame::{
     mapping::{frame_to_index, group_page_meta, meta_to_index},
-    meta_owners::PtLockPayload,
+    meta_owners::PtLockCell,
     meta_region_owners::MetaRegionOwners,
 };
 use crate::specs::mm::page_table::{INC_LEVELS, PageTableOwner};
@@ -666,16 +666,16 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
             // Lock before writing the PTE, so no one else can operate on it.
             let mut pt_lock_guard = {
                 proof_decl! {
-                    let tracked lock_payload: PtLockPayload;
+                    let tracked lock_cell: PtLockCell;
                 }
                 let pt_lock_guard = {
                     let tracked new_node_value = new_node_owner.tracked_borrow_value();
-                    #[verus_spec(with Tracked(new_node_value.tracked_borrow_node()), Tracked(&*regions), Tracked(guards) => Tracked(lock_payload))]
+                    #[verus_spec(with Tracked(new_node_value.tracked_borrow_node()), Tracked(&*regions), Tracked(guards) => Tracked(lock_cell))]
                     pt_ref.lock(guard)
                 };
                 proof {
                     let tracked new_node_value = new_node_owner.tracked_borrow_mut_value();
-                    new_node_value.tracked_install_node_lock_payload(lock_payload);
+                    new_node_value.tracked_install_node_lock_payload(lock_cell.tracked_into_value());
                 }
                 pt_lock_guard
             };
@@ -950,16 +950,16 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
         // Lock before writing the PTE, so no one else can operate on it.
         let mut pt_lock_guard = {
             proof_decl! {
-                let tracked lock_payload: PtLockPayload;
+                let tracked lock_cell: PtLockCell;
             }
             let pt_lock_guard = {
                 let tracked new_owner_value = new_owner.tracked_borrow_value();
-                #[verus_spec(with Tracked(new_owner_value.tracked_borrow_node()), Tracked(&*regions), Tracked(guards) => Tracked(lock_payload))]
+                #[verus_spec(with Tracked(new_owner_value.tracked_borrow_node()), Tracked(&*regions), Tracked(guards) => Tracked(lock_cell))]
                 pt_ref.lock(guard)
             };
             proof {
                 let tracked new_owner_value = new_owner.tracked_borrow_mut_value();
-                new_owner_value.tracked_install_node_lock_payload(lock_payload);
+                new_owner_value.tracked_install_node_lock_payload(lock_cell.tracked_into_value());
             }
             pt_lock_guard
         };
@@ -1922,16 +1922,16 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
 
         let pt_lock_guard = {
             proof_decl! {
-                let tracked lock_payload: PtLockPayload;
+                let tracked lock_cell: PtLockCell;
             }
             let pt_lock_guard = {
                 let tracked new_node_value = new_node_owner.tracked_borrow_value();
-                #[verus_spec(with Tracked(new_node_value.tracked_borrow_node()), Tracked(&*regions), Tracked(guards) => Tracked(lock_payload))]
+                #[verus_spec(with Tracked(new_node_value.tracked_borrow_node()), Tracked(&*regions), Tracked(guards) => Tracked(lock_cell))]
                 pt_ref.lock(guard)
             };
             proof {
                 let tracked new_node_value = new_node_owner.tracked_borrow_mut_value();
-                new_node_value.tracked_install_node_lock_payload(lock_payload);
+                new_node_value.tracked_install_node_lock_payload(lock_cell.tracked_into_value());
             }
             pt_lock_guard
         };

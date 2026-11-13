@@ -15,10 +15,11 @@ use vstd_extra::{
     cast_ptr::{self, Repr},
     ghost_tree::TreePath,
     ownership::*,
+    resource::flat_tree::{LockConst, LockedValue, NodeCell},
 };
 
 use crate::specs::{
-    arch::NR_ENTRIES,
+    arch::{NR_ENTRIES, NR_LEVELS},
     mm::{frame::linked_list::linked_list_owners::StoredLink, page_table::node::PageMetaOwner},
 };
 
@@ -124,27 +125,50 @@ pub open spec fn count_where(f: spec_fn(Seq<u8>) -> bool, s: PteBytes) -> int {
     count_where_upto(f, s, s.len() as int)
 }
 
-/// The constant of a page table node lock. Fixed when the node is created.
+/// The part of a page table node lock's constant that the node's parent does
+/// not see. Fixed when the node is created.
 ///
 /// The predicate cannot mention the `PageTableConfig` (the stored metadata is
 /// not generic), so the config-specific interpretation of PTEs is carried here
-/// as a ghost function. [`PageTablePageMeta::lock_wf`] pins it down.
+/// as ghost functions. [`PageTablePageMeta::lock_wf`] pins them down.
 ///
 /// [`PageTablePageMeta::lock_wf`]: crate::mm::page_table::PageTablePageMeta::lock_wf
-pub ghost struct PtLockConst {
+pub ghost struct PtLockConsts {
     /// The id of the node's `nr_children` cell.
     pub nr_children_id: CellId,
     /// The id of the node's `stray` cell.
     pub stray_id: CellId,
     /// The id of the node's PTE-model ghost variable.
     pub pte_model_id: Loc,
+    /// The paging level of the node.
+    pub pt_level: PagingLevel,
     /// Whether a PTE, given by its bytes, is present.
     pub is_present: spec_fn(Seq<u8>) -> bool,
+    /// The child page table node a PTE at the given level points to, if any.
+    pub child_of: spec_fn(Seq<u8>, PagingLevel) -> Option<Paddr>,
 }
 
-/// What a page table node lock holds while it is free. It is handed to whoever
-/// acquires the lock.
+/// The constant of a page table node lock: a [`flat_tree`] lock constant, keyed
+/// by the node's physical address.
+///
+/// The notion of a Constant comes from the ghost Atomics,  AtomicU8<K, G, Pred>,  the K is the part 
+/// that does not change. Here, it refers to the identities of everything inside the cell, as opposed to the contents. 
+/// The identities are fixed for the node's whole lifetime. The contents change whenever the lock holder writes.
+/// 
+/// [`flat_tree`]: vstd_extra::resource::flat_tree
+pub type PtLockConst = LockConst<Paddr, PtLockConsts>;
+
+/// What a page table node lock holds while it is free, inside a
+/// [`PtLockCell`]. It is handed to whoever acquires the lock.
 pub tracked struct PtLockPayload {
+    /// The physical address of the node.
+    pub ghost paddr: Paddr,
+    /// See [`PtLockConsts::pt_level`].
+    pub ghost pt_level: PagingLevel,
+    /// See [`PtLockConsts::is_present`].
+    pub ghost is_present: spec_fn(Seq<u8>) -> bool,
+    /// See [`PtLockConsts::child_of`].
+    pub ghost child_of: spec_fn(Seq<u8>, PagingLevel) -> Option<Paddr>,
     /// The permissions for the `nr_children` and `stray` cells.
     pub meta: PageMetaOwner,
     /// The authoritative half of the PTE model. The other half
@@ -152,31 +176,73 @@ pub tracked struct PtLockPayload {
     pub pte_auth: GhostVarAuth<PteBytes>,
 }
 
+impl LockedValue for PtLockPayload {
+    type Key = Paddr;
+
+    type Consts = PtLockConsts;
+
+    open spec fn key(self) -> Paddr {
+        self.paddr
+    }
+
+    open spec fn consts(self) -> PtLockConsts {
+        PtLockConsts {
+            nr_children_id: self.meta.nr_children.id(),
+            stray_id: self.meta.stray.id(),
+            pte_model_id: self.pte_auth.id(),
+            pt_level: self.pt_level,
+            is_present: self.is_present,
+            child_of: self.child_of,
+        }
+    }
+
+    /// The child page table node that PTE `i` points to, according to the PTE
+    /// model. Level-1 nodes have none.
+    open spec fn child_key(self, i: int) -> Option<Paddr> {
+        if self.pt_level <= 1 || !(0 <= i < self.pte_auth@.len()) {
+            None
+        } else {
+            (self.child_of)(self.pte_auth@[i], self.pt_level)
+        }
+    }
+
+    /// The flat-tree depth `level` is `NR_LEVELS - pt_level`, and
+    /// `nr_children` counts the present PTEs in the PTE model.
+    open spec fn inv(self, level: nat) -> bool {
+        &&& self.meta.inv()
+        &&& self.pt_level + level == NR_LEVELS
+        &&& self.meta.nr_children.value() == count_where(self.is_present, self.pte_auth@)
+    }
+}
+
+/// The cell a page table node lock holds while free. The root of a page table
+/// is at flat-tree depth `0` and level-1 nodes at depth `NR_LEVELS - 1`.
+pub type PtLockCell = NodeCell<PtLockPayload, NR_ENTRIES, NR_LEVELS>;
+
 /// The invariant of the page table node lock (see [`PageTableLock`]).
 pub struct PtLockPred;
 
-impl AtomicInvariantPredicate<PtLockConst, u8, Option<PtLockPayload>> for PtLockPred {
-    /// When the lock is free (`0`), it stores the [`PtLockPayload`], whose ids
-    /// match the constant, and whose `nr_children` counts the present PTEs in the
-    /// PTE model. When it is held (`1`), the payload is with the lock holder.
-    open spec fn atomic_inv(k: PtLockConst, v: u8, g: Option<PtLockPayload>) -> bool {
+impl AtomicInvariantPredicate<PtLockConst, u8, Option<PtLockCell>> for PtLockPred {
+    /// When the lock is free (`0`), it stores the [`PtLockCell`] whose identity
+    /// is the constant, and which can be unlocked. When it is held (`1`), the
+    /// cell is with the lock holder. This is [`flat_tree::CellPred`] on a `u8`.
+    ///
+    /// [`flat_tree::CellPred`]: vstd_extra::resource::flat_tree::CellPred
+    open spec fn atomic_inv(k: PtLockConst, v: u8, g: Option<PtLockCell>) -> bool {
         match g {
             None => v == 1,
-            Some(p) => {
+            Some(c) => {
                 &&& v == 0
-                &&& p.meta.inv()
-                &&& p.meta.nr_children.id() == k.nr_children_id
-                &&& p.meta.stray.id() == k.stray_id
-                &&& p.pte_auth.id() == k.pte_model_id
-                &&& p.meta.nr_children.value() == count_where(k.is_present, p.pte_auth@)
+                &&& c.lock_const() == k
+                &&& c.inv_cell()
             },
         }
     }
 }
 
-/// The lock of a page table node. It carries the [`PtLockPayload`] of the node
+/// The lock of a page table node. It carries the [`PtLockCell`] of the node
 /// while unlocked.
-pub type PageTableLock = AtomicU8<PtLockConst, Option<PtLockPayload>, PtLockPred>;
+pub type PageTableLock = AtomicU8<PtLockConst, Option<PtLockCell>, PtLockPred>;
 
 pub struct StoredPageTablePageMeta {
     pub nr_children: pcell_maybe_uninit::PCell<u16>,

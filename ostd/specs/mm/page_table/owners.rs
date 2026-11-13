@@ -699,6 +699,7 @@ impl<C: PageTableConfig> PageTableOwner<C> {
     }
 
     /// Introduces `pt_inv` for a node subtree from its per-child facts.
+    #[verifier::spinoff_prover]
     pub proof fn lemma_pt_inv_intro(owner: OwnerSubtree<C>)
         requires
             owner.inv(),
@@ -711,14 +712,20 @@ impl<C: PageTableConfig> PageTableOwner<C> {
     {
         let depth = (INC_LEVELS - owner.level()) as nat;
         assert(<EntryOwner<C> as TreeNodeValue<INC_LEVELS>>::la_inv(owner.value(), owner.level()));
-        assert forall|i: int| 0 <= i < NR_ENTRIES implies #[trigger] owner.has_child(i)
-            && Self::pt_edge_at(owner, i) && PageTableOwner(owner.child(i)).pt_inv_at_depth(
-            (depth - 1) as nat,
-        ) by {
+        assert(depth > 0);
+        let p = PageTableOwner(owner);
+        assert(p.0 == owner);
+        assert forall|i: int|
+            #![trigger p.0.has_child(i)]
+            0 <= i < NR_ENTRIES implies Self::pt_edge_at(p.0, i) && PageTableOwner(
+                p.0.child(i),
+            ).pt_inv_at_depth((depth - 1) as nat) by {
             assert(owner.has_child(i));
         };
+        assert(PageTableOwner(owner).pt_inv_at_depth(depth));
     }
 
+    #[verifier::spinoff_prover]
     pub proof fn pt_inv_unroll(self, i: int)
         requires
             self.pt_inv(),

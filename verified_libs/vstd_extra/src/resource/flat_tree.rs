@@ -168,6 +168,15 @@ impl<T: LockedValue, const N: usize, const L: usize> NodeCell<T, N, L> {
         &mut self.value
     }
 
+    /// Takes the value out of the cell, discarding the lock identity. The
+    /// value can then no longer be returned to its lock.
+    pub proof fn tracked_into_value(tracked self) -> (tracked res: T)
+        ensures
+            res == self.value(),
+    {
+        self.value
+    }
+
     /// Two cells never share a lock identity.
     pub proof fn lemma_distinct(tracked &mut self, tracked other: &Self)
         ensures

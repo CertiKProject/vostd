@@ -58,10 +58,10 @@ use crate::mm::page_table::*;
 use crate::mm::{Paddr, Vaddr};
 use crate::specs::mm::{
     frame::{
-        mapping::{frame_to_index, lemma_frame_to_index_injective, meta_to_index},
+        mapping::{frame_to_index, index_to_meta, lemma_frame_to_index_injective, meta_to_index},
         meta_owners::{
             MetaSlotOwner, MetaSlotStorage, MetadataPerms, PageTableLock, PtLockConst,
-            PtLockPayload, PtLockPred, PteBytes, typed_meta_value, typed_meta_wf,
+            PtLockCell, PtLockPayload, PtLockPred, PteBytes, typed_meta_value, typed_meta_wf,
         },
         meta_region_owners::MetaRegionOwners,
     },
@@ -684,7 +684,7 @@ impl<'a, C: PageTableConfig> PageTableNodeRef<'a, C> {
         with Tracked(owner): Tracked<&NodeOwner<C>>,
             Tracked(regions): Tracked<&MetaRegionOwners>,
             Tracked(guards): Tracked<&mut Guards<'rcu>>
-            -> payload: Tracked<PtLockPayload>,
+            -> cell: Tracked<PtLockCell>,
         requires
             self.inner@.invariants(*owner),
             regions.inv(),
@@ -694,11 +694,14 @@ impl<'a, C: PageTableConfig> PageTableNodeRef<'a, C> {
             final(guards).lock_held(owner.meta_vaddr()),
             Self::locks_preserved_except(owner.meta_vaddr(), *old(guards), *final(guards)),
             owner.relate_guard(res),
-            payload@.meta.inv(),
-            owner.meta_value(*regions).wf(payload@.meta),
-            payload@.pte_auth.id() == owner.pte_view.id(),
-            payload@.pte_auth@ == owner.pte_view@,
-            payload@.meta.nr_children.value() == count_present(owner.children_perm.value()),
+            cell@.lock_const() == owner.meta_value(*regions).lock.constant(),
+            cell@.inv_cell(),
+            cell@.key() == meta_to_frame(index_to_meta(owner.slot_index)),
+            cell@.value().meta.inv(),
+            owner.meta_value(*regions).wf(cell@.value().meta),
+            cell@.value().pte_auth.id() == owner.pte_view.id(),
+            cell@.value().pte_auth@ == owner.pte_view@,
+            cell@.value().meta.nr_children.value() == count_present(owner.children_perm.value()),
     )]
     #[verifier::exec_allows_no_decreases_clause]
     pub fn lock<'rcu, A: InAtomicMode>(self, _guard: &'rcu A) -> PageTableGuard<'rcu, C> where
@@ -714,7 +717,7 @@ impl<'a, C: PageTableConfig> PageTableNodeRef<'a, C> {
         let meta = self.meta();
 
         proof_decl!{
-            let tracked mut payload: Option<PtLockPayload> = None;
+            let tracked mut payload: Option<PtLockCell> = None;
         }
         loop
             invariant_except_break
@@ -747,7 +750,8 @@ impl<'a, C: PageTableConfig> PageTableNodeRef<'a, C> {
             let tracked payload = payload.tracked_unwrap();
         }
         proof {
-            payload.pte_auth.agree(&owner.pte_view);
+            reveal(lock_key_wf);
+            payload.tracked_borrow_value().pte_auth.agree(&owner.pte_view);
             lemma_count_where_pte_bytes::<C::E>(
                 owner.children_perm.value(),
                 owner.children_perm.value().len() as int,
@@ -1026,16 +1030,22 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
 impl<C: PageTableConfig> PageTablePageMeta<C> {
     /// Creates the metadata of a new, empty page table node.
     ///
-    /// The lock starts free, holding the permissions for `nr_children` and `stray`
-    /// and the authoritative half of the PTE model. The other half, recording that
-    /// all PTEs are absent, is returned for the node's owner.
+    /// The lock starts free, holding the node's [`PtLockCell`]: the permissions
+    /// for `nr_children` and `stray` and the authoritative half of the PTE model.
+    /// The other half, recording that all PTEs are absent, is returned for the
+    /// node's owner. The ghost `paddr`, the address of the frame the metadata
+    /// will describe, is the lock's key.
     #[verus_spec(res =>
         with
+            Ghost(paddr): Ghost<Paddr>,
             -> pte_view: Tracked<GhostVar<PteBytes>>,
+        requires
+            1 <= level <= NR_LEVELS,
         ensures
             res.lock_wf(),
             res.level == level,
-            pte_view@.id() == res.lock.constant().pte_model_id,
+            res.lock.constant().key == paddr,
+            pte_view@.id() == res.lock.constant().consts.pte_model_id,
             pte_view@@ == pte_bytes(Seq::new(NR_ENTRIES as nat, |_i: int| C::E::new_absent_spec())),
     )]
     pub fn new(level: PagingLevel) -> Self {
@@ -1043,28 +1053,31 @@ impl<C: PageTableConfig> PageTablePageMeta<C> {
         let (stray, Tracked(stray_perm)) = pcell_maybe_uninit::PCell::new(false);
         let ghost absent = Seq::new(NR_ENTRIES as nat, |_i: int| C::E::new_absent_spec());
         let tracked (pte_auth, pte_view) = GhostVarAuth::<PteBytes>::new(pte_bytes(absent));
-        let ghost k = PtLockConst {
-            nr_children_id: nr_children.id(),
-            stray_id: stray.id(),
-            pte_model_id: pte_auth.id(),
-            is_present: |b: Seq<u8>| raw_is_present::<C::E>(b),
-        };
         proof {
             C::E::lemma_page_table_entry_properties();
             lemma_count_present_upto_all_absent::<C::E>(absent, NR_ENTRIES as int);
             lemma_count_where_pte_bytes::<C::E>(absent, NR_ENTRIES as int);
         }
         let tracked payload = PtLockPayload {
+            paddr,
+            pt_level: level,
+            is_present: |b: Seq<u8>| raw_is_present::<C::E>(b),
+            child_of: raw_child_of_fn::<C::E>(),
             meta: PageMetaOwner { nr_children: nr_children_perm, stray: stray_perm },
             pte_auth,
         };
+        let tracked cell = PtLockCell::tracked_new(payload, (NR_LEVELS - level) as nat);
+        let ghost k = cell.lock_const();
         let res = Self {
-            lock: PageTableLock::new(Ghost(k), 0, Tracked(Some(payload))),
+            lock: PageTableLock::new(Ghost(k), 0, Tracked(Some(cell))),
             nr_children,
             stray,
             level,
             _phantom: PhantomData,
         };
+        proof {
+            reveal(PageTablePageMeta::lock_consts_wf);
+        }
         proof_with!{ |= Tracked(pte_view) }
         res
     }

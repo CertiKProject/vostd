@@ -15,6 +15,7 @@ use vstd_extra::{cast_ptr::Repr, drop_tracking::*};
 use crate::specs::mm::frame::meta_owners::{MetaSlotStorage, StoredPageTablePageMeta};
 
 use crate::mm::{
+    PagingLevel,
     frame::Frame,
     page_table::{PageTableConfig, PageTableGuard, PageTablePageMeta},
 };
@@ -86,9 +87,19 @@ impl<C: PageTableConfig> PageTablePageMeta<C> {
     /// The lock is well-formed and guards the permissions of this node's metadata cells.
     pub open spec fn lock_wf(self) -> bool {
         &&& self.lock.well_formed()
-        &&& self.lock.constant().nr_children_id == self.nr_children.id()
-        &&& self.lock.constant().stray_id == self.stray.id()
-        &&& self.lock.constant().is_present == (|b: Seq<u8>| raw_is_present::<C::E>(b))
+        &&& self.lock.constant().consts.nr_children_id == self.nr_children.id()
+        &&& self.lock.constant().consts.stray_id == self.stray.id()
+        &&& self.lock_consts_wf()
+        &&& self.lock.constant().consts.is_present == (|b: Seq<u8>| raw_is_present::<C::E>(b))
+    }
+
+    /// The parts of the lock constant used only by `flat_tree` reasoning: the
+    /// node's level and how its PTEs name child nodes. Opaque, as most proofs
+    /// about page table metadata do not need them.
+    #[verifier::opaque]
+    pub open spec fn lock_consts_wf(self) -> bool {
+        &&& self.lock.constant().consts.pt_level == self.level
+        &&& self.lock.constant().consts.child_of == raw_child_of_fn::<C::E>()
     }
 
     pub open spec fn into_spec(self) -> StoredPageTablePageMeta {

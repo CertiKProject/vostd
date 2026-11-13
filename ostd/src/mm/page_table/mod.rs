@@ -15,7 +15,7 @@ use crate::mm::frame::meta::{REF_COUNT_MAX, REF_COUNT_UNIQUE, REF_COUNT_UNUSED};
 use crate::mm::kspace::kvirt_area::disable_preempt;
 use crate::specs::mm::{
     frame::{
-        mapping::frame_to_index, meta_owners::PtLockPayload, meta_region_owners::MetaRegionOwners,
+        mapping::frame_to_index, meta_owners::PtLockCell, meta_region_owners::MetaRegionOwners,
     },
     page_table::{
         is_valid_range_spec, nr_pte_index_bits_spec, pte_index_bit_offset_spec,
@@ -1007,24 +1007,24 @@ impl PageTable<KernelPtConfig> {
         // It is not given back either, since the guard is not dropped (there is
         // no `Drop` for `PageTableGuard` yet).
         proof_decl! {
-            let tracked _root_lock_payload: PtLockPayload;
-            let tracked new_lock_payload: PtLockPayload;
+            let tracked _root_lock_cell: PtLockCell;
+            let tracked new_lock_cell: PtLockCell;
         }
         let mut root_node = {
             #[verus_spec(with Tracked(regions))]
             let root_ref = self.root.borrow();
-            #[verus_spec(with Tracked(root_owner), Tracked(&*regions), Tracked(guards) => Tracked(_root_lock_payload))]
+            #[verus_spec(with Tracked(root_owner), Tracked(&*regions), Tracked(guards) => Tracked(_root_lock_cell))]
             root_ref.lock(preempt_guard)
         };
         let ghost regions_after_kroot_borrow: MetaRegionOwners = *regions;
         let mut new_node: PageTableGuard<'rcu, UserPtConfig> = {
             #[verus_spec(with Tracked(regions))]
             let new_ref = new_root.borrow();
-            #[verus_spec(with Tracked(&new_node_owner), Tracked(&*regions), Tracked(guards) => Tracked(new_lock_payload))]
+            #[verus_spec(with Tracked(&new_node_owner), Tracked(&*regions), Tracked(guards) => Tracked(new_lock_cell))]
             new_ref.lock(preempt_guard)
         };
         proof {
-            new_node_owner.tracked_install_lock_payload(new_lock_payload);
+            new_node_owner.tracked_install_lock_payload(new_lock_cell.tracked_into_value());
         }
         proof {
             let kern_idx = crate::specs::mm::frame::mapping::frame_to_index(
