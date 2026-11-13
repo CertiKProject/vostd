@@ -552,7 +552,7 @@ impl<C: PageTableConfig> PageTableNode<C> {
                 #[trigger] old(regions).slot_owners[i].ref_count() != REF_COUNT_UNUSED
                 ==> i != meta_to_index(owner@.value().node().meta_vaddr()),
             owner@.value().match_pte(C::E::new_pt_spec(meta_to_frame(owner@.value().node().meta_vaddr())), level as PagingLevel),
-            final(parent_owner).meta_own == old(parent_owner).meta_own,
+            final(parent_owner).lock_cell == old(parent_owner).lock_cell,
             final(parent_owner).slot_index == old(parent_owner).slot_index,
             final(parent_owner).level == old(parent_owner).level,
             final(parent_owner).tree_level == old(parent_owner).tree_level,
@@ -662,9 +662,10 @@ impl<'a, C: PageTableConfig> PageTableNodeRef<'a, C> {
     /// - `owner` is the owner of this node and is sound with respect to `regions`.
     /// - No guard for this node exists.
     /// ## Postconditions
-    /// - Returns the lock's payload: the permissions for the node's `nr_children` and
-    ///   `stray` cells, and the authoritative half of its PTE model, which agrees with
-    ///   `owner`. Install it with [`NodeOwner::tracked_install_lock_payload`].
+    /// - Returns the lock's cell, whose payload holds the permissions for the node's
+    ///   `nr_children` and `stray` cells, and the authoritative half of its PTE model,
+    ///   which agrees with `owner`. Install it with
+    ///   [`NodeOwner::tracked_install_lock_cell`].
     /// - The returned guard is recorded in `guards`.
     /// ## Key Verification Step
     /// The payload is extracted from the lock's atomic invariant when the
@@ -960,7 +961,9 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
         ensures
             final(owner).inv(),
             final(owner).level == old(owner).level,
-            final(owner).meta_own == old(owner).meta_own,
+            final(owner).is_locked(),
+            final(owner).meta() == old(owner).meta(),
+            final(owner).cell().lock_const() == old(owner).cell().lock_const(),
             final(owner).pte_view.id() == old(owner).pte_view.id(),
             final(owner).slot_index == old(owner).slot_index,
             final(owner).children_perm.value() == old(owner).children_perm.value().update(

@@ -284,12 +284,11 @@ impl<C: PageTableConfig> OwnerOf for PageTablePageMeta<C> {
 
 /// # Verification Design
 /// The owner type for a page table node. It contains:
-/// - `meta_own`, a `PageMetaOwner`, which holds the permissions for node-specific
-///   metadata fields, `nr_children` and `stray`. It is `Some` exactly when this
-///   thread holds the node's lock; otherwise the permissions are stored in the lock
-///   (see [`PtLockPayload`]).
-/// - `pte_auth`, the authoritative half of the PTE model. Like `meta_own`, it
-///   travels between the lock and the owner.
+/// - `lock_cell`, the node's [`PtLockCell`]. It is `Some` exactly when this
+///   thread holds the node's lock; otherwise the cell is stored in the lock. Its
+///   [`PtLockPayload`] holds the permissions for the node-specific metadata
+///   fields `nr_children` and `stray` (see [`Self::meta`]) and the
+///   authoritative half of the PTE model (see [`Self::pte_auth`]).
 /// - `pte_view`, the other half of the PTE model, which always stays with the
 ///   owner. It records the bytes of the PTEs in `children_perm`; agreement with
 ///   `pte_auth` is what lets the lock state that `nr_children` counts the
@@ -302,8 +301,7 @@ impl<C: PageTableConfig> OwnerOf for PageTablePageMeta<C> {
 /// - `tree_level` is the level field of the `ghost_tree::TreeNode` that carries this object.
 ///   Carried here for convenience, though it can be computed from `level`.
 pub tracked struct NodeOwner<C: PageTableConfig> {
-    pub meta_own: Option<PageMetaOwner>,
-    pub pte_auth: Option<GhostVarAuth<PteBytes>>,
+    pub lock_cell: Option<PtLockCell>,
     pub pte_view: GhostVar<PteBytes>,
     pub children_perm: array_ptr::PointsTo<C::E, NR_ENTRIES>,
     pub ghost level: PagingLevel,
@@ -313,11 +311,10 @@ pub tracked struct NodeOwner<C: PageTableConfig> {
 
 impl<C: PageTableConfig> Inv for NodeOwner<C> {
     open spec fn inv(self) -> bool {
-        &&& (self.meta_own is Some <==> self.pte_auth is Some)
         &&& self.is_locked() ==> {
             &&& self.meta().inv()
-            &&& self.pte_auth->Some_0.id() == self.pte_view.id()
-            &&& self.pte_auth->Some_0@ == self.pte_view@
+            &&& self.pte_auth().id() == self.pte_view.id()
+            &&& self.pte_auth()@ == self.pte_view@
         }
         &&& self.pte_view@ == pte_bytes(self.children_perm.value())
         &&& 1 <= self.level <= NR_LEVELS
@@ -340,14 +337,25 @@ impl<C: PageTableConfig> Inv for NodeOwner<C> {
 
 impl<C: PageTableConfig> NodeOwner<C> {
     /// Whether this thread holds the node's lock, i.e., whether the lock's
-    /// payload has been moved into this owner.
+    /// cell has been moved into this owner.
     pub open spec fn is_locked(self) -> bool {
-        self.meta_own is Some
+        self.lock_cell is Some
+    }
+
+    /// The lock cell. Only meaningful if [`Self::is_locked`].
+    pub open spec fn cell(self) -> PtLockCell {
+        self.lock_cell->Some_0
     }
 
     /// The metadata permissions. Only meaningful if [`Self::is_locked`].
     pub open spec fn meta(self) -> PageMetaOwner {
-        self.meta_own->Some_0
+        self.cell().value().meta
+    }
+
+    /// The authoritative half of the PTE model. Only meaningful if
+    /// [`Self::is_locked`].
+    pub open spec fn pte_auth(self) -> GhostVarAuth<PteBytes> {
+        self.cell().value().pte_auth
     }
 
     /// Borrows the metadata permissions of a locked node.
@@ -357,30 +365,55 @@ impl<C: PageTableConfig> NodeOwner<C> {
         ensures
             *res == self.meta(),
     {
-        self.meta_own.tracked_borrow()
+        &self.lock_cell.tracked_borrow().tracked_borrow_value().meta
     }
 
-    /// Moves the payload obtained by acquiring the node's lock into this owner.
-    pub proof fn tracked_install_lock_payload(tracked &mut self, tracked payload: PtLockPayload)
+    /// Mutably borrows the metadata permissions of a locked node. Everything
+    /// else in the owner, including the rest of the cell, is unchanged.
+    pub proof fn tracked_borrow_mut_meta(tracked &mut self) -> (tracked res: &mut PageMetaOwner)
         requires
-            old(self).inv(),
-            !old(self).is_locked(),
-            payload.meta.inv(),
-            payload.pte_auth.id() == old(self).pte_view.id(),
-            payload.pte_auth@ == old(self).pte_view@,
+            old(self).is_locked(),
         ensures
-            final(self).inv(),
+            *res == old(self).meta(),
             final(self).is_locked(),
-            final(self).meta() == payload.meta,
+            final(self).meta() == *final(res),
+            final(self).cell().loc() == old(self).cell().loc(),
+            final(self).cell().level() == old(self).cell().level(),
+            final(self).cell().value() == (PtLockPayload {
+                meta: *final(res),
+                ..old(self).cell().value()
+            }),
             final(self).pte_view == old(self).pte_view,
             final(self).children_perm == old(self).children_perm,
             final(self).level == old(self).level,
             final(self).tree_level == old(self).tree_level,
             final(self).slot_index == old(self).slot_index,
     {
-        let tracked PtLockPayload { meta, pte_auth, .. } = payload;
-        self.meta_own = Some(meta);
-        self.pte_auth = Some(pte_auth);
+        match self.lock_cell {
+            Some(ref mut cell) => &mut cell.tracked_borrow_mut_value().meta,
+            None => proof_from_false(),
+        }
+    }
+
+    /// Moves the cell obtained by acquiring the node's lock into this owner.
+    pub proof fn tracked_install_lock_cell(tracked &mut self, tracked cell: PtLockCell)
+        requires
+            old(self).inv(),
+            !old(self).is_locked(),
+            cell.value().meta.inv(),
+            cell.value().pte_auth.id() == old(self).pte_view.id(),
+            cell.value().pte_auth@ == old(self).pte_view@,
+        ensures
+            final(self).inv(),
+            final(self).is_locked(),
+            final(self).cell() == cell,
+            final(self).pte_view == old(self).pte_view,
+            final(self).children_perm == old(self).children_perm,
+            final(self).level == old(self).level,
+            final(self).tree_level == old(self).tree_level,
+            final(self).slot_index == old(self).slot_index,
+    {
+        self.lock_cell = Some(cell);
     }
 
     /// Updates the PTE model of a locked node to match its `children_perm`, after
@@ -388,23 +421,30 @@ impl<C: PageTableConfig> NodeOwner<C> {
     pub proof fn tracked_sync_pte_model(tracked &mut self)
         requires
             old(self).is_locked(),
-            old(self).pte_auth is Some,
-            old(self).pte_auth->Some_0.id() == old(self).pte_view.id(),
+            old(self).pte_auth().id() == old(self).pte_view.id(),
         ensures
             final(self).pte_view@ == pte_bytes(old(self).children_perm.value()),
-            final(self).pte_auth->Some_0@ == final(self).pte_view@,
-            final(self).pte_auth->Some_0.id() == final(self).pte_view.id(),
+            final(self).pte_auth()@ == final(self).pte_view@,
+            final(self).pte_auth().id() == final(self).pte_view.id(),
             final(self).pte_view.id() == old(self).pte_view.id(),
-            final(self).meta_own == old(self).meta_own,
-            final(self).pte_auth is Some,
+            final(self).is_locked(),
+            final(self).meta() == old(self).meta(),
+            final(self).cell().lock_const() == old(self).cell().lock_const(),
+            final(self).cell().loc() == old(self).cell().loc(),
+            final(self).cell().level() == old(self).cell().level(),
+            final(self).cell().value() == (PtLockPayload {
+                pte_auth: final(self).pte_auth(),
+                ..old(self).cell().value()
+            }),
             final(self).children_perm == old(self).children_perm,
             final(self).level == old(self).level,
             final(self).tree_level == old(self).tree_level,
             final(self).slot_index == old(self).slot_index,
     {
-        let tracked mut auth = self.pte_auth.tracked_take();
-        auth.update(&mut self.pte_view, pte_bytes(self.children_perm.value()));
-        self.pte_auth = Some(auth);
+        let tracked mut cell = self.lock_cell.tracked_take();
+        let tracked payload = cell.tracked_borrow_mut_value();
+        payload.pte_auth.update(&mut self.pte_view, pte_bytes(self.children_perm.value()));
+        self.lock_cell = Some(cell);
     }
 
     /// The meta address of this node's slot, computed from `slot_index`.
@@ -438,6 +478,7 @@ impl<C: PageTableConfig> NodeOwner<C> {
         &&& self.pte_view.id() == self.meta_value(regions).lock.constant().consts.pte_model_id
         &&& lock_key_wf(self.meta_value(regions), self.slot_index)
         &&& self.is_locked() ==> self.meta_value(regions).wf(self.meta())
+        &&& self.is_locked() ==> self.cell().lock_const() == self.meta_value(regions).lock.constant()
         &&& self.level == self.meta_value(regions).level
         // A page-table node's slot is tracked with `PageTable` usage (set at
         // allocation via `get_node_from_unused_spec`). This discriminates node

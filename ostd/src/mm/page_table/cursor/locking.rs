@@ -927,8 +927,8 @@ fn dfs_acquire_lock<'rcu, C: PageTableConfig, A: InAtomicMode>(
                 proof {
                     let ghost meta_value = child0.value().node().meta_value(*regions);
                     let tracked c = subtree.tracked_borrow_mut_child(i as int);
-                    c.tracked_borrow_mut_value().tracked_install_fresh_node_lock_payload(
-                        lock_cell.tracked_into_value(),
+                    c.tracked_borrow_mut_value().tracked_install_fresh_node_lock_cell(
+                        lock_cell,
                         meta_value,
                     );
                     PageTableOwner::<C>::lemma_replace_root_value(child0, *c, *regions);

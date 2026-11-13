@@ -1024,7 +1024,7 @@ impl PageTable<KernelPtConfig> {
             new_ref.lock(preempt_guard)
         };
         proof {
-            new_node_owner.tracked_install_lock_payload(new_lock_cell.tracked_into_value());
+            new_node_owner.tracked_install_lock_cell(new_lock_cell);
         }
         proof {
             let kern_idx = crate::specs::mm::frame::mapping::frame_to_index(

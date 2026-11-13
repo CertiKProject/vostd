@@ -413,11 +413,8 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
             proof {
                 parent_owner.nr_children_absent_slot_bound(self.idx);
             }
-            let tracked mut parent_owner_meta = parent_owner.meta_own.tracked_take();
+            let tracked parent_owner_meta = parent_owner.tracked_borrow_mut_meta();
             nr_children.write(Tracked(&mut parent_owner_meta.nr_children), _tmp + 1);
-            proof {
-                parent_owner.meta_own = Some(parent_owner_meta);
-            }
         } else if !old_child.is_none() && new_child.is_none() {
             let tracked meta_points_to = regions.slots.tracked_borrow(parent_owner.slot_index);
             let tracked meta_slot_owner = regions.slot_owners.tracked_borrow(
@@ -433,11 +430,8 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
             proof {
                 parent_owner.nr_children_present_slot_bound(self.idx);
             }
-            let tracked mut parent_owner_meta = parent_owner.meta_own.tracked_take();
+            let tracked parent_owner_meta = parent_owner.tracked_borrow_mut_meta();
             nr_children.write(Tracked(&mut parent_owner_meta.nr_children), _tmp - 1);
-            proof {
-                parent_owner.meta_own = Some(parent_owner_meta);
-            }
         }
         #[verus_spec(with Tracked(new_owner), Tracked(regions))]
         let new_pte = new_child.into_pte();
@@ -675,7 +669,7 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
                 };
                 proof {
                     let tracked new_node_value = new_node_owner.tracked_borrow_mut_value();
-                    new_node_value.tracked_install_node_lock_payload(lock_cell.tracked_into_value());
+                    new_node_value.tracked_install_node_lock_cell(lock_cell);
                 }
                 pt_lock_guard
             };
@@ -700,11 +694,8 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
             )]
             let nr_children = self.node.nr_children_mut();
             let _tmp = nr_children.read(Tracked(&parent_owner.tracked_borrow_meta().nr_children));
-            let tracked mut parent_owner_meta = parent_owner.meta_own.tracked_take();
+            let tracked parent_owner_meta = parent_owner.tracked_borrow_mut_meta();
             nr_children.write(Tracked(&mut parent_owner_meta.nr_children), _tmp + 1);
-            proof {
-                parent_owner.meta_own = Some(parent_owner_meta);
-            }
 
             proof {
                 // For `final(owner).inv()`'s `child.level == self.level + 1`:
@@ -959,7 +950,7 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
             };
             proof {
                 let tracked new_owner_value = new_owner.tracked_borrow_mut_value();
-                new_owner_value.tracked_install_node_lock_payload(lock_cell.tracked_into_value());
+                new_owner_value.tracked_install_node_lock_cell(lock_cell);
             }
             pt_lock_guard
         };
@@ -1690,11 +1681,8 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
             proof {
                 parent_owner.nr_children_absent_slot_bound(idx);
             }
-            let tracked mut parent_owner_meta = parent_owner.meta_own.tracked_take();
+            let tracked parent_owner_meta = parent_owner.tracked_borrow_mut_meta();
             nr_children.write(Tracked(&mut parent_owner_meta.nr_children), _tmp + 1);
-            proof {
-                parent_owner.meta_own = Some(parent_owner_meta);
-            }
         } else if !old_child.is_none() && new_child.is_none() {
             let tracked meta_points_to = regions.slots.tracked_borrow(parent_owner.slot_index);
             let tracked meta_slot_owner = regions.slot_owners.tracked_borrow(
@@ -1710,11 +1698,8 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
             proof {
                 parent_owner.nr_children_present_slot_bound(idx);
             }
-            let tracked mut parent_owner_meta = parent_owner.meta_own.tracked_take();
+            let tracked parent_owner_meta = parent_owner.tracked_borrow_mut_meta();
             nr_children.write(Tracked(&mut parent_owner_meta.nr_children), _tmp - 1);
-            proof {
-                parent_owner.meta_own = Some(parent_owner_meta);
-            }
         }
         #[verus_spec(with Tracked(new_owner), Tracked(regions))]
         let new_pte = new_child.into_pte();
@@ -1931,7 +1916,7 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
             };
             proof {
                 let tracked new_node_value = new_node_owner.tracked_borrow_mut_value();
-                new_node_value.tracked_install_node_lock_payload(lock_cell.tracked_into_value());
+                new_node_value.tracked_install_node_lock_cell(lock_cell);
             }
             pt_lock_guard
         };
@@ -1943,7 +1928,7 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
 
         // `count_consistent` is momentarily broken between `alloc` and the
         // `+ 1` below, but the `nr_children` id-clause that `read`/`write` need
-        // is framed from the pre-`alloc` snapshot: `meta_own` is preserved by
+        // is framed from the pre-`alloc` snapshot: `lock_cell` is preserved by
         // `set_children_perm`/`write_pte`, and the parent slot perm is untouched
         // (`alloc` allocates a different slot, `write_pte` leaves regions
         // immutable).
@@ -1957,11 +1942,8 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
         )]
         let nr_children = self.nr_children_mut();
         let old_nr_children = nr_children.read(Tracked(&parent_owner.tracked_borrow_meta().nr_children));
-        let tracked mut parent_owner_meta = parent_owner.meta_own.tracked_take();
+        let tracked parent_owner_meta = parent_owner.tracked_borrow_mut_meta();
         nr_children.write(Tracked(&mut parent_owner_meta.nr_children), old_nr_children + 1);
-        proof {
-            parent_owner.meta_own = Some(parent_owner_meta);
-        }
 
         proof {
             // Restore the parent's `count_consistent`: slot `idx` went
@@ -2098,11 +2080,8 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
         proof {
             parent_owner.nr_children_absent_slot_bound(idx);
         }
-        let tracked mut parent_owner_meta = parent_owner.meta_own.tracked_take();
+        let tracked parent_owner_meta = parent_owner.tracked_borrow_mut_meta();
         nr_children.write(Tracked(&mut parent_owner_meta.nr_children), old_nr_children + 1);
-        proof {
-            parent_owner.meta_own = Some(parent_owner_meta);
-        }
 
         #[verus_spec(with Tracked(new_owner), Tracked(regions))]
         let new_pte = Child::<C>::Frame(paddr, level, prop).into_pte();

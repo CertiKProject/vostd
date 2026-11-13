@@ -10,7 +10,7 @@ use crate::specs::{
     mm::{
         frame::{
             mapping::{frame_to_index, index_to_meta, meta_to_index},
-            meta_owners::{PageUsage, PtLockPayload},
+            meta_owners::{PageUsage, PtLockCell},
             meta_region_owners::MetaRegionOwners,
         },
         page_table::{node::entry_view::*, *},
@@ -181,21 +181,21 @@ impl<C: PageTableConfig> EntryOwner<C> {
         self.kind = EntryOwnerKind::Node(node);
     }
 
-    /// Moves the payload obtained by locking this entry's node into the node's owner.
-    /// See [`NodeOwner::tracked_install_lock_payload`].
-    pub proof fn tracked_install_node_lock_payload(tracked &mut self, tracked payload: PtLockPayload)
+    /// Moves the cell obtained by locking this entry's node into the node's owner.
+    /// See [`NodeOwner::tracked_install_lock_cell`].
+    pub proof fn tracked_install_node_lock_cell(tracked &mut self, tracked cell: PtLockCell)
         requires
             old(self).kind is Node,
             old(self).node().inv(),
             !old(self).node().is_locked(),
-            payload.meta.inv(),
-            payload.pte_auth.id() == old(self).node().pte_view.id(),
-            payload.pte_auth@ == old(self).node().pte_view@,
+            cell.value().meta.inv(),
+            cell.value().pte_auth.id() == old(self).node().pte_view.id(),
+            cell.value().pte_auth@ == old(self).node().pte_view@,
         ensures
             final(self).kind is Node,
             final(self).node().inv(),
             final(self).node().is_locked(),
-            final(self).node().meta() == payload.meta,
+            final(self).node().cell() == cell,
             final(self).node().pte_view == old(self).node().pte_view,
             final(self).node().children_perm == old(self).node().children_perm,
             final(self).node().level == old(self).node().level,
@@ -205,32 +205,33 @@ impl<C: PageTableConfig> EntryOwner<C> {
             final(self).parent_level == old(self).parent_level,
     {
         let tracked mut node = self.tracked_take_node();
-        node.tracked_install_lock_payload(payload);
+        node.tracked_install_lock_cell(cell);
         self.tracked_put_node(node);
     }
 
-    /// Like [`Self::tracked_install_node_lock_payload`], for a payload just
-    /// taken from the node's lock, without knowing that the owner is unlocked:
-    /// if the owner already held the payload, the two payloads' `nr_children`
-    /// permissions would share a cell, which is impossible.
-    pub proof fn tracked_install_fresh_node_lock_payload(
+    /// Like [`Self::tracked_install_node_lock_cell`], for a cell just taken
+    /// from the node's lock, without knowing that the owner is unlocked: if the
+    /// owner already held a cell, the two cells would share a lock identity,
+    /// which is impossible.
+    pub proof fn tracked_install_fresh_node_lock_cell(
         tracked &mut self,
-        tracked payload: PtLockPayload,
+        tracked cell: PtLockCell,
         meta_value: PageTablePageMeta<C>,
     )
         requires
             old(self).kind is Node,
             old(self).node().inv(),
-            payload.meta.inv(),
-            payload.pte_auth.id() == old(self).node().pte_view.id(),
-            payload.pte_auth@ == old(self).node().pte_view@,
-            meta_value.wf(payload.meta),
-            old(self).node().is_locked() ==> meta_value.wf(old(self).node().meta()),
+            cell.value().meta.inv(),
+            cell.value().pte_auth.id() == old(self).node().pte_view.id(),
+            cell.value().pte_auth@ == old(self).node().pte_view@,
+            cell.lock_const() == meta_value.lock.constant(),
+            old(self).node().is_locked() ==> old(self).node().cell().lock_const()
+                == meta_value.lock.constant(),
         ensures
             final(self).kind is Node,
             final(self).node().inv(),
             final(self).node().is_locked(),
-            final(self).node().meta() == payload.meta,
+            final(self).node().cell() == cell,
             final(self).node().pte_view == old(self).node().pte_view,
             final(self).node().children_perm == old(self).node().children_perm,
             final(self).node().level == old(self).node().level,
@@ -239,12 +240,12 @@ impl<C: PageTableConfig> EntryOwner<C> {
             final(self).path == old(self).path,
             final(self).parent_level == old(self).parent_level,
     {
-        let tracked mut payload = payload;
+        let tracked mut cell = cell;
         if self.node().is_locked() {
-            let tracked held = self.tracked_borrow_node().tracked_borrow_meta();
-            payload.meta.nr_children.is_exclusive(&held.nr_children);
+            let tracked held = self.tracked_borrow_node().lock_cell.tracked_borrow();
+            cell.lemma_distinct(held);
         }
-        self.tracked_install_node_lock_payload(payload);
+        self.tracked_install_node_lock_cell(cell);
     }
 
     pub proof fn tracked_borrow_node(tracked &self) -> (tracked res: &NodeOwner<C>)

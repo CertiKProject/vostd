@@ -178,6 +178,7 @@ pub proof fn lemma_vaddr_strict_bound(path: TreePath<NR_ENTRIES>)
 /// The VA of any path is within the `2^39`-sized cell of its top-level index:
 /// `path[0] * 2^39 <= vaddr(path)` and `vaddr(path) + page_size <= (path[0]+1) * 2^39`.
 /// Pure VA arithmetic (x86 4-level paging). Used by `view_rec_top_index_va_bound`.
+#[verifier::spinoff_prover]
 pub proof fn lemma_vaddr_top_index_cell(path: TreePath<NR_ENTRIES>)
     requires
         path.inv(),
