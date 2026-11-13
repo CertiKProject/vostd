@@ -21,11 +21,13 @@ use crate::mm::{
 use vstd_extra::array_ptr::*;
 
 use crate::mm::page_table::*;
-use crate::specs::mm::frame::meta_owners::PtLockCell;
+use crate::specs::mm::frame::meta_owners::{PtLockCell, PtLockPayload};
+use vstd_extra::resource::flat_tree::{LockedTree, LockedValue, tree_wf, tree_wf_at};
 use crate::specs::mm::frame::meta_region_owners::MetaRegionOwners;
 use crate::specs::mm::page_table::node::Guards;
 use crate::specs::mm::page_table::node::entry_owners::{EntryOwner, EntryOwnerKind};
-use crate::specs::mm::page_table::node::owners::NodeOwner;
+use crate::specs::mm::page_table::node::owners::{NodeOwner, lemma_count_where_pte_bytes, lock_key_wf};
+use crate::mm::frame::meta::mapping::meta_to_frame;
 use crate::specs::task::InAtomicMode;
 
 use align_ext::AlignExt;
@@ -780,6 +782,7 @@ proof fn lemma_dfs_child_range(level: PagingLevel, node_va: Vaddr, va_range: Ran
             va_range.end as int,
             (INC_LEVELS - final(subtree).level()) as nat,
         ),
+        dfs_locked_flat(*final(subtree), cur_node_va, va_range),
         *final(guards) == *old(guards),
         *final(cur_node) == *old(cur_node),
         final(regions).inv(),
@@ -805,6 +808,9 @@ fn dfs_acquire_lock<'rcu, C: PageTableConfig, A: InAtomicMode>(
         cur_node.level()
     };
     if cur_level == 1 {
+        proof {
+            lemma_dfs_locked_flat(*subtree, *regions, cur_node_va, va_range);
+        }
         return;
     }
     let idx_range = dfs_get_idx_range::<C>(cur_level, cur_node_va, &va_range);
@@ -839,6 +845,7 @@ fn dfs_acquire_lock<'rcu, C: PageTableConfig, A: InAtomicMode>(
             forall|k: int| regions0.slots.contains_key(k) ==> #[trigger] regions.slots.contains_key(k),
             forall|k: int| regions0.slots.contains_key(k) ==> regions0.slots[k] == #[trigger] regions.slots[k],
             forall|j: int| i <= j < NR_ENTRIES ==> #[trigger] subtree.children()[j] == old_children[j],
+            forall|j: int| 0 <= j < NR_ENTRIES ==> #[trigger] subtree.child(j).value().is_borrowed() == old(subtree).child(j).value().is_borrowed(),
             forall|j: int|
                 #![trigger subtree.child(j)]
                 s0 <= j < i && subtree.child(j).value().is_node() ==> {
@@ -992,6 +999,11 @@ fn dfs_acquire_lock<'rcu, C: PageTableConfig, A: InAtomicMode>(
                     assert(*subtree == t0.insert(i as int, c2));
                     assert(subtree.child(i as int) == c2);
                     assert(c2.value() == c_inst.value());
+                    assert forall|j: int| 0 <= j < NR_ENTRIES implies #[trigger] subtree.child(j).value().is_borrowed() == old(subtree).child(j).value().is_borrowed() by {
+                        if j != i {
+                            assert(subtree.child(j) == t0.child(j));
+                        }
+                    }
                     assert(c2.level() == subtree.level() + 1);
                     assert forall|j: int|
                         #![trigger subtree.child(j)]
@@ -1026,6 +1038,9 @@ fn dfs_acquire_lock<'rcu, C: PageTableConfig, A: InAtomicMode>(
                 }
             },
         }
+    }
+    proof {
+        lemma_dfs_locked_flat(*subtree, *regions, cur_node_va, va_range);
     }
 }
 
@@ -1065,6 +1080,346 @@ pub open spec fn dfs_unlocked_below<C: PageTableConfig>(
                     (depth - 1) as nat,
                 )
             }
+    }
+}
+
+/// A subtree of held page table lock cells, as a [`flat_tree`] tree.
+///
+/// [`flat_tree`]: vstd_extra::resource::flat_tree
+pub type PtLockedTree = LockedTree<PtLockPayload, NR_ENTRIES, NR_LEVELS>;
+
+/// The lock cells held in `t`: the root node's cell and, below it, the cells of
+/// the locked page-table nodes reachable from the root through locked nodes.
+/// A node at paging level `level` is at flat-tree level `NR_LEVELS - level`;
+/// `depth` is the root's paging level.
+pub open spec fn locked_cells_at<C: PageTableConfig>(t: OwnerSubtree<C>, depth: nat) -> PtLockedTree
+    decreases depth,
+{
+    PtLockedTree::new(
+        t.value().node().cell(),
+        (NR_LEVELS - t.value().node().level) as nat,
+        Seq::new(
+            NR_ENTRIES as nat,
+            |i: int|
+                if depth > 0 && t.has_child(i) && t.child(i).value().is_node() && t.child(
+                    i,
+                ).value().node().is_locked() {
+                    Some(locked_cells_at(t.child(i), (depth - 1) as nat))
+                } else {
+                    None
+                },
+        ),
+    )
+}
+
+/// [`locked_cells_at`] for a node subtree.
+pub open spec fn locked_cells<C: PageTableConfig>(t: OwnerSubtree<C>) -> PtLockedTree {
+    locked_cells_at(t, t.value().node().level as nat)
+}
+
+/// In `t`, every child slot whose range overlaps `[va_start, va_end)` has been
+/// grafted exactly when the PTE model points to a child node: the holder has
+/// all of the range below the root. The flat-tree counterpart of
+/// [`dfs_locked_below`], with the same clipped ranges.
+pub open spec fn locked_complete_in_range(
+    t: PtLockedTree,
+    node_va: int,
+    va_start: int,
+    va_end: int,
+    depth: nat,
+) -> bool
+    decreases depth,
+{
+    depth > 0 && t.value().value().pt_level > 1 ==> {
+        let ps = page_size(t.value().value().pt_level) as int;
+        forall|i: int|
+            #![trigger t.children()[i]]
+            0 <= i < NR_ENTRIES && (va_start - node_va) / ps <= i < ceil_div(va_end - node_va, ps)
+                ==> {
+                let cva = node_va + i * ps;
+                &&& (t.value().value().child_key(i) is Some <==> t.has_child(i))
+                &&& t.has_child(i) ==> locked_complete_in_range(
+                    t.child(i),
+                    cva,
+                    if va_start < cva {
+                        cva
+                    } else {
+                        va_start
+                    },
+                    if va_end < cva + ps {
+                        va_end
+                    } else {
+                        cva + ps
+                    },
+                    (depth - 1) as nat,
+                )
+            }
+    }
+}
+
+/// The key of a held node's lock cell is the node's physical address.
+proof fn lemma_cell_key<C: PageTableConfig>(e: EntryOwner<C>, regions: MetaRegionOwners)
+    requires
+        e.metaregion_sound(regions),
+        e.is_node(),
+        e.node().is_locked(),
+    ensures
+        e.node().cell().key() == meta_to_frame(e.node().meta_vaddr()),
+{
+    reveal(lock_key_wf);
+}
+
+/// What a held node's lock cell says about child slot `i`: its PTE model
+/// points to a child node exactly when the child entry is a node, and then to
+/// the child's physical address.
+proof fn lemma_cell_child_key<C: PageTableConfig>(
+    t: OwnerSubtree<C>,
+    regions: MetaRegionOwners,
+    i: int,
+)
+    requires
+        PageTableOwner(t).pt_inv(),
+        t.value().metaregion_sound(regions),
+        t.value().is_node(),
+        t.value().node().is_locked(),
+        0 <= i < NR_ENTRIES,
+        !t.child(i).value().is_borrowed(),
+    ensures
+        t.value().node().cell().value().pt_level == t.value().node().level,
+        t.value().node().cell().value().child_key(i) == if t.child(i).value().is_node() {
+            Some(meta_to_frame(t.child(i).value().node().meta_vaddr()))
+        } else {
+            None::<Paddr>
+        },
+{
+    PageTableOwner(t).pt_inv_unroll(i);
+    let node = t.value().node();
+    let pte = node.children_perm.value()[i];
+    reveal(PageTablePageMeta::lock_consts_wf);
+    ostd_pod::lemma_decode_pod_inverse::<C::E>(pte);
+    assert(node.pte_auth()@[i] == ostd_pod::pod_bytes(pte));
+    if t.child(i).value().is_node() {
+        assert(t.child(i).value().node().inv());
+    }
+}
+
+/// The lock cells held in a node subtree form a well-formed flat tree.
+proof fn lemma_locked_cells_wf<C: PageTableConfig>(
+    t: OwnerSubtree<C>,
+    regions: MetaRegionOwners,
+    depth: nat,
+)
+    requires
+        PageTableOwner(t).pt_inv(),
+        PageTableOwner(t).metaregion_sound(regions),
+        t.value().is_node(),
+        t.value().node().is_locked(),
+        depth == t.value().node().level,
+    ensures
+        locked_cells_at(t, depth).inv(),
+        tree_wf_at(locked_cells_at(t, depth), depth),
+    decreases depth,
+{
+    let lt = locked_cells_at(t, depth);
+    let node = t.value().node();
+    let lvl = (NR_LEVELS - node.level) as nat;
+    assert(<EntryOwner<C> as TreeNodeValue<INC_LEVELS>>::la_inv(t.value(), t.level()));
+    assert(t.value().metaregion_sound(regions));
+    reveal(PageTablePageMeta::lock_consts_wf);
+    lemma_count_where_pte_bytes::<C::E>(
+        node.children_perm.value(),
+        node.children_perm.value().len() as int,
+    );
+    assert(lt.value() == node.cell());
+    assert(lt.level() == lvl);
+    assert(lt.value().inv_cell());
+    assert forall|i: int|
+        #![trigger lt.children()[i]]
+        0 <= i < NR_ENTRIES && lt.has_child(i) implies {
+            &&& t.has_child(i)
+            &&& lt.child(i) == locked_cells_at(t.child(i), (depth - 1) as nat)
+            &&& lt.child(i).level() == lvl + 1
+            &&& lt.child(i).inv()
+            &&& tree_wf_at(lt.child(i), (depth - 1) as nat)
+            &&& lt.value().value().child_key(i) == Some(lt.child(i).value().key())
+        } by {
+        PageTableOwner(t).pt_inv_unroll(i);
+        t.lemma_subtree_satisfies_unroll_once(
+            t.value().path,
+            PageTableOwner::<C>::metaregion_sound_pred(regions),
+            i,
+        );
+        let c = t.child(i);
+        assert(c.value().node().inv());
+        lemma_cell_child_key(t, regions, i);
+        lemma_cell_key(c.value(), regions);
+        lemma_locked_cells_wf(c, regions, (depth - 1) as nat);
+    }
+    if node.level == 1 {
+        assert forall|i: int| 0 <= i < NR_ENTRIES implies !(#[trigger] lt.children()[i] is Some) by {
+            if lt.has_child(i) {
+                PageTableOwner(t).pt_inv_unroll(i);
+                assert(t.child(i).value().node().inv());
+            }
+        }
+    }
+    assert(lt.inv_children());
+    assert(lt.inv());
+}
+
+/// The lock cells held in a node subtree in which [`dfs_acquire_lock`] has
+/// locked a range form a flat tree that is complete over the range.
+proof fn lemma_locked_cells_complete<C: PageTableConfig>(
+    t: OwnerSubtree<C>,
+    regions: MetaRegionOwners,
+    depth: nat,
+    node_va: int,
+    va_start: int,
+    va_end: int,
+)
+    requires
+        PageTableOwner(t).pt_inv(),
+        PageTableOwner(t).metaregion_sound(regions),
+        t.value().is_node(),
+        t.value().node().is_locked(),
+        depth == t.value().node().level,
+        dfs_locked_below(t, node_va, va_start, va_end, (INC_LEVELS - t.level()) as nat),
+        forall|i: int|
+            0 <= i < NR_ENTRIES ==> !(#[trigger] t.child(i)).value().is_borrowed() || !((va_start
+                - node_va) / (page_size(t.value().node().level) as int) <= i < ceil_div(
+                va_end - node_va,
+                page_size(t.value().node().level) as int,
+            )),
+    ensures
+        locked_complete_in_range(locked_cells_at(t, depth), node_va, va_start, va_end, depth),
+    decreases depth,
+{
+    let lt = locked_cells_at(t, depth);
+    let node = t.value().node();
+    assert(<EntryOwner<C> as TreeNodeValue<INC_LEVELS>>::la_inv(t.value(), t.level()));
+    assert(t.value().metaregion_sound(regions));
+    reveal(PageTablePageMeta::lock_consts_wf);
+    assert(lt.value() == node.cell());
+    if node.level > 1 {
+        let ps = page_size(node.level) as int;
+        assert(lt.value().value().pt_level == node.level);
+        assert forall|i: int|
+            #![trigger lt.children()[i]]
+            0 <= i < NR_ENTRIES && (va_start - node_va) / ps <= i < ceil_div(va_end - node_va, ps)
+                implies {
+                let cva = node_va + i * ps;
+                &&& (lt.value().value().child_key(i) is Some <==> lt.has_child(i))
+                &&& lt.has_child(i) ==> locked_complete_in_range(
+                    lt.child(i),
+                    cva,
+                    if va_start < cva {
+                        cva
+                    } else {
+                        va_start
+                    },
+                    if va_end < cva + ps {
+                        va_end
+                    } else {
+                        cva + ps
+                    },
+                    (depth - 1) as nat,
+                )
+            } by {
+            PageTableOwner(t).pt_inv_unroll(i);
+            t.lemma_subtree_satisfies_unroll_once(
+                t.value().path,
+                PageTableOwner::<C>::metaregion_sound_pred(regions),
+                i,
+            );
+            let c = t.child(i);
+            lemma_cell_child_key(t, regions, i);
+            if c.value().is_node() {
+                let cva = node_va + i * ps;
+                assert(c.value().node().inv());
+                assert(c.value().node().is_locked());
+                assert forall|j: int| 0 <= j < NR_ENTRIES implies !(#[trigger] c.child(j)).value().is_borrowed() by {
+                    PageTableOwner(c).pt_inv_unroll(j);
+                }
+                lemma_locked_cells_complete(
+                    c,
+                    regions,
+                    (depth - 1) as nat,
+                    cva,
+                    if va_start < cva {
+                        cva
+                    } else {
+                        va_start
+                    },
+                    if va_end < cva + ps {
+                        va_end
+                    } else {
+                        cva + ps
+                    },
+                );
+            }
+        }
+    }
+}
+
+/// [`dfs_acquire_lock`]'s postcondition, restated as a [`flat_tree`] tree:
+/// if the root is locked, the held cells form a well-formed tree that is
+/// complete over the range.
+///
+/// [`flat_tree`]: vstd_extra::resource::flat_tree
+pub open spec fn dfs_locked_flat<C: PageTableConfig>(
+    t: OwnerSubtree<C>,
+    node_va: Vaddr,
+    va_range: Range<Vaddr>,
+) -> bool {
+    t.value().node().is_locked() ==> {
+        &&& tree_wf(locked_cells(t))
+        &&& locked_complete_in_range(
+            locked_cells(t),
+            node_va as int,
+            va_range.start as int,
+            va_range.end as int,
+            t.value().node().level as nat,
+        )
+    }
+}
+
+proof fn lemma_dfs_locked_flat<C: PageTableConfig>(
+    t: OwnerSubtree<C>,
+    regions: MetaRegionOwners,
+    node_va: Vaddr,
+    va_range: Range<Vaddr>,
+)
+    requires
+        PageTableOwner(t).pt_inv(),
+        PageTableOwner(t).metaregion_sound(regions),
+        t.value().is_node(),
+        dfs_range_ok(t.value().node().level, node_va, va_range),
+        dfs_locked_below(
+            t,
+            node_va as int,
+            va_range.start as int,
+            va_range.end as int,
+            (INC_LEVELS - t.level()) as nat,
+        ),
+        forall|i: int| 0 <= i < NR_ENTRIES ==> !(#[trigger] t.child(i)).value().is_borrowed()
+            || !(idx_range_spec(t.value().node().level, node_va, va_range.start, va_range.end).0 <= i
+                < idx_range_spec(t.value().node().level, node_va, va_range.start, va_range.end).1),
+    ensures
+        dfs_locked_flat(t, node_va, va_range),
+{
+    if t.value().node().is_locked() {
+        let depth = t.value().node().level as nat;
+        lemma_idx_range_spec_exact(t.value().node().level, node_va, va_range);
+        lemma_locked_cells_wf(t, regions, depth);
+        lemma_locked_cells_complete(
+            t,
+            regions,
+            depth,
+            node_va as int,
+            va_range.start as int,
+            va_range.end as int,
+        );
+        assert(locked_cells(t).level() == NR_LEVELS - t.value().node().level);
     }
 }
 
