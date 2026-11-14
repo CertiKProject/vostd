@@ -306,7 +306,7 @@ impl<'rcu, C: PageTableConfig> CursorContinuation<'rcu, C> {
                     &&& child->0.level() == self.tree_level + 1
                     &&& child->0.value().path.len() == self.entry_own.node().tree_level + 1
                     &&& child->0.value().match_pte(
-                        self.entry_own.node().children_perm.value()[i],
+                        self.entry_own.node().ptes()[i],
                         self.entry_own.node().level(),
                     )
                     &&& child->0.value().path == self.path().push_tail(i)
@@ -346,7 +346,7 @@ impl<'rcu, C: PageTableConfig> CursorContinuation<'rcu, C> {
             self.children[i]->0.level() == self.tree_level + 1,
             self.children[i]->0.value().path.len() == self.entry_own.node().tree_level + 1,
             self.children[i]->0.value().match_pte(
-                self.entry_own.node().children_perm.value()[i],
+                self.entry_own.node().ptes()[i],
                 self.entry_own.node().level(),
             ),
             self.children[i]->0.value().path == self.path().push_tail(i),
@@ -488,7 +488,7 @@ impl<'rcu, C: PageTableConfig> CursorContinuation<'rcu, C> {
         ensures
             child_value.path.len() == parent_owner.tree_level + 1,
             child_value.match_pte(
-                parent_owner.children_perm.value()[idx as int],
+                parent_owner.ptes()[idx as int],
                 parent_owner.level(),
             ),
             child_value.path == entry_own.path.push_tail(idx as int),
@@ -536,8 +536,8 @@ impl<'rcu, C: PageTableConfig> CursorContinuation<'rcu, C> {
             // Other PTEs preserved (operation only touched the entry at idx)
             forall|j: int|
                 0 <= j < NR_ENTRIES && j != self.idx
-                    ==> #[trigger] self.entry_own.node().children_perm.value()[j]
-                    == parent_old.children_perm.value()[j],
+                    ==> #[trigger] self.entry_own.node().ptes()[j]
+                    == parent_old.ptes()[j],
             // Children at j != idx untouched
             forall|j: int|
                 0 <= j < NR_ENTRIES && j != self.idx ==> #[trigger] self.children[j]
@@ -560,7 +560,7 @@ impl<'rcu, C: PageTableConfig> CursorContinuation<'rcu, C> {
             self.children[self.idx as int]->0.value().path.len() == self.entry_own.node().tree_level
                 + 1,
             self.children[self.idx as int]->0.value().match_pte(
-                self.entry_own.node().children_perm.value()[self.idx as int],
+                self.entry_own.node().ptes()[self.idx as int],
                 self.entry_own.node().level(),
             ),
             // The new child satisfies the PT-specific tree invariant. This is
@@ -740,7 +740,7 @@ impl<'rcu, C: PageTableConfig> Inv for CursorOwner<'rcu, C> {
             &&& self.continuations[2].entry_own.path.len()
                 == self.continuations[3].entry_own.node().tree_level + 1
             &&& self.continuations[2].entry_own.match_pte(
-                self.continuations[3].entry_own.node().children_perm.value()[self.continuations[3].idx as int],
+                self.continuations[3].entry_own.node().ptes()[self.continuations[3].idx as int],
                 self.continuations[3].entry_own.node().level(),
             )
             &&& self.continuations[2].entry_own.parent_level
@@ -765,7 +765,7 @@ impl<'rcu, C: PageTableConfig> Inv for CursorOwner<'rcu, C> {
             &&& self.continuations[1].entry_own.path.len()
                 == self.continuations[2].entry_own.node().tree_level + 1
             &&& self.continuations[1].entry_own.match_pte(
-                self.continuations[2].entry_own.node().children_perm.value()[self.continuations[2].idx as int],
+                self.continuations[2].entry_own.node().ptes()[self.continuations[2].idx as int],
                 self.continuations[2].entry_own.node().level(),
             )
             &&& self.continuations[1].entry_own.parent_level
@@ -792,7 +792,7 @@ impl<'rcu, C: PageTableConfig> Inv for CursorOwner<'rcu, C> {
             &&& self.continuations[0].entry_own.path.len()
                 == self.continuations[1].entry_own.node().tree_level + 1
             &&& self.continuations[0].entry_own.match_pte(
-                self.continuations[1].entry_own.node().children_perm.value()[self.continuations[1].idx as int],
+                self.continuations[1].entry_own.node().ptes()[self.continuations[1].idx as int],
                 self.continuations[1].entry_own.node().level(),
             )
             &&& self.continuations[0].entry_own.parent_level

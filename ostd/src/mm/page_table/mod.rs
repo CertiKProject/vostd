@@ -875,10 +875,10 @@ impl PageTable<KernelPtConfig> {
     /// not a page table node (i.e., is absent or maps a huge frame).
     pub open spec fn create_user_pt_panic_condition(root_owner: NodeOwner<KernelPtConfig>) -> bool {
         exists|i: usize|
-            #![trigger root_owner.children_perm.value()[i as int]]
+            #![trigger root_owner.ptes()[i as int]]
             KernelPtConfig::TOP_LEVEL_INDEX_RANGE().start <= i
                 < KernelPtConfig::TOP_LEVEL_INDEX_RANGE().end && {
-                let pte = root_owner.children_perm.value()[i as int];
+                let pte = root_owner.ptes()[i as int];
                 ||| !pte.is_present()
                 ||| pte.is_last(root_owner.level())
             }
@@ -1004,13 +1004,13 @@ impl PageTable<KernelPtConfig> {
             proof {
                 let kern_node = kernel_owner.0.value().node();
                 assert forall|j: usize|
-                    #![trigger kern_node.children_perm.value()[j as int]]
+                    #![trigger kern_node.ptes()[j as int]]
                     KernelPtConfig::TOP_LEVEL_INDEX_RANGE().start <= j
                         < KernelPtConfig::TOP_LEVEL_INDEX_RANGE().end implies {
-                    let pte = kern_node.children_perm.value()[j as int];
+                    let pte = kern_node.ptes()[j as int];
                     pte.is_present() && !pte.is_last(kern_node.level())
                 } by {
-                    let pte = kern_node.children_perm.value()[j as int];
+                    let pte = kern_node.ptes()[j as int];
                     if !pte.is_present() || pte.is_last(kern_node.level()) {
                         assert(Self::create_user_pt_panic_condition(kern_node));
                     }
@@ -1023,7 +1023,7 @@ impl PageTable<KernelPtConfig> {
                 entry_owner = child_subtree.tracked_borrow_value();
                 let kern_node = kernel_owner.0.value().node();
                 assert(entry_owner.match_pte(
-                    kern_node.children_perm.value()[i as int],
+                    kern_node.ptes()[i as int],
                     entry_owner.parent_level,
                 ));
                 assert(entry_owner.parent_level == kern_node.level());
@@ -1051,7 +1051,7 @@ impl PageTable<KernelPtConfig> {
 
             proof {
                 let kern_node = kernel_owner.0.value().node();
-                let pte = kern_node.children_perm.value()[i as int];
+                let pte = kern_node.ptes()[i as int];
 
                 assert(pte.is_present() && !pte.is_last(kern_node.level())) by {
                     if !pte.is_present() || pte.is_last(kern_node.level()) {
@@ -1060,7 +1060,7 @@ impl PageTable<KernelPtConfig> {
                         assert(exists|j: usize|
                             KernelPtConfig::TOP_LEVEL_INDEX_RANGE().start <= j
                                 < KernelPtConfig::TOP_LEVEL_INDEX_RANGE().end && {
-                                let p = #[trigger] kern_node.children_perm.value()[j as int];
+                                let p = #[trigger] kern_node.ptes()[j as int];
                                 ||| !p.is_present()
                                 ||| p.is_last(kern_node.level())
                             });
@@ -1655,13 +1655,13 @@ pub trait PageTableEntryTrait:
 /// integer. Importantly, it does not include any data that is unsafe to duplicate.
 #[verifier::external_body]
 #[verus_spec(
-    with Tracked(perm): Tracked<&vstd_extra::array_ptr::PointsTo<E, NR_ENTRIES>>
+    with Tracked(perm): Tracked<&vstd_extra::array_ptr::PointsTo<usize, NR_ENTRIES>>
     requires
         perm.is_init(ptr.index as int),
         perm.addr() == ptr.addr(),
         0 <= ptr.index < NR_ENTRIES,
     returns
-        perm.value()[ptr.index as int],
+        crate::specs::mm::page_table::node::owners::raw_decode::<E>(perm.value()[ptr.index as int]),
 )]
 pub unsafe fn load_pte<E: PageTableEntryTrait>(
     ptr: vstd_extra::array_ptr::ArrayPtr<E, NR_ENTRIES>,
@@ -1684,15 +1684,18 @@ pub unsafe fn load_pte<E: PageTableEntryTrait>(
 /// and the pointer is in bounds.
 #[verifier::external_body]
 #[verus_spec(
-    with Tracked(perm): Tracked<&mut vstd_extra::array_ptr::PointsTo<E, NR_ENTRIES>>
+    with Tracked(perm): Tracked<&mut vstd_extra::array_ptr::PointsTo<usize, NR_ENTRIES>>
     requires
         old(perm).addr() == ptr.addr(),
         0 <= ptr.index < NR_ENTRIES,
         old(perm).is_init_all(),
     ensures
         final(perm).wf(),
-        final(perm).value()[ptr.index as int] == new_val,
-        final(perm).value() == old(perm).value().update(ptr.index as int, new_val),
+        final(perm).value()[ptr.index as int] == new_val.as_usize_spec(),
+        final(perm).value() == old(perm).value().update(
+            ptr.index as int,
+            new_val.as_usize_spec(),
+        ),
         final(perm).addr() == old(perm).addr(),
         final(perm).is_init_all(),
 )]

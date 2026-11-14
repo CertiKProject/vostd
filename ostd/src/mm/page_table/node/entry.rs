@@ -238,9 +238,9 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
             // count and the counter are both unchanged — keeping the parent's
             // `count_consistent` invariant intact for the caller.
             crate::specs::mm::page_table::node::owners::count_present(
-                final(parent_owner).children_perm.value(),
+                final(parent_owner).ptes(),
             ) == crate::specs::mm::page_table::node::owners::count_present(
-                old(parent_owner).children_perm.value(),
+                old(parent_owner).ptes(),
             ),
             final(parent_owner).meta().nr_children.value() == old(
                 parent_owner,
@@ -348,7 +348,7 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
     )]
     #[verifier::spinoff_prover]
     pub(in crate::mm) fn replace(&mut self, new_child: Child<C>) -> Child<C> {
-        let ghost cp0 = parent_owner.children_perm.value();
+        let ghost cp0 = parent_owner.ptes();
         let ghost initial_regions = *regions;
         let ghost initial_owner = *owner;
 
@@ -578,7 +578,7 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
                         == final(owner).value().node().level()
                 &&& forall|i: int| 0 <= i < NR_ENTRIES ==>
                     (#[trigger] final(owner).child(i)).value().match_pte(
-                        final(owner).value().node().children_perm.value()[i],
+                        final(owner).value().node().ptes()[i],
                         final(owner).child(i).value().parent_level)
             },
             !old(owner).value().is_absent() ==> {
@@ -593,7 +593,7 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
         PageTableGuard<'rcu, C>,
     > {
         let entry_is_present = self.pte.is_present();
-        let ghost cp0 = parent_owner.children_perm.value();
+        let ghost cp0 = parent_owner.ptes();
 
         #[verus_spec(with Tracked(&*parent_owner))]
         let level = self.node.level();
@@ -864,8 +864,8 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
             // parent NodeOwner into the cursor's continuation.
             old(owner).value().is_frame() && old(parent_owner).level() > 1 ==>
                 forall|j: int| 0 <= j < NR_ENTRIES && j != old(self).idx ==>
-                    #[trigger] final(parent_owner).children_perm.value()[j]
-                        == old(parent_owner).children_perm.value()[j],
+                    #[trigger] final(parent_owner).ptes()[j]
+                        == old(parent_owner).ptes()[j],
     )]
     pub(in crate::mm) fn split_if_mapped_huge<A: InAtomicMode>(&mut self, guard: &'rcu A) -> Option<
         PageTableGuard<'rcu, C>,
@@ -1039,7 +1039,7 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
                     0 <= j < NR_ENTRIES ==> {
                         &&& (#[trigger] new_owner.children()[j]) is Some
                         &&& new_owner.children()[j].unwrap().value().match_pte(
-                            new_owner.value().node().children_perm.value()[j],
+                            new_owner.value().node().ptes()[j],
                             new_owner.value().node().level(),
                         )
                         &&& new_owner.children()[j].unwrap().value().parent_level
@@ -1052,7 +1052,7 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
                     i <= j < NR_ENTRIES ==> {
                         &&& (#[trigger] new_owner.children()[j]) is Some
                         &&& new_owner.children()[j].unwrap().value().is_absent()
-                        &&& new_owner.value().node().children_perm.value()[j]
+                        &&& new_owner.value().node().ptes()[j]
                             == C::E::new_absent_spec()
                     },
                 // Children [0, i) have been replaced with frames.
@@ -1220,7 +1220,7 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
         let ghost regions_before_registration = *regions;
         proof {
             crate::specs::mm::page_table::node::owners::lemma_count_present_upto_update(
-                old(parent_owner).children_perm.value(),
+                old(parent_owner).ptes(),
                 NR_ENTRIES as int,
                 self.idx as int,
                 self.pte,
@@ -1326,7 +1326,7 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
             parent_owner.inv(),
             parent_owner.relate_guard(*guard),
             idx < NR_ENTRIES,
-            owner.match_pte(parent_owner.children_perm.value()[idx as int], owner.parent_level),
+            owner.match_pte(parent_owner.ptes()[idx as int], owner.parent_level),
             regions.inv(),
             regions.slots.contains_key(parent_owner.slot_index),
         ensures
@@ -1359,7 +1359,7 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
             old(owner).inv(),
             old(owner).is_frame(),
             old(owner).match_pte(
-                old(parent_owner).children_perm.value()[idx as int],
+                old(parent_owner).ptes()[idx as int],
                 old(owner).parent_level,
             ),
             old(parent_owner).inv(),
@@ -1387,10 +1387,10 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
             final(owner).is_frame(),
             final(owner).match_pte(res, final(parent_owner).level()),
             final(owner).match_pte(
-                final(parent_owner).children_perm.value()[idx as int],
+                final(parent_owner).ptes()[idx as int],
                 final(parent_owner).level(),
             ),
-            res == final(parent_owner).children_perm.value()[idx as int],
+            res == final(parent_owner).ptes()[idx as int],
             final(parent_owner).inv(),
             final(parent_owner).slot_index == old(parent_owner).slot_index,
             final(parent_owner).level() == old(parent_owner).level(),
@@ -1405,12 +1405,12 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
             final(owner).path == old(owner).path,
             final(owner).parent_level == old(owner).parent_level,
             forall|j: int| 0 <= j < NR_ENTRIES && j != idx ==>
-                #[trigger] final(parent_owner).children_perm.value()[j]
-                    == old(parent_owner).children_perm.value()[j],
+                #[trigger] final(parent_owner).ptes()[j]
+                    == old(parent_owner).ptes()[j],
             crate::specs::mm::page_table::node::owners::count_present(
-                final(parent_owner).children_perm.value(),
+                final(parent_owner).ptes(),
             ) == crate::specs::mm::page_table::node::owners::count_present(
-                old(parent_owner).children_perm.value(),
+                old(parent_owner).ptes(),
             ),
             op.ensures((old(owner).frame().prop,), final(owner).frame().prop),
             *final(self) == *old(self),
@@ -1420,7 +1420,7 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
         idx: usize,
         op: impl FnOnce(PageProperty) -> PageProperty,
     ) -> C::E {
-        let ghost cp_old = parent_owner.children_perm.value();
+        let ghost cp_old = parent_owner.ptes();
         let mut pte = unsafe {
             #[verus_spec(with Tracked(&*parent_owner), Tracked(regions))]
             self.read_pte(idx)
@@ -1476,7 +1476,7 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
             old(owner).inv(),
             old(owner).metaregion_sound(*old(regions)),
             old(owner).match_pte(
-                old(parent_owner).children_perm.value()[idx as int],
+                old(parent_owner).ptes()[idx as int],
                 old(owner).parent_level,
             ),
             old(parent_owner).inv(),
@@ -1503,7 +1503,7 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
             final(new_owner).inv(),
             final(new_owner).metaregion_sound(*final(regions)),
             final(new_owner).match_pte(
-                final(parent_owner).children_perm.value()[idx as int],
+                final(parent_owner).ptes()[idx as int],
                 final(parent_owner).level(),
             ),
             final(new_owner).path == old(new_owner).path,
@@ -1531,8 +1531,8 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
             final(parent_owner).relate_guard(*final(self)),
             final(parent_owner).metaregion_sound_node(*final(regions)),
             forall|j: int| 0 <= j < NR_ENTRIES && j != idx ==>
-                #[trigger] final(parent_owner).children_perm.value()[j]
-                    == old(parent_owner).children_perm.value()[j],
+                #[trigger] final(parent_owner).ptes()[j]
+                    == old(parent_owner).ptes()[j],
             forall|slot: int|
                 #![trigger final(regions).slot_owners[slot].paths_in_pt]
                 (!final(new_owner).is_node() || final(new_owner).is_absent() || slot
@@ -1596,7 +1596,7 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
         };
 
         // For restoring `count_consistent` after the PTE swap below.
-        let ghost cp0 = parent_owner.children_perm.value();
+        let ghost cp0 = parent_owner.ptes();
 
         if old_child.is_none() && !new_child.is_none() {
             #[verus_spec(with
@@ -1743,7 +1743,7 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
             old(parent_owner).metaregion_sound_node(*old(regions)),
             idx < NR_ENTRIES,
             old(owner).value().match_pte(
-                old(parent_owner).children_perm.value()[idx as int],
+                old(parent_owner).ptes()[idx as int],
                 old(owner).value().parent_level,
             ),
             old(regions).inv(),
@@ -1760,7 +1760,7 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
             final(owner).value().node().relate_guard(res),
             final(owner).value().node().slot_vaddr() == res.inner.inner@.ptr.addr(),
             final(owner).value().match_pte(
-                final(parent_owner).children_perm.value()[idx as int],
+                final(parent_owner).ptes()[idx as int],
                 final(parent_owner).level(),
             ),
             final(guards).lock_held(final(owner).value().node().slot_vaddr()),
@@ -1791,7 +1791,7 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
                     == final(owner).value().node().level(),
             forall|i: int| 0 <= i < NR_ENTRIES ==>
                 (#[trigger] final(owner).children()[i])->0.value().match_pte(
-                    final(owner).value().node().children_perm.value()[i],
+                    final(owner).value().node().ptes()[i],
                     final(owner).children()[i]->0.value().parent_level),
             forall|i: int| i != frame_to_index(final(owner).value().meta_slot_paddr()->0) ==>
                 (#[trigger] final(regions).slot_owners[i]) == old(regions).slot_owners[i],
@@ -1811,8 +1811,8 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
             final(parent_owner).relate_guard(*final(self)),
             final(parent_owner).metaregion_sound_node(*final(regions)),
             forall|j: int| 0 <= j < NR_ENTRIES && j != idx ==>
-                #[trigger] final(parent_owner).children_perm.value()[j]
-                    == old(parent_owner).children_perm.value()[j],
+                #[trigger] final(parent_owner).ptes()[j]
+                    == old(parent_owner).ptes()[j],
             *final(self) == *old(self),
             forall |i: usize| old(guards).lock_held(i) ==> final(guards).lock_held(i),
             forall |i: usize| old(guards).unlocked(i) && i != final(owner).value().node().slot_vaddr() ==> final(guards).unlocked(i),
@@ -1837,7 +1837,7 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
         }
         // Snapshot the parent's PTE array for restoring `count_consistent`
         // after the absent→present (`new_pte`) install below.
-        let ghost cp0 = parent_owner.children_perm.value();
+        let ghost cp0 = parent_owner.ptes();
         // The original (absent) entry value, for the fresh-node region/
         // tree-predicate discharge after `owner` is rebuilt as the new node.
         let ghost old_owner_val = owner.value();
@@ -2014,7 +2014,7 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
             old(parent_owner).level() == old(owner).parent_level,
             idx < NR_ENTRIES,
             old(owner).match_pte(
-                old(parent_owner).children_perm.value()[idx as int],
+                old(parent_owner).ptes()[idx as int],
                 old(owner).parent_level,
             ),
             old(regions).inv(),
@@ -2030,12 +2030,12 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
             *final(owner) == old(owner).from_pte_owner_spec(),
             *final(new_owner) == old(new_owner).into_pte_owner_spec(),
             final(new_owner).pte_invariants(
-                final(parent_owner).children_perm.value()[idx as int],
+                final(parent_owner).ptes()[idx as int],
                 *final(regions),
             ),
             forall|i: int|
-                0 <= i < NR_ENTRIES && i != idx ==> #[trigger] old(parent_owner).children_perm.value()[i]
-                    == final(parent_owner).children_perm.value()[i],
+                0 <= i < NR_ENTRIES && i != idx ==> #[trigger] old(parent_owner).ptes()[i]
+                    == final(parent_owner).ptes()[i],
             final(parent_owner).slot_index == old(parent_owner).slot_index,
             final(parent_owner).level() == old(parent_owner).level(),
             final(parent_owner).tree_level == old(parent_owner).tree_level,
@@ -2053,7 +2053,7 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
         level: PagingLevel,
         prop: PageProperty,
     ) {
-        let ghost cp0 = parent_owner.children_perm.value();
+        let ghost cp0 = parent_owner.ptes();
         #[verus_spec(with
             Tracked(NodeOwner::<C>::tracked_borrow_frame_metadata_perm(
                 &parent_owner.frame_permission,

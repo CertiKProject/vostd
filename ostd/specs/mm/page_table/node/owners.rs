@@ -136,6 +136,37 @@ pub proof fn lemma_count_where_pte_raws<E: PageTableEntryTrait>(s: Seq<E>, n: in
 }
 
 
+/// Counting present PTEs among raw values gives the same result as counting
+/// the decoded PTEs.
+pub proof fn lemma_count_where_raw<E: PageTableEntryTrait>(raw: Seq<usize>, n: int)
+    requires
+        0 <= n <= raw.len(),
+    ensures
+        count_where_upto(|r: usize| raw_is_present::<E>(r), raw, n) == count_present_upto(
+            raw.map_values(|r: usize| raw_decode::<E>(r)),
+            n,
+        ),
+    decreases n,
+{
+    if n > 0 {
+        lemma_count_where_raw::<E>(raw, n - 1);
+    }
+}
+
+/// Decoding raw values written as `as_usize` of a PTE gives the PTE back, so
+/// updating a raw value updates the decoded sequence.
+pub proof fn lemma_decode_update<E: PageTableEntryTrait>(raw: Seq<usize>, i: int, e: E)
+    requires
+        0 <= i < raw.len(),
+    ensures
+        raw.update(i, e.as_usize_spec()).map_values(|r: usize| raw_decode::<E>(r))
+            == raw.map_values(|r: usize| raw_decode::<E>(r)).update(i, e),
+{
+    lemma_raw_decode::<E>(e);
+    assert(raw.update(i, e.as_usize_spec()).map_values(|r: usize| raw_decode::<E>(r))
+        =~= raw.map_values(|r: usize| raw_decode::<E>(r)).update(i, e));
+}
+
 /// `count_present_upto` is between `0` and `n`.
 pub proof fn lemma_count_present_upto_bound<E: PageTableEntryTrait>(s: Seq<E>, n: int)
     requires
@@ -281,7 +312,9 @@ impl<C: PageTableConfig> OwnerOf for PageTablePageMeta<C> {
 ///   `pte_auth` is what lets the lock state that `nr_children` counts the
 ///   present PTEs without depending on the `PageTableConfig`.
 /// - `children_perm` is an array permission for the underlying frame in which the node
-///   is allocated, interpreted as an array of `NR_ENTRIES` page table entries
+///   is allocated, as `NR_ENTRIES` raw PTE values (`PageTableEntryTrait::as_usize`).
+///   The raw type keeps it independent of the `PageTableConfig`, so that it can be
+///   held by the node's lock. [`Self::ptes`] decodes it.
 /// - `slot_index` identifies the underlying frame's index in the metadata region
 /// - Each node is a page table with a level between 1 and 4 (on x86); `level` tracks
 ///   the level of this node.
@@ -291,9 +324,11 @@ pub tracked struct NodeOwner<C: PageTableConfig> {
     pub lock_cell: Option<PtLockCell>,
     pub pte_view: GhostVar<PteRaws>,
     pub frame_permission: FracMetadataPerm,
-    pub children_perm: array_ptr::PointsTo<C::E, NR_ENTRIES>,
+    pub children_perm: array_ptr::PointsTo<usize, NR_ENTRIES>,
     pub ghost tree_level: int,
     pub ghost slot_index: int,
+    /// The configuration, which determines how the raw PTEs are decoded.
+    pub ghost _config: core::marker::PhantomData<C>,
 }
 
 impl<C: PageTableConfig> Inv for NodeOwner<C> {
@@ -303,7 +338,7 @@ impl<C: PageTableConfig> Inv for NodeOwner<C> {
             &&& self.pte_auth().id() == self.pte_view.id()
             &&& self.pte_auth()@ == self.pte_view@
         }
-        &&& self.pte_view@ == pte_raws(self.children_perm.value())
+        &&& self.pte_view@ == self.children_perm.value()
         &&& self.frame_permission.frac() == 1
         &&& 1 <= self.level() <= NR_LEVELS
         &&& self.children_perm.wf()
@@ -326,6 +361,11 @@ impl<C: PageTableConfig> NodeOwner<C> {
     /// cell has been moved into this owner.
     pub open spec fn is_locked(self) -> bool {
         self.lock_cell is Some
+    }
+
+    /// The node's PTEs, decoded from the raw values in `children_perm`.
+    pub open spec fn ptes(self) -> Seq<C::E> {
+        self.children_perm.value().map_values(|r: usize| raw_decode::<C::E>(r))
     }
 
     /// The lock cell. Only meaningful if [`Self::is_locked`].
@@ -432,7 +472,7 @@ impl<C: PageTableConfig> NodeOwner<C> {
             old(self).is_locked(),
             old(self).pte_auth().id() == old(self).pte_view.id(),
         ensures
-            final(self).pte_view@ == pte_raws(old(self).children_perm.value()),
+            final(self).pte_view@ == old(self).children_perm.value(),
             final(self).pte_auth()@ == final(self).pte_view@,
             final(self).pte_auth().id() == final(self).pte_view.id(),
             final(self).pte_view.id() == old(self).pte_view.id(),
@@ -452,7 +492,7 @@ impl<C: PageTableConfig> NodeOwner<C> {
     {
         let tracked mut cell = self.lock_cell.tracked_take();
         let tracked payload = cell.tracked_borrow_mut_value();
-        payload.pte_auth.update(&mut self.pte_view, pte_raws(self.children_perm.value()));
+        payload.pte_auth.update(&mut self.pte_view, self.children_perm.value());
         self.lock_cell = Some(cell);
     }
 
@@ -526,7 +566,7 @@ impl<C: PageTableConfig> NodeOwner<C> {
     /// site). For an unlocked node the fact is kept by the lock instead.
     pub open spec fn count_consistent(self) -> bool {
         self.is_locked() ==> self.meta().nr_children.value() == count_present(
-            self.children_perm.value(),
+            self.ptes(),
         )
     }
 }
@@ -541,13 +581,13 @@ impl<C: PageTableConfig> NodeOwner<C> {
             self.inv(),
             self.is_locked(),
             self.count_consistent(),
-            self.children_perm.value().len() == NR_ENTRIES,
+            self.ptes().len() == NR_ENTRIES,
             idx < NR_ENTRIES,
-            !self.children_perm.value()[idx as int].is_present(),
+            !self.ptes()[idx as int].is_present(),
         ensures
             self.meta().nr_children.value() < NR_ENTRIES,
     {
-        lemma_count_present_upto_absent(self.children_perm.value(), NR_ENTRIES as int, idx as int);
+        lemma_count_present_upto_absent(self.ptes(), NR_ENTRIES as int, idx as int);
     }
 
     /// If a slot in `children_perm` holds a present PTE, then `nr_children > 0`.
@@ -558,13 +598,13 @@ impl<C: PageTableConfig> NodeOwner<C> {
             self.inv(),
             self.is_locked(),
             self.count_consistent(),
-            self.children_perm.value().len() == NR_ENTRIES,
+            self.ptes().len() == NR_ENTRIES,
             idx < NR_ENTRIES,
-            self.children_perm.value()[idx as int].is_present(),
+            self.ptes()[idx as int].is_present(),
         ensures
             self.meta().nr_children.value() > 0,
     {
-        lemma_count_present_upto_present(self.children_perm.value(), NR_ENTRIES as int, idx as int);
+        lemma_count_present_upto_present(self.ptes(), NR_ENTRIES as int, idx as int);
     }
 }
 

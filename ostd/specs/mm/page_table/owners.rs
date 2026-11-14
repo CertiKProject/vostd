@@ -321,7 +321,7 @@ pub open spec fn allocated_empty_node_owner<C: PageTableConfig>(
     // depth + 1.
     &&& owner.level() == (INC_LEVELS - level - 1) as nat
     &&& owner.value().node().inv()
-    &&& !owner.value().node().children_perm.value().all(|child: C::E| child.is_present())
+    &&& !owner.value().node().ptes().all(|child: C::E| child.is_present())
     &&& forall|i: int|
         0 <= i < NR_ENTRIES ==> {
             &&& #[trigger] owner.has_child(i)
@@ -332,7 +332,7 @@ pub open spec fn allocated_empty_node_owner<C: PageTableConfig>(
     &&& forall|i: int|
         #![auto]
         0 <= i < NR_ENTRIES ==> owner.child(i).value().match_pte(
-            owner.value().node().children_perm.value()[i],
+            owner.value().node().ptes()[i],
             owner.child(i).value().parent_level,
         )
     &&& forall|i: int|
@@ -344,7 +344,7 @@ pub open spec fn allocated_empty_node_owner<C: PageTableConfig>(
     // "not all are present" clause; needed by `split_if_mapped_huge`'s
     // loop invariant which inspects each slot's PTE.)
     &&& forall|j: int|
-        0 <= j < NR_ENTRIES ==> #[trigger] owner.value().node().children_perm.value()[j]
+        0 <= j < NR_ENTRIES ==> #[trigger] owner.value().node().ptes()[j]
             == C::E::new_absent_spec()
 }
 
@@ -540,11 +540,11 @@ impl<C: PageTableConfig> PageTableOwner<C> {
         // `view_rec`. The top-level guard keeps deeper consumers on pure
         // `match_pte`, so borrowing never appears below the root.
         &&& (parent.child(i).value().match_pte(
-            parent.value().node().children_perm.value()[i],
+            parent.value().node().ptes()[i],
             parent.value().node().level(),
         ) || (parent.value().node().level() == NR_LEVELS && leading_bits_spec::<C>() == 0
             && parent.child(i).value().borrowed_match_pte(
-            parent.value().node().children_perm.value()[i],
+            parent.value().node().ptes()[i],
             parent.value().node().level(),
         )))
         &&& parent.child(i).value().path == parent.value().path.push_tail(i)
@@ -648,7 +648,7 @@ impl<C: PageTableConfig> PageTableOwner<C> {
             c2.value().path == t.child(i).value().path,
             c2.value().parent_level == t.child(i).value().parent_level,
             c2.value().match_pte(
-                t.value().node().children_perm.value()[i],
+                t.value().node().ptes()[i],
                 t.value().node().level(),
             ),
         ensures
@@ -699,18 +699,14 @@ impl<C: PageTableConfig> PageTableOwner<C> {
         reveal(PageTableOwner::pt_inv_at_depth);
         let depth = (INC_LEVELS - owner.level()) as nat;
         assert(<EntryOwner<C> as TreeNodeValue<INC_LEVELS>>::la_inv(owner.value(), owner.level()));
-        assert(depth > 0);
-        let p = PageTableOwner(owner);
-        assert(p.0 == owner);
-        assert forall|i: int|
-            #![trigger p.0.has_child(i)]
-            0 <= i < NR_ENTRIES implies Self::pt_edge_at(p.0, i) && PageTableOwner(
-                p.0.child(i),
-            ).pt_inv_at_depth((depth - 1) as nat) by {
+        assert forall|i: int| 0 <= i < NR_ENTRIES implies #[trigger] owner.has_child(i)
+            && Self::pt_edge_at(owner, i) && PageTableOwner(owner.child(i)).pt_inv_at_depth(
+            (depth - 1) as nat,
+        ) by {
             assert(owner.has_child(i));
         };
-        assert(PageTableOwner(owner).pt_inv_at_depth(depth));
     }
+
 
     #[verifier::spinoff_prover]
     #[verifier::spinoff_prover]
@@ -770,7 +766,7 @@ impl<C: PageTableConfig> PageTableOwner<C> {
                     &&& !owner.child(i).value().is_node()
                     &&& owner.child(i).value().path.len() == owner.value().node().tree_level + 1
                     &&& owner.child(i).value().match_pte(
-                        owner.value().node().children_perm.value()[i],
+                        owner.value().node().ptes()[i],
                         owner.value().node().level(),
                     )
                     &&& owner.child(i).value().path == owner.value().path.push_tail(i)
@@ -1492,7 +1488,7 @@ impl<C: PageTableConfig> PageTableOwner<C> {
             self.view_rec(path) == set![],
     {
         if path.len() < INC_LEVELS - 1 {
-            let cp = self.0.value().node().children_perm.value();
+            let cp = self.0.value().node().ptes();
             // `count_consistent` + `nr_children == 0` ⟹ no present PTEs.
             self.lemma_view_rec_contains(path);
             assert forall|m: Mapping| self.view_rec(path).contains(m) implies false by {

@@ -381,7 +381,7 @@ impl<'a, C: PageTableConfig> PageTableNodeRef<'a, C> {
             owner.meta_value().wf(cell@.value().meta),
             cell@.value().pte_auth.id() == owner.pte_view.id(),
             cell@.value().pte_auth@ == owner.pte_view@,
-            cell@.value().meta.nr_children.value() == count_present(owner.children_perm.value()),
+            cell@.value().meta.nr_children.value() == count_present(owner.ptes()),
     )]
     #[verifier::exec_allows_no_decreases_clause]
     pub fn lock<'rcu, A: InAtomicMode>(self, _guard: &'rcu A) -> PageTableGuard<'rcu, C> where
@@ -429,7 +429,7 @@ impl<'a, C: PageTableConfig> PageTableNodeRef<'a, C> {
         proof {
             reveal(lock_key_wf);
             payload.tracked_borrow_value().pte_auth.agree(&owner.pte_view);
-            lemma_count_where_pte_raws::<C::E>(
+            lemma_count_where_raw::<C::E>(
                 owner.children_perm.value(),
                 owner.children_perm.value().len() as int,
             );
@@ -489,7 +489,7 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
             child_owner.inv(),
             owner.relate_guard(*old(self)),
             child_owner.match_pte(
-                owner.children_perm.value()[idx as int],
+                owner.ptes()[idx as int],
                 child_owner.parent_level,
             ),
             regions.inv(),
@@ -587,7 +587,7 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
             regions.contains(owner.slot_index),
             idx < NR_ENTRIES,
         returns
-            owner.children_perm.value()[idx as int],
+            owner.ptes()[idx as int],
     )]
     pub unsafe fn read_pte(&self, idx: usize) -> C::E {
         // debug_assert!(idx < nr_subpage_per_huge::<C>());
@@ -635,7 +635,7 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
             final(owner).frame_permission == old(owner).frame_permission,
             final(owner).slot_index == old(owner).slot_index,
             final(owner).tree_level == old(owner).tree_level,
-            final(owner).children_perm.value() == old(owner).children_perm.value().update(
+            final(owner).ptes() == old(owner).ptes().update(
                 idx as int,
                 pte,
             ),
@@ -657,6 +657,7 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
         }
         proof {
             assert(owner.children_perm.wf());
+            lemma_decode_update::<C::E>(old(owner).children_perm.value(), idx as int, pte);
             owner.tracked_sync_pte_model();
         }
     }
@@ -713,7 +714,7 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
         }
         proof {
             reveal(PageTablePageMeta::lock_consts_wf);
-            lemma_count_where_pte_raws::<C::E>(
+            lemma_count_where_raw::<C::E>(
                 owner.children_perm.value(),
                 owner.children_perm.value().len() as int,
             );

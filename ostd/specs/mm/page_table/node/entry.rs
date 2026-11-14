@@ -77,7 +77,7 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
         &&& parent_owner.level() == owner.parent_level
         &&& parent_owner.inv()
         &&& parent_owner.relate_guard(guard)
-        &&& owner.match_pte(parent_owner.children_perm.value()[self.idx as int], owner.parent_level)
+        &&& owner.match_pte(parent_owner.ptes()[self.idx as int], owner.parent_level)
     }
 
     pub open spec fn metaregion_sound_preserved(
@@ -196,8 +196,8 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
         parent_owner1: NodeOwner<C>,
     ) -> bool {
         &&& forall|i: int|
-            0 <= i < NR_ENTRIES ==> i != self.idx ==> parent_owner0.children_perm.value()[i]
-                == parent_owner1.children_perm.value()[i]
+            0 <= i < NR_ENTRIES ==> i != self.idx ==> parent_owner0.ptes()[i]
+                == parent_owner1.ptes()[i]
         &&& parent_owner1.slot_index == parent_owner0.slot_index
         &&& parent_owner1.level() == parent_owner0.level()
         &&& parent_owner1.tree_level == parent_owner0.tree_level

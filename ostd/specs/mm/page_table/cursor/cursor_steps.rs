@@ -312,7 +312,7 @@ impl<'rcu, C: PageTableConfig> CursorOwner<'rcu, C> {
                 &&& child.children[j].unwrap().value().path.len()
                     == child.entry_own.node().tree_level + 1
                 &&& child.children[j].unwrap().value().match_pte(
-                    child.entry_own.node().children_perm.value()[j],
+                    child.entry_own.node().ptes()[j],
                     child.entry_own.node().level(),
                 )
                 &&& <EntryOwner<C> as TreeNodeValue<NR_LEVELS>>::rel_children(

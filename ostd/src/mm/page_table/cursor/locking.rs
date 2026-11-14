@@ -31,7 +31,7 @@ use vstd_extra::drop_tracking::{DropObligation, ManuallyDrop, TrackDrop};
 use vstd_extra::resource::flat_tree::{LockedTree, LockedValue, tree_wf, tree_wf_at};
 use crate::mm::frame::meta::mapping::meta_to_frame;
 use crate::specs::mm::page_table::node::owners::{
-    lemma_count_where_pte_raws, lemma_raw_decode, lock_key_wf,
+    lemma_count_where_raw, lemma_raw_decode, lock_key_wf,
 };
 
 verus! {
@@ -1256,10 +1256,9 @@ proof fn lemma_cell_child_key<C: PageTableConfig>(
 {
     PageTableOwner(t).pt_inv_unroll(i);
     let node = t.value().node();
-    let pte = node.children_perm.value()[i];
+    let pte = node.ptes()[i];
     reveal(PageTablePageMeta::lock_consts_wf);
-    lemma_raw_decode::<C::E>(pte);
-    assert(node.pte_auth()@[i] == pte.as_usize_spec());
+    assert(node.pte_auth()@[i] == node.children_perm.value()[i]);
     if t.child(i).value().is_node() {
         assert(t.child(i).value().node().inv());
     }
@@ -1288,7 +1287,7 @@ proof fn lemma_locked_cells_wf<C: PageTableConfig>(
     assert(<EntryOwner<C> as TreeNodeValue<INC_LEVELS>>::la_inv(t.value(), t.level()));
     assert(t.value().metaregion_sound(regions));
     reveal(PageTablePageMeta::lock_consts_wf);
-    lemma_count_where_pte_raws::<C::E>(
+    lemma_count_where_raw::<C::E>(
         node.children_perm.value(),
         node.children_perm.value().len() as int,
     );
