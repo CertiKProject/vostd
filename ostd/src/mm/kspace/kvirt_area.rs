@@ -445,6 +445,13 @@ impl KVirtArea {
             owner.inv(),
             owner.pt_owner.metaregion_sound(*old(regions)),
             owner.pt_owner.0.value().node().relate_guard(root_guard),
+            // No node of the kernel page table has a live guard.
+            owner.pt_owner.0.subtree_satisfies(
+                owner.pt_owner.0.value().path,
+                crate::specs::mm::page_table::cursor::owners::node_unguarded::<KernelPtConfig>(
+                    *old(guards),
+                ),
+            ),
             // For each frame, the map contains an appropriate owner keyed by
             // that frame's paddr. Duplicates in `frames` share the same owner.
             forall|i: int|
@@ -727,6 +734,13 @@ impl KVirtArea {
             owner.inv(),
             owner.pt_owner.metaregion_sound(*old(regions)),
             owner.pt_owner.0.value().node().relate_guard(root_guard),
+            // No node of the kernel page table has a live guard.
+            owner.pt_owner.0.subtree_satisfies(
+                owner.pt_owner.0.value().path,
+                crate::specs::mm::page_table::cursor::owners::node_unguarded::<KernelPtConfig>(
+                    *old(guards),
+                ),
+            ),
             Self::untracked_range_slots_in_regions(&pa_range, *old(regions)),
             forall|pa: Paddr, level: PagingLevel|
                 #[trigger]

@@ -230,6 +230,8 @@ impl<'rcu, C: PageTableConfig, A: InAtomicMode> Cursor<'rcu, C, A> {
                 ==> Self::cursor_new_success_conditions(*va),
             pt_own.0.value().node().relate_guard(root_guard),
             va.end > 0,
+            // No node of the page table has a live guard.
+            pt_own.0.subtree_satisfies(pt_own.0.value().path, node_unguarded::<C>(*old(guards))),
         ensures
             final(regions).slots == old(regions).slots,
             forall|idx: int| #![trigger final(regions).slot_owners[idx]]
@@ -1964,6 +1966,8 @@ impl<'rcu, C: PageTableConfig, A: InAtomicMode> CursorMut<'rcu, C, A> {
                 ==> Cursor::<C, A>::cursor_new_success_conditions(*va),
             pt_own.0.value().node().relate_guard(root_guard),
             va.end > 0,
+            // No node of the page table has a live guard.
+            pt_own.0.subtree_satisfies(pt_own.0.value().path, node_unguarded::<C>(*old(guards))),
         ensures
             final(regions).slots == old(regions).slots,
             forall|idx: int| #![trigger final(regions).slot_owners[idx]]

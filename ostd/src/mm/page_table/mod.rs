@@ -1251,6 +1251,8 @@ impl<C: PageTableConfig> PageTable<C> {
                 ==> Cursor::<C, G>::cursor_new_success_conditions(*va),
             owner.0.value().node().relate_guard(root_guard),
             va.end > 0,
+            // No node of the page table has a live guard.
+            owner.0.subtree_satisfies(owner.0.value().path, node_unguarded::<C>(*old(guards))),
         ensures
             final(regions).slots == old(regions).slots,
             forall|idx: int| #![trigger final(regions).slot_owners[idx]]
@@ -1311,6 +1313,8 @@ impl<C: PageTableConfig> PageTable<C> {
                 ==> Cursor::<C, G>::cursor_new_success_conditions(*va),
             owner.0.value().node().relate_guard(root_guard),
             va.end > 0,
+            // No node of the page table has a live guard.
+            owner.0.subtree_satisfies(owner.0.value().path, node_unguarded::<C>(*old(guards))),
         ensures
             final(regions).slots == old(regions).slots,
             forall|idx: int| #![trigger final(regions).slot_owners[idx]]

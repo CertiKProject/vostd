@@ -224,6 +224,11 @@ impl<'a> VmSpace<'a> {
             self.pt.relates_owner(owner, *old(regions)),
             owner.0.value().node().relate_guard(root_guard),
             va.end > 0,
+            // No node of the page table has a live guard.
+            owner.0.subtree_satisfies(
+                owner.0.value().path,
+                crate::specs::mm::page_table::cursor::owners::node_unguarded::<UserPtConfig>(*old(guards)),
+            ),
         ensures
             crate::mm::page_table::Cursor::<UserPtConfig, G>::cursor_new_success_conditions(*va) ==> (r matches Ok(_) && cursor_owner@ matches Some(_)),
             // On the success branch, the returned cursor owner satisfies
@@ -289,6 +294,11 @@ impl<'a> VmSpace<'a> {
             self.pt.relates_owner(owner, *old(regions)),
             owner.0.value().node().relate_guard(root_guard),
             va.end > 0,
+            // No node of the page table has a live guard.
+            owner.0.subtree_satisfies(
+                owner.0.value().path,
+                crate::specs::mm::page_table::cursor::owners::node_unguarded::<UserPtConfig>(*old(guards)),
+            ),
         ensures
             crate::mm::page_table::Cursor::<UserPtConfig, G>::cursor_new_success_conditions(*va) ==> (r matches Ok(_) && cursor_owner@ matches Some(_)),
             // See `cursor` above for the derivation.
