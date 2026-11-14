@@ -31,7 +31,10 @@ mod child_specs;
 #[path = "../../../../specs/mm/page_table/node/entry.rs"]
 mod entry_specs;
 
-use vstd::{atomic::PAtomicU8, cell::pcell_maybe_uninit, prelude::*, simple_pptr::PPtr};
+use vstd::{
+    atomic_ghost::AtomicInvariantPredicate, atomic_with_ghost, cell::pcell_maybe_uninit, prelude::*,
+    resource::ghost_var::{GhostVar, GhostVarAuth}, simple_pptr::PPtr,
+};
 use vstd_extra::{array_ptr, cast_ptr::*, ghost_tree::*, ownership::*};
 
 pub use crate::specs::mm::page_table::node::{entry_owners::*, owners::*};
@@ -83,7 +86,7 @@ pub struct PageTablePageMeta<C: PageTableConfig> {
     /// referenced by page tables of different levels.
     pub level: PagingLevel,
     /// The lock for the page table page.
-    pub lock: PAtomicU8,
+    pub lock: PageTableLock,
     pub _phantom: core::marker::PhantomData<C>,
 }
 
@@ -232,6 +235,7 @@ impl<C: PageTableConfig> PageTableNode<C> {
         ensures
             final(regions).inv(),
             allocated_empty_node_owner(owner@, level),
+            !owner@.value().node().is_locked(),
             allocated_empty_node_grandchildren_none(owner@),
             res.ptr.addr() == owner@.value().node().slot_vaddr(),
             res.external_meta_wf(owner@.value().node().frame_permission.resource(), ()),
@@ -340,26 +344,99 @@ impl<'a, C: PageTableConfig> PageTableNodeRef<'a, C> {
     /// An atomic mode guard is required to
     ///  1. prevent deadlocks;
     ///  2. provide a lifetime (`'rcu`) that the nodes are guaranteed to outlive.
-    /// # Verification Design
-    /// As of when we verified this library, we didn't have a spin lock implementation, so we axiomatize
-    /// what happens when it's successful.
-    #[verifier::external_body]
+    ///
+    /// # Verified Properties
+    /// ## Preconditions
+    /// - `owner` is the owner of this node, and its metadata's lock is well-formed
+    ///   for it (as in [`NodeOwner::metaregion_sound_node`]).
+    /// - No guard for this node exists.
+    /// ## Postconditions
+    /// - Returns the lock's cell, whose payload holds the permissions for the node's
+    ///   `nr_children` and `stray` cells, and the authoritative half of its PTE model,
+    ///   which agrees with `owner`. Install it with
+    ///   [`NodeOwner::tracked_install_lock_cell`].
+    /// - The returned guard is recorded in `guards`.
+    /// ## Key Verification Step
+    /// The cell is extracted from the lock's atomic invariant when the
+    /// compare-and-exchange succeeds, as in `SpinLock::acquire_lock`.
     #[verus_spec(res =>
         with Tracked(owner): Tracked<&NodeOwner<C>>,
             Tracked(guards): Tracked<&mut Guards>
+            -> cell: Tracked<PtLockCell>,
         requires
             self.inner@.invariants(*owner),
             self.inner@.external_meta_wf(owner.frame_permission.resource(), ()),
+            owner.meta_value().lock_wf(),
+            owner.pte_view.id() == owner.meta_value().lock.constant().consts.pte_model_id,
+            lock_key_wf(owner.meta_value(), owner.slot_index),
             old(guards).unlocked(owner.slot_vaddr()),
         ensures
             final(guards).lock_held(owner.slot_vaddr()),
             Self::locks_preserved_except(owner.slot_vaddr(), *old(guards), *final(guards)),
             owner.relate_guard(res),
+            cell@.lock_const() == owner.meta_value().lock.constant(),
+            cell@.inv_cell(),
+            cell@.key() == meta_to_frame(index_to_meta(owner.slot_index)),
+            cell@.value().meta.inv(),
+            owner.meta_value().wf(cell@.value().meta),
+            cell@.value().pte_auth.id() == owner.pte_view.id(),
+            cell@.value().pte_auth@ == owner.pte_view@,
+            cell@.value().meta.nr_children.value() == count_present(owner.children_perm.value()),
     )]
+    #[verifier::exec_allows_no_decreases_clause]
     pub fn lock<'rcu, A: InAtomicMode>(self, _guard: &'rcu A) -> PageTableGuard<'rcu, C> where
         'a: 'rcu,
      {
-        unimplemented!()
+        #[verus_spec(with
+            Tracked(Some(owner.tracked_borrow_metadata_perm())),
+            Tracked(&())
+        )]
+        let meta = self.meta();
+
+        proof_decl!{
+            let tracked mut payload: Option<PtLockCell> = None;
+        }
+        loop
+            invariant_except_break
+                payload is None,
+            invariant
+                meta == owner.meta_value(),
+                meta.lock_wf(),
+            ensures
+                payload is Some,
+                PtLockPred::atomic_inv(meta.lock.constant(), 0, payload),
+        {
+            let res = atomic_with_ghost! {
+                meta.lock => compare_exchange(0, 1);
+                returning res;
+                ghost g => {
+                    if res is Ok {
+                        payload = Some(g.tracked_take());
+                    }
+                }
+            };
+            if res.is_ok() {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+
+        let guard = PageTableGuard::<'rcu, C> { inner: self };
+
+        proof_decl!{
+            let tracked payload = payload.tracked_unwrap();
+        }
+        proof {
+            reveal(lock_key_wf);
+            payload.tracked_borrow_value().pte_auth.agree(&owner.pte_view);
+            lemma_count_where_pte_raws::<C::E>(
+                owner.children_perm.value(),
+                owner.children_perm.value().len() as int,
+            );
+            guards.guards = guards.guards.insert(owner.slot_vaddr());
+        }
+        proof_with!{ |= Tracked(payload) }
+        guard
     }
 
     /// Creates a new [`PageTableGuard`] without checking if the page table lock is held.
@@ -448,11 +525,12 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
     #[verus_spec(nr =>
         with Tracked(owner) : Tracked<&NodeOwner<C>>,
         requires
-            owner.meta_own.nr_children.id() == owner.meta_value().nr_children.id(),
+            owner.is_locked(),
+            owner.meta().nr_children.id() == owner.meta_value().nr_children.id(),
             self.inner.inner@.invariants(*owner),
             self.inner.inner@.external_meta_wf(owner.frame_permission.resource(), ()),
         returns
-            owner.meta_own.nr_children.value(),
+            owner.meta().nr_children.value(),
     )]
     pub fn nr_children(&self) -> u16 {
         #[verus_spec(with
@@ -461,7 +539,7 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
         )]
         let meta = self.meta();
 
-        *meta.nr_children.borrow(Tracked(&owner.meta_own.nr_children))
+        *meta.nr_children.borrow(Tracked(&owner.tracked_borrow_meta().nr_children))
     }
 
     /// Returns if the page table node is detached from its parent.
@@ -543,13 +621,17 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
              Tracked(regions): Tracked<&MetaRegionOwners>,
         requires
             old(self).inner.inner@.invariants(*old(owner)),
+            old(owner).is_locked(),
             regions.inv(),
             regions.contains(old(owner).slot_index),
             idx < NR_ENTRIES,
         ensures
             final(owner).inv(),
             final(owner).level() == old(owner).level(),
-            final(owner).meta_own == old(owner).meta_own,
+            final(owner).is_locked(),
+            final(owner).meta() == old(owner).meta(),
+            final(owner).cell().lock_const() == old(owner).cell().lock_const(),
+            final(owner).pte_view.id() == old(owner).pte_view.id(),
             final(owner).frame_permission == old(owner).frame_permission,
             final(owner).slot_index == old(owner).slot_index,
             final(owner).tree_level == old(owner).tree_level,
@@ -575,6 +657,7 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
         }
         proof {
             assert(owner.children_perm.wf());
+            owner.tracked_sync_pte_model();
         }
     }
 
@@ -611,15 +694,60 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
     }
 }*/
 
+#[verus_verify]
 impl<C: PageTableConfig> PageTablePageMeta<C> {
+    /// Creates the metadata of a new, empty page table node.
+    ///
+    /// The lock starts free, holding the node's [`PtLockCell`]: the permissions
+    /// for `nr_children` and `stray` and the authoritative half of the PTE model.
+    /// The other half, recording that all PTEs are absent, is returned for the
+    /// node's owner. The ghost `paddr`, the address of the frame the metadata
+    /// will describe, is the lock's key.
+    #[verus_spec(res =>
+        with
+            Ghost(paddr): Ghost<Paddr>,
+            -> pte_view: Tracked<GhostVar<PteRaws>>,
+        requires
+            1 <= level <= NR_LEVELS,
+        ensures
+            res.lock_wf(),
+            res.level == level,
+            res.lock.constant().key == paddr,
+            pte_view@.id() == res.lock.constant().consts.pte_model_id,
+            pte_view@@ == pte_raws(Seq::new(NR_ENTRIES as nat, |_i: int| C::E::new_absent_spec())),
+    )]
     pub fn new(level: PagingLevel) -> Self {
-        Self {
-            nr_children: pcell_maybe_uninit::PCell::new(0).0,
-            stray: pcell_maybe_uninit::PCell::new(false).0,
-            level,
-            lock: PAtomicU8::new(0).0,
-            _phantom: PhantomData,
+        let (nr_children, Tracked(nr_children_perm)) = pcell_maybe_uninit::PCell::new(0);
+        let (stray, Tracked(stray_perm)) = pcell_maybe_uninit::PCell::new(false);
+        let ghost absent = Seq::new(NR_ENTRIES as nat, |_i: int| C::E::new_absent_spec());
+        let tracked (pte_auth, pte_view) = GhostVarAuth::<PteRaws>::new(pte_raws(absent));
+        proof {
+            C::E::lemma_page_table_entry_properties();
+            lemma_count_present_upto_all_absent::<C::E>(absent, NR_ENTRIES as int);
+            lemma_count_where_pte_raws::<C::E>(absent, NR_ENTRIES as int);
         }
+        let tracked payload = PtLockPayload {
+            paddr,
+            pt_level: level,
+            is_present: |r: usize| raw_is_present::<C::E>(r),
+            child_of: raw_child_of_fn::<C::E>(),
+            meta: PageMetaOwner { nr_children: nr_children_perm, stray: stray_perm },
+            pte_auth,
+        };
+        let tracked cell = PtLockCell::tracked_new(payload, (NR_LEVELS - level) as nat);
+        let ghost k = cell.lock_const();
+        let res = Self {
+            lock: PageTableLock::new(Ghost(k), 0, Tracked(Some(cell))),
+            nr_children,
+            stray,
+            level,
+            _phantom: PhantomData,
+        };
+        proof {
+            reveal(PageTablePageMeta::lock_consts_wf);
+        }
+        proof_with!{ |= Tracked(pte_view) }
+        res
     }
 
     /// The PTE value that `read_once::<C::E>` would produce at cursor `c`

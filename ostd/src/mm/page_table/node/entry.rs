@@ -190,6 +190,7 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
              Tracked(parent_owner): Tracked<&mut NodeOwner<C>>,
              Tracked(regions): Tracked<&MetaRegionOwners>,
         requires
+            old(parent_owner).is_locked(),
             old(owner).inv(),
             old(self).wf(*old(owner)),
             old(self).node_matching(*old(owner), *old(parent_owner), *old(self).node),
@@ -215,6 +216,7 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
                 op.ensures((p_in,), p_out) && C::E::new_page_req(pa, level, p_in)
                     ==> C::E::new_page_req(pa, level, p_out),
         ensures
+            final(parent_owner).is_locked(),
             final(owner).inv(),
             final(self).wf(*final(owner)),
             final(self).node_matching(*final(owner), *final(parent_owner), *final(self).node),
@@ -240,9 +242,9 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
             ) == crate::specs::mm::page_table::node::owners::count_present(
                 old(parent_owner).children_perm.value(),
             ),
-            final(parent_owner).meta_own.nr_children.value() == old(
+            final(parent_owner).meta().nr_children.value() == old(
                 parent_owner,
-            ).meta_own.nr_children.value(),
+            ).meta().nr_children.value(),
     )]
     pub(in crate::mm) fn protect(&mut self, op: impl FnOnce(PageProperty) -> PageProperty) {
         #[verus_spec(with Tracked(owner), Tracked(parent_owner), Tracked(regions))]
@@ -276,12 +278,14 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
              Tracked(new_owner): Tracked<&mut EntryOwner<C>>,
              Tracked(parent_owner): Tracked<&mut NodeOwner<C>>,
         requires
+            old(parent_owner).is_locked(),
             old(self).invariants(*old(owner), *old(regions)),
             new_child.invariants(*old(new_owner), *old(regions)),
             old(self).node_matching(*old(owner), *old(parent_owner), *old(self).node),
             old(self).new_owner_compatible(new_child, *old(owner), *old(new_owner), *old(regions)),
             old(parent_owner).metaregion_sound_node(*old(regions)),
         ensures
+            final(parent_owner).is_locked(),
             res matches Child::PageTable(node) ==> {
                 &&& node.tracked_slot_perm@ == final(regions).slots[final(owner).node().slot_index]
                 &&& node.tracked_metadata_perm@ is None
@@ -378,27 +382,33 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
                 Tracked(NodeOwner::<C>::tracked_borrow_frame_metadata_perm(
                     &parent_owner.frame_permission,
                 )),
-                Ghost(parent_owner.meta_own.nr_children.id())
+                Ghost(parent_owner.meta().nr_children.id())
             )]
             let nr_children = self.node.nr_children_mut();
-            let _tmp = nr_children.read(Tracked(&parent_owner.meta_own.nr_children));
+            let _tmp = nr_children.read(Tracked(&parent_owner.tracked_borrow_meta().nr_children));
             proof {
                 parent_owner.lemma_nr_children_absent_slot_bound(self.idx);
             }
-            nr_children.write(Tracked(&mut parent_owner.meta_own.nr_children), _tmp + 1);
+            nr_children.write(
+                Tracked(&mut NodeOwner::<C>::tracked_cell_meta_mut(&mut parent_owner.lock_cell).nr_children),
+                _tmp + 1,
+            );
         } else if !old_child.is_none() && new_child.is_none() {
             #[verus_spec(with
                 Tracked(NodeOwner::<C>::tracked_borrow_frame_metadata_perm(
                     &parent_owner.frame_permission,
                 )),
-                Ghost(parent_owner.meta_own.nr_children.id())
+                Ghost(parent_owner.meta().nr_children.id())
             )]
             let nr_children = self.node.nr_children_mut();
-            let _tmp = nr_children.read(Tracked(&parent_owner.meta_own.nr_children));
+            let _tmp = nr_children.read(Tracked(&parent_owner.tracked_borrow_meta().nr_children));
             proof {
                 parent_owner.nr_children_present_slot_bound(self.idx);
             }
-            nr_children.write(Tracked(&mut parent_owner.meta_own.nr_children), _tmp - 1);
+            nr_children.write(
+                Tracked(&mut NodeOwner::<C>::tracked_cell_meta_mut(&mut parent_owner.lock_cell).nr_children),
+                _tmp - 1,
+            );
         }
         #[verus_spec(with Tracked(new_owner))]
         let new_pte = new_child.into_pte();
@@ -514,6 +524,7 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
             Tracked(regions): Tracked<&mut MetaRegionOwners>,
             Tracked(guards): Tracked<&mut Guards>,
         requires
+            old(parent_owner).is_locked(),
             old(self).invariants(old(owner).value(), *old(regions)),
             old(owner).inv(),
             old(owner).value().path.len() == old(owner).level(),
@@ -522,6 +533,7 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
             old(owner).level() + old(parent_owner).level() == INC_LEVELS,
             old(parent_owner).metaregion_sound_node(*old(regions)),
         ensures
+            final(parent_owner).is_locked(),
             final(regions).slots == old(regions).slots,
             final(self).invariants(final(owner).value(), *final(regions)),
             final(self).parent_perms_preserved(*old(parent_owner), *final(parent_owner)),
@@ -638,10 +650,20 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
             };
 
             // Lock before writing the PTE, so no one else can operate on it.
+            proof_decl! {
+                let tracked lock_cell: crate::specs::mm::frame::meta_owners::PtLockCell;
+            }
             let mut pt_lock_guard = {
-                #[verus_spec(with Tracked(new_node_owner.tracked_borrow_value().tracked_borrow_node()), Tracked(guards))]
+                #[verus_spec(with Tracked(new_node_owner.tracked_borrow_value().tracked_borrow_node()), Tracked(guards) => Tracked(lock_cell))]
                 pt_ref.lock(guard)
             };
+            proof {
+                let ghost meta_value = new_node_owner.value().node().meta_value();
+                new_node_owner.tracked_borrow_mut_value().tracked_install_fresh_node_lock_cell(
+                    lock_cell,
+                    meta_value,
+                );
+            }
 
             // SAFETY:
             //  1. The index is within the bounds.
@@ -656,11 +678,14 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
                 Tracked(NodeOwner::<C>::tracked_borrow_frame_metadata_perm(
                     &parent_owner.frame_permission,
                 )),
-                Ghost(parent_owner.meta_own.nr_children.id())
+                Ghost(parent_owner.meta().nr_children.id())
             )]
             let nr_children = self.node.nr_children_mut();
-            let _tmp = nr_children.read(Tracked(&parent_owner.meta_own.nr_children));
-            nr_children.write(Tracked(&mut parent_owner.meta_own.nr_children), _tmp + 1);
+            let _tmp = nr_children.read(Tracked(&parent_owner.tracked_borrow_meta().nr_children));
+            nr_children.write(
+                Tracked(&mut NodeOwner::<C>::tracked_cell_meta_mut(&mut parent_owner.lock_cell).nr_children),
+                _tmp + 1,
+            );
 
             proof {
                 let tracked new_node_value = new_node_owner.tracked_borrow_mut_value();
@@ -742,6 +767,7 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
              Tracked(regions): Tracked<&mut MetaRegionOwners>,
              Tracked(guards): Tracked<&mut Guards>
         requires
+            old(parent_owner).is_locked(),
             old(regions).inv(),
             old(owner).inv(),
             old(owner).value().path.len() == old(owner).level(),
@@ -756,6 +782,7 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
             old(owner).value().is_frame() && old(parent_owner).level() > 1 ==>
                 old(owner).value().metaregion_sound(*old(regions)),
         ensures
+            final(parent_owner).is_locked(),
             old(owner).value().is_frame() && old(parent_owner).level() > 1 ==> {
                 &&& res is Some
                 &&& final(owner).value().is_node()
@@ -810,7 +837,8 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
             *final(final(self).node) == *final(old(self).node),
             final(parent_owner).metaregion_sound_node(*final(regions)),
             final(parent_owner).slot_index == old(parent_owner).slot_index,
-            final(parent_owner).meta_own == old(parent_owner).meta_own,
+            final(parent_owner).meta() == old(parent_owner).meta(),
+            final(parent_owner).cell().lock_const() == old(parent_owner).cell().lock_const(),
             final(parent_owner).frame_permission == old(parent_owner).frame_permission,
             final(regions).slots == old(regions).slots,
             final(self).node.inner.inner@.ptr.addr() == old(self).node.inner.inner@.ptr.addr(),
@@ -907,10 +935,32 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
         };
 
         // Lock before writing the PTE, so no one else can operate on it.
+        proof_decl! {
+            let tracked lock_cell: crate::specs::mm::frame::meta_owners::PtLockCell;
+        }
         let mut pt_lock_guard = {
-            #[verus_spec(with Tracked(new_owner.tracked_borrow_value().tracked_borrow_node()), Tracked(guards))]
+            #[verus_spec(with Tracked(new_owner.tracked_borrow_value().tracked_borrow_node()), Tracked(guards) => Tracked(lock_cell))]
             pt_ref.lock(guard)
         };
+        proof {
+            let ghost meta_value = new_owner.value().node().meta_value();
+            let ghost new_owner_unlocked = new_owner;
+            new_owner.tracked_borrow_mut_value().tracked_install_fresh_node_lock_cell(
+                lock_cell,
+                meta_value,
+            );
+            assert(new_owner.children() == new_owner_unlocked.children());
+            assert(crate::specs::mm::page_table::allocated_empty_node_grandchildren_none(
+                new_owner,
+            )) by {
+                assert forall|i: int, j: int|
+                    0 <= i < NR_ENTRIES && 0 <= j < NR_ENTRIES implies !#[trigger] new_owner.child(
+                    i,
+                ).has_child(j) by {
+                    assert(new_owner.child(i) == new_owner_unlocked.child(i));
+                }
+            }
+        }
 
         let ghost new_owner_path = new_owner.value().path;
         let ghost new_owner_meta_addr = new_owner.value().node().slot_vaddr();
@@ -962,6 +1012,7 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
                 parent_owner.metaregion_sound_node(*regions),
                 *parent_owner == *old(parent_owner),
                 new_owner.value().is_node(),
+                new_owner.value().node().is_locked(),
                 new_owner.inv(),
                 new_owner.value().path == new_owner_path,
                 new_owner.value().node().slot_vaddr() == new_owner_meta_addr,
@@ -1285,6 +1336,7 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
              Tracked(parent_owner): Tracked<&mut NodeOwner<C>>,
              Tracked(regions): Tracked<&MetaRegionOwners>,
         requires
+            old(parent_owner).is_locked(),
             old(owner).inv(),
             old(owner).is_frame(),
             old(owner).match_pte(
@@ -1311,6 +1363,7 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
                 op.ensures((p_in,), p_out) && C::E::new_page_req(pa, level, p_in)
                     ==> C::E::new_page_req(pa, level, p_out),
         ensures
+            final(parent_owner).is_locked(),
             final(owner).inv(),
             final(owner).is_frame(),
             final(owner).match_pte(res, final(parent_owner).level()),
@@ -1323,8 +1376,8 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
             final(parent_owner).slot_index == old(parent_owner).slot_index,
             final(parent_owner).level() == old(parent_owner).level(),
             final(parent_owner).tree_level == old(parent_owner).tree_level,
-            final(parent_owner).meta_own.nr_children.id() == old(parent_owner).meta_own.nr_children.id(),
-            final(parent_owner).meta_own.stray == old(parent_owner).meta_own.stray,
+            final(parent_owner).meta().nr_children.id() == old(parent_owner).meta().nr_children.id(),
+            final(parent_owner).meta().stray == old(parent_owner).meta().stray,
             final(parent_owner).relate_guard(*final(self)),
             final(parent_owner).metaregion_sound_node(*regions),
             final(owner).frame().mapped_pa == old(owner).frame().mapped_pa,
@@ -1400,6 +1453,7 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
              Tracked(new_owner): Tracked<&mut EntryOwner<C>>,
              Tracked(parent_owner): Tracked<&mut NodeOwner<C>>,
         requires
+            old(parent_owner).is_locked(),
             old(owner).inv(),
             old(owner).metaregion_sound(*old(regions)),
             old(owner).match_pte(
@@ -1421,6 +1475,7 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
             },
             old(parent_owner).metaregion_sound_node(*old(regions)),
         ensures
+            final(parent_owner).is_locked(),
             res matches Child::PageTable(node) ==> {
                 &&& node.tracked_slot_perm@ == final(regions).slots[final(owner).node().slot_index]
                 &&& node.tracked_metadata_perm@ is None
@@ -1529,27 +1584,33 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
                 Tracked(NodeOwner::<C>::tracked_borrow_frame_metadata_perm(
                     &parent_owner.frame_permission,
                 )),
-                Ghost(parent_owner.meta_own.nr_children.id())
+                Ghost(parent_owner.meta().nr_children.id())
             )]
             let nr_children = self.nr_children_mut();
-            let _tmp = nr_children.read(Tracked(&parent_owner.meta_own.nr_children));
+            let _tmp = nr_children.read(Tracked(&parent_owner.tracked_borrow_meta().nr_children));
             proof {
                 parent_owner.lemma_nr_children_absent_slot_bound(idx);
             }
-            nr_children.write(Tracked(&mut parent_owner.meta_own.nr_children), _tmp + 1);
+            nr_children.write(
+                Tracked(&mut NodeOwner::<C>::tracked_cell_meta_mut(&mut parent_owner.lock_cell).nr_children),
+                _tmp + 1,
+            );
         } else if !old_child.is_none() && new_child.is_none() {
             #[verus_spec(with
                 Tracked(NodeOwner::<C>::tracked_borrow_frame_metadata_perm(
                     &parent_owner.frame_permission,
                 )),
-                Ghost(parent_owner.meta_own.nr_children.id())
+                Ghost(parent_owner.meta().nr_children.id())
             )]
             let nr_children = self.nr_children_mut();
-            let _tmp = nr_children.read(Tracked(&parent_owner.meta_own.nr_children));
+            let _tmp = nr_children.read(Tracked(&parent_owner.tracked_borrow_meta().nr_children));
             proof {
                 parent_owner.nr_children_present_slot_bound(idx);
             }
-            nr_children.write(Tracked(&mut parent_owner.meta_own.nr_children), _tmp - 1);
+            nr_children.write(
+                Tracked(&mut NodeOwner::<C>::tracked_cell_meta_mut(&mut parent_owner.lock_cell).nr_children),
+                _tmp - 1,
+            );
         }
         #[verus_spec(with Tracked(new_owner))]
         let new_pte = new_child.into_pte();
@@ -1649,6 +1710,7 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
              Tracked(regions): Tracked<&mut MetaRegionOwners>,
              Tracked(guards): Tracked<&mut Guards>,
         requires
+            old(parent_owner).is_locked(),
             old(owner).inv(),
             old(owner).value().path.len() == old(owner).level(),
             old(owner).value().is_absent(),
@@ -1668,6 +1730,7 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
             old(regions).inv(),
             old(regions).slots.contains_key(old(parent_owner).slot_index),
         ensures
+            final(parent_owner).is_locked(),
             final(regions).slots == old(regions).slots,
             final(owner).inv(),
             final(owner).value().is_node(),
@@ -1810,11 +1873,21 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
             PageTableNodeRef::borrow_paddr(paddr)
         };
 
+        proof_decl! {
+            let tracked lock_cell: crate::specs::mm::frame::meta_owners::PtLockCell;
+        }
         let pt_lock_guard = {
             let tracked new_node_value = new_node_owner.tracked_borrow_value();
-            #[verus_spec(with Tracked(new_node_value.tracked_borrow_node()), Tracked(guards))]
+            #[verus_spec(with Tracked(new_node_value.tracked_borrow_node()), Tracked(guards) => Tracked(lock_cell))]
             pt_ref.lock(guard)
         };
+        proof {
+            let ghost meta_value = new_node_owner.value().node().meta_value();
+            new_node_owner.tracked_borrow_mut_value().tracked_install_fresh_node_lock_cell(
+                lock_cell,
+                meta_value,
+            );
+        }
 
         unsafe {
             #[verus_spec(with Tracked(parent_owner), Tracked(&*regions))]
@@ -1825,11 +1898,14 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
             Tracked(NodeOwner::<C>::tracked_borrow_frame_metadata_perm(
                 &parent_owner.frame_permission,
             )),
-            Ghost(parent_owner.meta_own.nr_children.id())
+            Ghost(parent_owner.meta().nr_children.id())
         )]
         let nr_children = self.nr_children_mut();
-        let old_nr_children = nr_children.read(Tracked(&parent_owner.meta_own.nr_children));
-        nr_children.write(Tracked(&mut parent_owner.meta_own.nr_children), old_nr_children + 1);
+        let old_nr_children = nr_children.read(Tracked(&parent_owner.tracked_borrow_meta().nr_children));
+        nr_children.write(
+                Tracked(&mut NodeOwner::<C>::tracked_cell_meta_mut(&mut parent_owner.lock_cell).nr_children),
+                old_nr_children + 1,
+            );
 
         proof {
             crate::specs::mm::page_table::node::owners::lemma_count_present_upto_update(
@@ -1906,6 +1982,7 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
              Tracked(new_owner): Tracked<&mut EntryOwner<C>>,
              Tracked(parent_owner): Tracked<&mut NodeOwner<C>>,
         requires
+            old(parent_owner).is_locked(),
             old(owner).inv(),
             old(owner).is_absent(),
             old(owner).metaregion_sound(*old(regions)),
@@ -1924,6 +2001,7 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
             old(owner).path == old(new_owner).path,
             old(owner).parent_level == old(new_owner).parent_level,
         ensures
+            final(parent_owner).is_locked(),
             final(new_owner).inv(),
             final(parent_owner).inv(),
             *final(owner) == old(owner).from_pte_owner_spec(),
@@ -1938,8 +2016,8 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
             final(parent_owner).slot_index == old(parent_owner).slot_index,
             final(parent_owner).level() == old(parent_owner).level(),
             final(parent_owner).tree_level == old(parent_owner).tree_level,
-            final(parent_owner).meta_own.nr_children.id() == old(parent_owner).meta_own.nr_children.id(),
-            final(parent_owner).meta_own.stray == old(parent_owner).meta_own.stray,
+            final(parent_owner).meta().nr_children.id() == old(parent_owner).meta().nr_children.id(),
+            final(parent_owner).meta().stray == old(parent_owner).meta().stray,
             final(parent_owner).relate_guard(*final(self)),
             final(parent_owner).metaregion_sound_node(*final(regions)),
             *final(regions) == *old(regions),
@@ -1957,14 +2035,17 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
             Tracked(NodeOwner::<C>::tracked_borrow_frame_metadata_perm(
                 &parent_owner.frame_permission,
             )),
-            Ghost(parent_owner.meta_own.nr_children.id())
+            Ghost(parent_owner.meta().nr_children.id())
         )]
         let nr_children = self.nr_children_mut();
-        let old_nr_children = nr_children.read(Tracked(&parent_owner.meta_own.nr_children));
+        let old_nr_children = nr_children.read(Tracked(&parent_owner.tracked_borrow_meta().nr_children));
         proof {
             parent_owner.lemma_nr_children_absent_slot_bound(idx);
         }
-        nr_children.write(Tracked(&mut parent_owner.meta_own.nr_children), old_nr_children + 1);
+        nr_children.write(
+                Tracked(&mut NodeOwner::<C>::tracked_cell_meta_mut(&mut parent_owner.lock_cell).nr_children),
+                old_nr_children + 1,
+            );
 
         #[verus_spec(with Tracked(new_owner))]
         let new_pte = Child::<C>::Frame(paddr, level, prop).into_pte();

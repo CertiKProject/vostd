@@ -1225,6 +1225,7 @@ impl<C: PageTableConfig> PageTableOwner<C> {
     }
 
     /// Every mapping in `view_rec` satisfies `Mapping::inv()`.
+    #[verifier::spinoff_prover]
     pub proof fn lemma_view_rec_mapping_inv(self, path: TreePath<NR_ENTRIES>)
         requires
             self.pt_inv(),
@@ -1350,7 +1351,8 @@ impl<C: PageTableConfig> PageTableOwner<C> {
         requires
             self.pt_inv(),
             self.0.value().is_node(),
-            self.0.value().node().meta_own.nr_children.value() == 0,
+            self.0.value().node().is_locked(),
+            self.0.value().node().meta().nr_children.value() == 0,
             self.0.value().node().count_consistent(),
             path.len() <= INC_LEVELS - 1,
             path.len() == self.0.level(),

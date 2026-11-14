@@ -468,11 +468,11 @@ fn try_traverse_and_lock_subtree_root<'rcu, C: PageTableConfig, A: InAtomicMode>
         #[verus_spec(with
             Tracked(node_owner.tracked_borrow_metadata_perm()),
             Tracked(&()),
-            Ghost(node_owner.meta_own.stray.id())
+            Ghost(node_owner.meta().stray.id())
         )]
         let stray = pt_guard.stray_mut();
         let is_stray = *(stray.borrow(
-            Tracked(&cont.entry_own.tracked_borrow_node().meta_own.stray),
+            Tracked(&cont.entry_own.tracked_borrow_node().tracked_borrow_meta().stray),
         ));
 
         proof {
@@ -547,10 +547,10 @@ fn try_traverse_and_lock_subtree_root<'rcu, C: PageTableConfig, A: InAtomicMode>
     #[verus_spec(with
         Tracked(node_owner.tracked_borrow_metadata_perm()),
         Tracked(&()),
-        Ghost(node_owner.meta_own.stray.id())
+        Ghost(node_owner.meta().stray.id())
     )]
     let stray = pt_guard.stray_mut();
-    let is_stray = *(stray.borrow(Tracked(&cont.entry_own.tracked_borrow_node().meta_own.stray)));
+    let is_stray = *(stray.borrow(Tracked(&cont.entry_own.tracked_borrow_node().tracked_borrow_meta().stray)));
 
     proof {
         cursor_own.continuations.tracked_insert(cursor_own.level - 1, cont);

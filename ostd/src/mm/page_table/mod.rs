@@ -951,6 +951,13 @@ impl PageTable<KernelPtConfig> {
             assert(kernel_owner.0.value().is_node());
             assert(kernel_owner.0.value().metaregion_sound(*regions));
         }
+        // The kernel root is only read below, so its lock cell is not needed.
+        // It is not given back either, since the guard is not dropped (there is
+        // no `Drop` for `PageTableGuard` yet).
+        proof_decl! {
+            let tracked _root_lock_cell: crate::specs::mm::frame::meta_owners::PtLockCell;
+            let tracked new_lock_cell: crate::specs::mm::frame::meta_owners::PtLockCell;
+        }
         let mut root_node = {
             /* The root's counting permission is held by NodeOwner; borrowing
              * with that external permission preserves the pointer and refcount.
@@ -958,7 +965,7 @@ impl PageTable<KernelPtConfig> {
              */
             #[verus_spec(with Tracked(&root_owner.frame_permission), Tracked(&*regions))]
             let root_ref = self.root.borrow_with_permission();
-            #[verus_spec(with Tracked(root_owner), Tracked(guards))]
+            #[verus_spec(with Tracked(root_owner), Tracked(guards) => Tracked(_root_lock_cell))]
             root_ref.lock(preempt_guard)
         };
         let mut new_node: PageTableGuard<'rcu, UserPtConfig> = {
@@ -967,9 +974,12 @@ impl PageTable<KernelPtConfig> {
              */
             #[verus_spec(with Tracked(&new_node_owner.frame_permission), Tracked(&*regions))]
             let new_ref = new_root.borrow_with_permission();
-            #[verus_spec(with Tracked(&new_node_owner), Tracked(guards))]
+            #[verus_spec(with Tracked(&new_node_owner), Tracked(guards) => Tracked(new_lock_cell))]
             new_ref.lock(preempt_guard)
         };
+        proof {
+            new_node_owner.tracked_install_lock_cell(new_lock_cell);
+        }
         let mut i: usize = KernelPtConfig::TOP_LEVEL_INDEX_RANGE().start;
         while i < KernelPtConfig::TOP_LEVEL_INDEX_RANGE().end
             invariant
@@ -986,6 +996,7 @@ impl PageTable<KernelPtConfig> {
                 kernel_owner.metaregion_sound(*regions),
                 // The new node owner's invariants and guard relation.
                 new_node_owner.inv(),
+                new_node_owner.is_locked(),
                 new_node_owner.relate_guard(new_node),
                 regions.contains(new_node_owner.slot_index),
             decreases KernelPtConfig::TOP_LEVEL_INDEX_RANGE().end - i,
@@ -1147,6 +1158,7 @@ impl<C: PageTableConfig> PageTable<C> {
             final(owner)@ is Some,
             final(owner)@->0.inv(),
             (final(owner)@->0).0.value().is_node(),
+            !(final(owner)@->0).0.value().node().is_locked(),
             r.root.ptr.addr() == (final(owner)@->0).0.value().node().slot_vaddr(),
             (final(owner)@->0).0.value().metaregion_sound(*final(regions)),
             r.relates_owner(final(owner)@->0, *final(regions)),
@@ -1612,6 +1624,14 @@ pub trait PageTableEntryTrait:
     proof fn lemma_paddr_is_page_aligned(self)
         ensures
             self.paddr() % PAGE_SIZE == 0,
+    ;
+
+    /// A PTE is determined by its raw value. The ghost PTE model kept by a
+    /// node's lock ([`crate::specs::mm::frame::meta_owners::PteRaws`]) records
+    /// raw values, since the lock's type cannot depend on the configuration.
+    proof fn lemma_as_usize_injective(self, other: Self)
+        ensures
+            self.as_usize_spec() == other.as_usize_spec() ==> self == other,
     ;
 }
 

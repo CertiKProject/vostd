@@ -653,6 +653,9 @@ impl PageTableEntryTrait for PageTableEntry {
         self.0
     }
 
+    proof fn lemma_as_usize_injective(self, other: Self) {
+    }
+
     proof fn lemma_page_table_entry_properties() {
         Self::lemma_layout();
         lemma_page_property_flag_constants();
