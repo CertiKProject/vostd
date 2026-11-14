@@ -27,7 +27,7 @@ use crate::{
     //    task::atomic_mode::InAtomicMode,
 };
 use core::marker::PhantomData;
-use core::ops::Deref;
+use core::ops::{Deref, Range};
 
 verus! {
 
@@ -556,14 +556,14 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
                 &&& MetaSlot::claim_unused_slot_region_spec(
                     final(owner).value().meta_slot_paddr()->0,
                     false, *old(regions), *final(regions))
-                &&& OwnerSubtree::implies(
-                    CursorOwner::<'rcu, C>::node_unlocked(*old(guards)),
-                    CursorOwner::<'rcu, C>::node_unlocked_except(*final(guards), final(owner).value().node().slot_vaddr()))
+                &&& forall|b: Range<Vaddr>| #[trigger] OwnerSubtree::implies(
+                    CursorOwner::<'rcu, C>::node_unlocked(*old(guards), b),
+                    CursorOwner::<'rcu, C>::node_unlocked_except(*final(guards), final(owner).value().node().slot_vaddr(), b))
                 &&& Self::metaregion_sound_neq_preserved(old(owner).value(), final(owner).value(), *old(regions), *final(regions))
                 &&& Self::path_tracked_pred_preserved(*old(regions), *final(regions))
                 &&& old(regions).slots.contains_key(frame_to_index(final(owner).value().meta_slot_paddr()->0))
-                &&& final(owner).subtree_satisfies(final(owner).value().path,
-                    CursorOwner::<'rcu, C>::node_unlocked_except(*final(guards), final(owner).value().node().slot_vaddr()))
+                &&& forall|b: Range<Vaddr>| #[trigger] final(owner).subtree_satisfies(final(owner).value().path,
+                    CursorOwner::<'rcu, C>::node_unlocked_except(*final(guards), final(owner).value().node().slot_vaddr(), b))
                 &&& final(owner).subtree_satisfies(final(owner).value().path, PageTableOwner::<C>::metaregion_sound_pred(*final(regions)))
                 &&& final(owner).subtree_satisfies(final(owner).value().path, PageTableOwner::<C>::path_tracked_pred(*final(regions)))
                 &&& PageTableOwner(*final(owner)).view_rec(final(owner).value().path) == set![]
@@ -708,10 +708,6 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
                     self.pte,
                 );
 
-                let f_nu = CursorOwner::<'rcu, C>::node_unlocked_except(
-                    *guards,
-                    owner.value().node().slot_vaddr(),
-                );
                 let f_ms = PageTableOwner::<C>::metaregion_sound_pred(*regions);
                 let f_pt = PageTableOwner::<C>::path_tracked_pred(*regions);
                 Entry::<C>::lemma_allocated_node_preserves_disjoint_entries(
@@ -721,11 +717,24 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
                     *regions,
                 );
 
-                crate::specs::mm::page_table::lemma_fresh_node_subtree_satisfies(
-                    *owner,
+                assert forall|b: Range<Vaddr>| #[trigger] owner.subtree_satisfies(
                     owner.value().path,
-                    f_nu,
-                );
+                    CursorOwner::<'rcu, C>::node_unlocked_except(
+                        *guards,
+                        owner.value().node().slot_vaddr(),
+                        b,
+                    ),
+                ) by {
+                    crate::specs::mm::page_table::lemma_fresh_node_subtree_satisfies(
+                        *owner,
+                        owner.value().path,
+                        CursorOwner::<'rcu, C>::node_unlocked_except(
+                            *guards,
+                            owner.value().node().slot_vaddr(),
+                            b,
+                        ),
+                    );
+                }
                 crate::specs::mm::page_table::lemma_fresh_node_subtree_satisfies(
                     *owner,
                     owner.value().path,
@@ -809,14 +818,14 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
                             + j * page_size::<PagingConsts>((old(parent_owner).level() - 1) as PagingLevel)
                 &&& final(owner).value().path == old(owner).value().path
                 &&& final(owner).value().metaregion_sound(*final(regions))
-                &&& OwnerSubtree::implies(
-                    CursorOwner::<'rcu, C>::node_unlocked(*old(guards)),
-                    CursorOwner::<'rcu, C>::node_unlocked_except(*final(guards), final(owner).value().node().slot_vaddr()))
+                &&& forall|b: Range<Vaddr>| #[trigger] OwnerSubtree::implies(
+                    CursorOwner::<'rcu, C>::node_unlocked(*old(guards), b),
+                    CursorOwner::<'rcu, C>::node_unlocked_except(*final(guards), final(owner).value().node().slot_vaddr(), b))
                 &&& OwnerSubtree::implies(
                     PageTableOwner::<C>::metaregion_sound_pred(*old(regions)),
                     PageTableOwner::<C>::metaregion_sound_pred(*final(regions)))
-                &&& final(owner).subtree_satisfies(final(owner).value().path,
-                    CursorOwner::<'rcu, C>::node_unlocked_except(*final(guards), final(owner).value().node().slot_vaddr()))
+                &&& forall|b: Range<Vaddr>| #[trigger] final(owner).subtree_satisfies(final(owner).value().path,
+                    CursorOwner::<'rcu, C>::node_unlocked_except(*final(guards), final(owner).value().node().slot_vaddr(), b))
                 &&& final(owner).subtree_satisfies(final(owner).value().path,
                     PageTableOwner::<C>::metaregion_sound_pred(*final(regions)))
             },
@@ -1249,14 +1258,24 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
                 *old(regions),
                 *regions,
             );
-            crate::specs::mm::page_table::lemma_fresh_node_subtree_satisfies(
-                *owner,
+            assert forall|b: Range<Vaddr>| #[trigger] owner.subtree_satisfies(
                 owner.value().path,
                 CursorOwner::<'rcu, C>::node_unlocked_except(
                     *guards,
                     owner.value().node().slot_vaddr(),
+                    b,
                 ),
-            );
+            ) by {
+                crate::specs::mm::page_table::lemma_fresh_node_subtree_satisfies(
+                    *owner,
+                    owner.value().path,
+                    CursorOwner::<'rcu, C>::node_unlocked_except(
+                        *guards,
+                        owner.value().node().slot_vaddr(),
+                        b,
+                    ),
+                );
+            }
             crate::specs::mm::page_table::lemma_fresh_node_subtree_satisfies(
                 *owner,
                 owner.value().path,
@@ -1745,9 +1764,9 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
                 final(parent_owner).level(),
             ),
             final(guards).lock_held(final(owner).value().node().slot_vaddr()),
-            OwnerSubtree::implies(
-                CursorOwner::<'rcu, C>::node_unlocked(*old(guards)),
-                CursorOwner::<'rcu, C>::node_unlocked_except(*final(guards), final(owner).value().node().slot_vaddr())),
+            forall|b: Range<Vaddr>| #[trigger] OwnerSubtree::implies(
+                CursorOwner::<'rcu, C>::node_unlocked(*old(guards), b),
+                CursorOwner::<'rcu, C>::node_unlocked_except(*final(guards), final(owner).value().node().slot_vaddr(), b)),
             Entry::<C>::metaregion_sound_neq_preserved(
                 old(owner).value(),
                 final(owner).value(),
@@ -1756,8 +1775,8 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
             ),
             Entry::<C>::path_tracked_pred_preserved(*old(regions), *final(regions)),
             old(regions).slots.contains_key(frame_to_index(final(owner).value().meta_slot_paddr()->0)),
-            final(owner).subtree_satisfies(final(owner).value().path,
-                CursorOwner::<'rcu, C>::node_unlocked_except(*final(guards), final(owner).value().node().slot_vaddr())),
+            forall|b: Range<Vaddr>| #[trigger] final(owner).subtree_satisfies(final(owner).value().path,
+                CursorOwner::<'rcu, C>::node_unlocked_except(*final(guards), final(owner).value().node().slot_vaddr(), b)),
             final(owner).subtree_satisfies(final(owner).value().path, PageTableOwner::<C>::metaregion_sound_pred(*final(regions))),
             final(owner).subtree_satisfies(final(owner).value().path, PageTableOwner::<C>::path_tracked_pred(*final(regions))),
             PageTableOwner(*final(owner)).view_rec(final(owner).value().path) == set![],
@@ -1937,7 +1956,6 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
             new_meta_slot.paths_in_pt = set![owner.value().path];
 
             let ghost new_node_addr = owner.value().node().slot_vaddr();
-            let f_nu = CursorOwner::<'rcu, C>::node_unlocked_except(*guards, new_node_addr);
             let f_ms = PageTableOwner::<C>::metaregion_sound_pred(*regions);
             let f_pt = PageTableOwner::<C>::path_tracked_pred(*regions);
             Entry::<C>::lemma_allocated_node_preserves_disjoint_entries(
@@ -1947,11 +1965,16 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
                 *regions,
             );
 
-            crate::specs::mm::page_table::lemma_fresh_node_subtree_satisfies(
-                *owner,
+            assert forall|b: Range<Vaddr>| #[trigger] owner.subtree_satisfies(
                 owner.value().path,
-                f_nu,
-            );
+                CursorOwner::<'rcu, C>::node_unlocked_except(*guards, new_node_addr, b),
+            ) by {
+                crate::specs::mm::page_table::lemma_fresh_node_subtree_satisfies(
+                    *owner,
+                    owner.value().path,
+                    CursorOwner::<'rcu, C>::node_unlocked_except(*guards, new_node_addr, b),
+                );
+            }
             crate::specs::mm::page_table::lemma_fresh_node_subtree_satisfies(
                 *owner,
                 owner.value().path,

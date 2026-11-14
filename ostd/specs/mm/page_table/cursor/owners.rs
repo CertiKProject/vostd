@@ -362,8 +362,6 @@ impl<'rcu, C: PageTableConfig> CursorContinuation<'rcu, C> {
         &&& self.entry_own.is_node()
         &&& self.entry_own.inv()
         &&& self.entry_own.node().relate_guard(self.guard)
-        // The cursor holds the lock of every node on its path.
-        &&& self.entry_own.node().is_locked()
         &&& self.tree_level == INC_LEVELS - self.level() - 1
         &&& self.tree_level < INC_LEVELS - 1
         &&& self.path().len() == self.tree_level
@@ -392,8 +390,11 @@ impl<'rcu, C: PageTableConfig> CursorContinuation<'rcu, C> {
         self.idx = (self.idx + 1) as usize;
     }
 
+    /// The cursor holds this node's lock: its guard is recorded in `guards`,
+    /// and the lock cell is in the owner.
     pub open spec fn node_locked(self, guards: Guards) -> bool {
-        guards.lock_held(self.guard.inner.inner@.ptr.addr())
+        &&& guards.lock_held(self.guard.inner.inner@.ptr.addr())
+        &&& self.entry_own.node().is_locked()
     }
 
     pub open spec fn view_mappings(self) -> Set<Mapping> {
@@ -530,7 +531,6 @@ impl<'rcu, C: PageTableConfig> CursorContinuation<'rcu, C> {
             self.entry_own.is_node(),
             self.entry_own.inv(),
             self.entry_own.node().relate_guard(self.guard),
-            self.entry_own.node().is_locked(),
             self.entry_own.node().level() == parent_old.level(),
             self.entry_own.node().tree_level == parent_old.tree_level,
             // Other PTEs preserved (operation only touched the entry at idx)
@@ -802,31 +802,45 @@ impl<'rcu, C: PageTableConfig> Inv for CursorOwner<'rcu, C> {
 }
 
 impl<'rcu, C: PageTableConfig> CursorOwner<'rcu, C> {
-    pub open spec fn node_unlocked(guards: Guards) -> (spec_fn(
+    /// Whether the VA range of the entry at `path` overlaps `barrier`. An
+    /// entry's range is the part of the address space its parent maps through it.
+    pub open spec fn overlaps_barrier(
+        owner: EntryOwner<C>,
+        path: TreePath<NR_ENTRIES>,
+        barrier: Range<Vaddr>,
+    ) -> bool {
+        &&& (vaddr_of::<C>(path) as int) < barrier.end
+        &&& barrier.start < vaddr_of::<C>(path) as int + page_size::<C>(owner.parent_level) as int
+    }
+
+    /// A node below the cursor's path has no live guard, and if its VA range
+    /// overlaps the cursor's `barrier` range the cursor holds its lock cell:
+    /// those are the nodes [`dfs_acquire_lock`] locked when the cursor was
+    /// created, and the nodes the cursor has allocated in the range since.
+    /// Nodes outside the range may be locked by other cursors.
+    ///
+    /// [`dfs_acquire_lock`]: crate::mm::page_table::cursor::locking
+    pub open spec fn node_unlocked(guards: Guards, barrier: Range<Vaddr>) -> (spec_fn(
         EntryOwner<C>,
         TreePath<NR_ENTRIES>,
     ) -> bool) {
         |owner: EntryOwner<C>, path: TreePath<NR_ENTRIES>|
             owner.is_node() ==> {
                 &&& guards.unlocked(owner.node().slot_vaddr())
-                // No guard exists for the node, but its lock is held by this
-                // cursor, so its lock cell is in the owner. (As elsewhere in
-                // the cursor model, the cursor is treated as owning its whole
-                // tree; see `lock_range`.)
-                &&& owner.node().is_locked()
+                &&& Self::overlaps_barrier(owner, path, barrier) ==> owner.node().is_locked()
             }
     }
 
-    pub open spec fn node_unlocked_except(guards: Guards, addr: usize) -> (spec_fn(
-        EntryOwner<C>,
-        TreePath<NR_ENTRIES>,
-    ) -> bool) {
+    /// [`Self::node_unlocked`], except that the node at `addr` may have a guard.
+    pub open spec fn node_unlocked_except(
+        guards: Guards,
+        addr: usize,
+        barrier: Range<Vaddr>,
+    ) -> (spec_fn(EntryOwner<C>, TreePath<NR_ENTRIES>) -> bool) {
         |owner: EntryOwner<C>, path: TreePath<NR_ENTRIES>|
             owner.is_node() ==> {
-                &&& owner.node().slot_vaddr() != addr ==> guards.unlocked(
-                    owner.node().slot_vaddr(),
-                )
-                &&& owner.node().is_locked()
+                &&& owner.node().slot_vaddr() != addr ==> guards.unlocked(owner.node().slot_vaddr())
+                &&& Self::overlaps_barrier(owner, path, barrier) ==> owner.node().is_locked()
             }
     }
 
@@ -839,8 +853,49 @@ impl<'rcu, C: PageTableConfig> CursorOwner<'rcu, C> {
             self.level - 1 <= i < NR_LEVELS ==> { self.continuations[i].map_children(f) }
     }
 
+    /// The cursor holds the lock cell of its current node.
+    pub proof fn lemma_cur_node_locked(self, guards: Guards)
+        requires
+            self.nodes_locked(guards),
+            1 <= self.level <= self.guard_level,
+        ensures
+            self.continuations[self.level - 1].entry_own.node().is_locked(),
+    {
+        assert(self.continuations[self.level - 1].node_locked(guards));
+    }
+
+    /// While the cursor is in its barrier range, the entry it points to overlaps
+    /// the barrier range, so if it is a node the cursor holds its lock cell.
+    pub proof fn lemma_cur_entry_overlaps_barrier(self)
+        requires
+            self.inv(),
+            self.in_barrier_va(),
+        ensures
+            Self::overlaps_barrier(
+                self.cur_entry_owner(),
+                self.continuations[self.level - 1].path().push_tail(self.index() as int),
+                self.barrier_va,
+            ),
+    {
+        let cont = self.continuations[self.level - 1];
+        self.cur_va_in_subtree_range();
+        self.lemma_inv_continuation(self.level - 1);
+        cont.lemma_inv_children_rel_unroll(self.index() as int);
+        C::lemma_paging_consts_properties();
+        C::axiom_current_paging_consts_hardcoded();
+        crate::specs::arch::lemma_arch_specific_consts_properties::<C>();
+        crate::specs::mm::page_table::cursor::page_size_lemmas::lemma_page_size_is_pow2_pte_index_bit_offset::<C>(
+            self.level,
+        );
+        crate::specs::mm::page_table::cursor::page_size_lemmas::lemma_page_size_spec_values();
+        vstd::arithmetic::power2::lemma2_to64();
+        assert(self.cur_entry_owner().parent_level == self.level);
+        assert(page_size::<C>(self.level) == page_size::<PagingConsts>(self.level));
+        assert(self.cur_subtree().value().path == cont.path().push_tail(self.index() as int));
+    }
+
     pub open spec fn children_not_locked(self, guards: Guards) -> bool {
-        self.map_full_tree(Self::node_unlocked(guards))
+        self.map_full_tree(Self::node_unlocked(guards, self.barrier_va))
     }
 
     pub proof fn lemma_children_not_locked_unroll(self, guards: Guards)
@@ -850,14 +905,18 @@ impl<'rcu, C: PageTableConfig> CursorOwner<'rcu, C> {
             forall|i: int|
                 #![trigger self.continuations[i]]
                 self.level - 1 <= i < NR_LEVELS ==> self.continuations[i].map_children(
-                    Self::node_unlocked(guards),
+                    Self::node_unlocked(guards, self.barrier_va),
                 ),
     {
     }
 
     pub open spec fn only_current_locked(self, guards: Guards) -> bool {
         self.map_full_tree(
-            Self::node_unlocked_except(guards, self.cur_entry_owner().node().slot_vaddr()),
+            Self::node_unlocked_except(
+                guards,
+                self.cur_entry_owner().node().slot_vaddr(),
+                self.barrier_va,
+            ),
         )
     }
 
@@ -878,8 +937,8 @@ impl<'rcu, C: PageTableConfig> CursorOwner<'rcu, C> {
             self.children_not_locked(guards1),
     {
         let current_addr = self.cur_entry_owner().node().slot_vaddr();
-        let f = Self::node_unlocked_except(guards0, current_addr);
-        let g = Self::node_unlocked(guards1);
+        let f = Self::node_unlocked_except(guards0, current_addr, self.barrier_va);
+        let g = Self::node_unlocked(guards1, self.barrier_va);
 
         self.lemma_map_children_implies(f, g);
     }

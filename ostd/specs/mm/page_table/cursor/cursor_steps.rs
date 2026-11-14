@@ -43,6 +43,7 @@ pub proof fn subtree_unlock_upgrade<'rcu, C: PageTableConfig>(
     regions: MetaRegionOwners,
     excepted_addr: usize,
     excepted_path: TreePath<NR_ENTRIES>,
+    barrier: Range<Vaddr>,
 )
     requires
         subtree.inv(),
@@ -50,7 +51,7 @@ pub proof fn subtree_unlock_upgrade<'rcu, C: PageTableConfig>(
         subtree.subtree_satisfies(path, PageTableOwner::<C>::metaregion_sound_pred(regions)),
         subtree.subtree_satisfies(
             path,
-            CursorOwner::<'rcu, C>::node_unlocked_except(guards, excepted_addr),
+            CursorOwner::<'rcu, C>::node_unlocked_except(guards, excepted_addr, barrier),
         ),
         regions.slot_owners[meta_to_index(excepted_addr)].paths_in_pt == set![excepted_path],
         // Structural path == value path
@@ -64,13 +65,13 @@ pub proof fn subtree_unlock_upgrade<'rcu, C: PageTableConfig>(
         excepted_path.len() <= path.len() || (exists|k: int|
             0 <= k < path.len() && #[trigger] excepted_path[k] != path[k]),
     ensures
-        subtree.subtree_satisfies(path, CursorOwner::<'rcu, C>::node_unlocked(guards)),
+        subtree.subtree_satisfies(path, CursorOwner::<'rcu, C>::node_unlocked(guards, barrier)),
     decreases INC_LEVELS - subtree.level(),
 {
     reveal(PageTableOwner::pt_inv_at_depth);
     let f = PageTableOwner::<C>::metaregion_sound_pred(regions);
-    let g = CursorOwner::<'rcu, C>::node_unlocked_except(guards, excepted_addr);
-    let h = CursorOwner::<'rcu, C>::node_unlocked(guards);
+    let g = CursorOwner::<'rcu, C>::node_unlocked_except(guards, excepted_addr, barrier);
+    let h = CursorOwner::<'rcu, C>::node_unlocked(guards, barrier);
 
     if subtree.value().is_node() {
         if subtree.value().node().slot_vaddr() == excepted_addr {
@@ -92,14 +93,14 @@ pub proof fn subtree_unlock_upgrade<'rcu, C: PageTableConfig>(
 
             let child_path = path.push_tail(i);
 
-            subtree_unlock_upgrade(
-                child,
+            subtree_unlock_upgrade(child,
                 child_path,
                 guards,
                 regions,
                 excepted_addr,
                 excepted_path,
-            );
+                    barrier,
+                );
         };
     } else if subtree.level() < INC_LEVELS - 1 && !subtree.value().is_node() {
         // Non-node: pt_inv gives children[i] is None, so subtree_satisfies
@@ -404,9 +405,11 @@ impl<'rcu, C: PageTableConfig> CursorOwner<'rcu, C> {
             }
         };
 
-        // `only_current_locked` says the current child node is held.
+        // The current child node overlaps the barrier range, so
+        // `only_current_locked` says the cursor holds its lock cell.
         assert(cur_entry.node().is_locked()) by {
-            let g = CursorOwner::<'rcu, C>::node_unlocked_except(guards, cur_entry_addr);
+            self.lemma_cur_entry_overlaps_barrier();
+            let g = CursorOwner::<'rcu, C>::node_unlocked_except(guards, cur_entry_addr, self.barrier_va);
             assert(old_cont.map_children(g));
             assert(old_cont.children[old_cont.idx as int] is Some);
             assert(old_cont.children[old_cont.idx as int]->0.subtree_satisfies(
@@ -418,8 +421,8 @@ impl<'rcu, C: PageTableConfig> CursorOwner<'rcu, C> {
         self.push_level_owner_preserves_inv(guard);
 
         let f = PageTableOwner::<C>::metaregion_sound_pred(regions);
-        let g_except = CursorOwner::<'rcu, C>::node_unlocked_except(guards, cur_entry_addr);
-        let h = CursorOwner::<'rcu, C>::node_unlocked(guards);
+        let g_except = CursorOwner::<'rcu, C>::node_unlocked_except(guards, cur_entry_addr, self.barrier_va);
+        let h = CursorOwner::<'rcu, C>::node_unlocked(guards, self.barrier_va);
 
         assert forall|i: int|
             #![trigger new_owner.continuations[i]]
@@ -446,6 +449,7 @@ impl<'rcu, C: PageTableConfig> CursorOwner<'rcu, C> {
                         regions,
                         cur_entry_addr,
                         cur_entry_path,
+                        self.barrier_va,
                     );
                 };
             } else if i == self.level - 1 {
@@ -464,6 +468,7 @@ impl<'rcu, C: PageTableConfig> CursorOwner<'rcu, C> {
                         regions,
                         cur_entry_addr,
                         cur_entry_path,
+                        self.barrier_va,
                     );
                 };
             } else {
@@ -486,6 +491,7 @@ impl<'rcu, C: PageTableConfig> CursorOwner<'rcu, C> {
                         regions,
                         cur_entry_addr,
                         cur_entry_path,
+                        self.barrier_va,
                     );
                 };
             }
@@ -565,6 +571,7 @@ impl<'rcu, C: PageTableConfig> CursorOwner<'rcu, C> {
         requires
             self.inv(),
             self.level < NR_LEVELS,
+            self.level <= self.guard_level,
             self.children_not_locked(guards),
             self.nodes_locked(guards),
             self.metaregion_sound(regions),
@@ -577,10 +584,12 @@ impl<'rcu, C: PageTableConfig> CursorOwner<'rcu, C> {
         reveal(PageTableOwner::pt_inv_at_depth);
         let child = self.continuations[self.level - 1];
         let child_addr = child.entry_own.node().slot_vaddr();
+        // The child goes back below its parent; the cursor holds its lock cell.
+        assert(child.node_locked(guards));
 
         self.lemma_map_children_implies(
-            CursorOwner::<'rcu, C>::node_unlocked(guards),
-            CursorOwner::<'rcu, C>::node_unlocked_except(guards, child_addr),
+            CursorOwner::<'rcu, C>::node_unlocked(guards, self.barrier_va),
+            CursorOwner::<'rcu, C>::node_unlocked_except(guards, child_addr, self.barrier_va),
         );
         reveal(CursorContinuation::map_children);
         reveal(CursorOwner::path_metaregion_sound);

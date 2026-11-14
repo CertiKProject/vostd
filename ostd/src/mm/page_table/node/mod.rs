@@ -66,7 +66,7 @@ use crate::{
     specs::task::InAtomicMode,
 };
 pub use child::*;
-use core::{marker::PhantomData, ops::Deref, sync::atomic::Ordering};
+use core::{marker::PhantomData, ops::{Deref, Range}, sync::atomic::Ordering};
 pub use entry::*;
 
 verus! {
@@ -331,9 +331,9 @@ impl<'a, C: PageTableConfig> PageTableNodeRef<'a, C> {
         guards0: Guards,
         guards1: Guards,
     ) -> bool {
-        &&& OwnerSubtree::implies(
-            CursorOwner::<'rcu, C>::node_unlocked(guards0),
-            CursorOwner::<'rcu, C>::node_unlocked_except(guards1, addr),
+        &&& forall|b: Range<Vaddr>| #[trigger] OwnerSubtree::implies(
+            CursorOwner::<'rcu, C>::node_unlocked(guards0, b),
+            CursorOwner::<'rcu, C>::node_unlocked_except(guards1, addr, b),
         )
         &&& forall|i: usize| guards0.lock_held(i) ==> guards1.lock_held(i)
         &&& forall|i: usize| guards0.unlocked(i) && i != addr ==> guards1.unlocked(i)
