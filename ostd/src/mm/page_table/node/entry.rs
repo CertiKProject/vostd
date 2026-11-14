@@ -1321,9 +1321,11 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
         with Tracked(owner): Tracked<&EntryOwner<C>>,
              Tracked(parent_owner): Tracked<&NodeOwner<C>>,
              Tracked(regions): Tracked<&MetaRegionOwners>,
+             Tracked(perm): Tracked<&vstd_extra::array_ptr::PointsTo<usize, NR_ENTRIES>>,
         requires
             owner.inv(),
             parent_owner.inv(),
+            parent_owner.is_pte_perm(*perm),
             parent_owner.relate_guard(*guard),
             idx < NR_ENTRIES,
             owner.match_pte(parent_owner.ptes()[idx as int], owner.parent_level),
@@ -1341,7 +1343,7 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
     pub(in crate::mm) unsafe fn new_at(guard: &'a mut PageTableGuard<'rcu, C>, idx: usize) -> Self {
         // SAFETY: The index is within the bound.
         let pte = unsafe {
-            #[verus_spec(with Tracked(parent_owner), Tracked(regions))]
+            #[verus_spec(with Tracked(parent_owner), Tracked(regions), Tracked(perm))]
             guard.read_pte(idx)
         };
         Self::new(pte, idx, guard)
@@ -1422,7 +1424,7 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
     ) -> C::E {
         let ghost cp_old = parent_owner.ptes();
         let mut pte = unsafe {
-            #[verus_spec(with Tracked(&*parent_owner), Tracked(regions))]
+            #[verus_spec(with Tracked(&*parent_owner), Tracked(regions), Tracked(parent_owner.tracked_borrow_perm()))]
             self.read_pte(idx)
         };
 
@@ -1583,7 +1585,7 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
         }
 
         let pte = unsafe {
-            #[verus_spec(with Tracked(&*parent_owner), Tracked(&*regions))]
+            #[verus_spec(with Tracked(&*parent_owner), Tracked(&*regions), Tracked(parent_owner.tracked_borrow_perm()))]
             self.read_pte(idx)
         };
 

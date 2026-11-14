@@ -7,6 +7,7 @@ use vstd::{
     simple_pptr::*,
 };
 use vstd_extra::{
+    array_ptr,
     cast_ptr::{self, Repr},
     ghost_tree::TreePath,
     ownership::*,
@@ -132,6 +133,9 @@ pub tracked struct PtLockPayload {
     /// The authoritative half of the PTE model. The other half
     /// (`NodeOwner::pte_view`) stays with the page table tree.
     pub pte_auth: GhostVarAuth<PteRaws>,
+    /// The permission for the node's PTE array, as raw values. Whoever holds
+    /// the lock may read and write the PTEs.
+    pub ptes: array_ptr::PointsTo<usize, NR_ENTRIES>,
 }
 
 impl LockedValue for PtLockPayload {
@@ -170,6 +174,10 @@ impl LockedValue for PtLockPayload {
         &&& self.meta.inv()
         &&& self.pt_level + level == NR_LEVELS
         &&& self.meta.nr_children.value() == count_where(self.is_present, self.pte_auth@)
+        &&& self.ptes.wf()
+        &&& self.ptes.is_init_all()
+        &&& self.ptes.value() == self.pte_auth@
+        &&& self.ptes.addr() == crate::mm::paddr_to_vaddr(self.paddr)
     }
 }
 

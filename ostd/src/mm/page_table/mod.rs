@@ -951,11 +951,12 @@ impl PageTable<KernelPtConfig> {
             assert(kernel_owner.0.value().is_node());
             assert(kernel_owner.0.value().metaregion_sound(*regions));
         }
-        // The kernel root is only read below, so its lock cell is not needed.
-        // It is not given back either, since the guard is not dropped (there is
-        // no `Drop` for `PageTableGuard` yet).
+        // The kernel page table's owner is shared, so the kernel root's lock cell
+        // cannot be installed in it. It is held here instead, and provides the
+        // permission to read the root's PTEs. It is not given back, since the
+        // guard is not dropped (there is no `Drop` for `PageTableGuard` yet).
         proof_decl! {
-            let tracked _root_lock_cell: crate::specs::mm::frame::meta_owners::PtLockCell;
+            let tracked root_lock_cell: crate::specs::mm::frame::meta_owners::PtLockCell;
             let tracked new_lock_cell: crate::specs::mm::frame::meta_owners::PtLockCell;
         }
         let mut root_node = {
@@ -965,7 +966,7 @@ impl PageTable<KernelPtConfig> {
              */
             #[verus_spec(with Tracked(&root_owner.frame_permission), Tracked(&*regions))]
             let root_ref = self.root.borrow_with_permission();
-            #[verus_spec(with Tracked(root_owner), Tracked(guards) => Tracked(_root_lock_cell))]
+            #[verus_spec(with Tracked(root_owner), Tracked(guards) => Tracked(root_lock_cell))]
             root_ref.lock(preempt_guard)
         };
         let mut new_node: PageTableGuard<'rcu, UserPtConfig> = {
@@ -992,6 +993,7 @@ impl PageTable<KernelPtConfig> {
                 // Lock postcondition for the kernel root.
                 *root_owner == kernel_owner.0.value().node(),
                 root_owner.relate_guard(root_node),
+                root_owner.is_pte_perm(root_lock_cell.value().ptes),
                 // Tree-wide soundness of the kernel page table.
                 kernel_owner.metaregion_sound(*regions),
                 // The new node owner's invariants and guard relation.
@@ -1043,7 +1045,10 @@ impl PageTable<KernelPtConfig> {
                 assert(entry_owner.metaregion_sound(*regions));
             }
 
-            #[verus_spec(with Tracked(root_owner), Tracked(entry_owner), Tracked(&*regions))]
+            // The kernel root's PTE array permission comes from the lock cell
+            // taken above, since the kernel page table's owner is shared.
+            #[verus_spec(with Tracked(root_owner), Tracked(entry_owner), Tracked(&*regions),
+                Tracked(&root_lock_cell.tracked_borrow_value().ptes))]
             let root_entry = root_node.entry(i);
             let ghost pre_to_ref_regions: MetaRegionOwners = *regions;
             #[verus_spec(with Tracked(entry_owner), Tracked(root_owner), Tracked(regions))]

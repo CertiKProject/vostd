@@ -350,6 +350,8 @@ pub open spec fn locked_subtree_ready<'rcu, C: PageTableConfig>(
     let ps_up = page_size::<PagingConsts>((level + 1) as PagingLevel);
     let node_va = nat_align_down(va.start as nat, ps_up as nat) as Vaddr;
     &&& cont.all_some()
+    // The root's lock cell is held: it was just locked.
+    &&& cont.entry_own.node().is_locked()
     &&& PageTableOwner(t).metaregion_sound(regions)
     &&& children_unguarded(t, guards)
     &&& 1 <= level <= NR_LEVELS
@@ -823,6 +825,7 @@ proof fn lemma_dfs_child_range(level: PagingLevel, node_va: Vaddr, va_range: Ran
         PageTableOwner(*old(subtree)).pt_inv(),
         PageTableOwner(*old(subtree)).metaregion_sound(*old(regions)),
         old(subtree).value().is_node(),
+        old(subtree).value().node().is_locked(),
         old(subtree).value().node().relate_guard(*old(cur_node)),
         children_unguarded(*old(subtree), *old(guards)),
         dfs_range_ok(old(subtree).value().node().level(), cur_node_va, va_range),
@@ -945,7 +948,8 @@ fn dfs_acquire_lock<'rcu, C: PageTableConfig, A: InAtomicMode>(
         let child = {
             let tracked parent_owner = subtree.tracked_borrow_value().tracked_borrow_node();
             let tracked child_owner = subtree.tracked_borrow_child(i as int).tracked_borrow_value();
-            #[verus_spec(with Tracked(parent_owner), Tracked(child_owner), Tracked(&*regions))]
+            #[verus_spec(with Tracked(parent_owner), Tracked(child_owner), Tracked(&*regions),
+                Tracked(parent_owner.tracked_borrow_perm()))]
             cur_node.entry(i)
         };
         let child_ref = {
@@ -1258,7 +1262,7 @@ proof fn lemma_cell_child_key<C: PageTableConfig>(
     let node = t.value().node();
     let pte = node.ptes()[i];
     reveal(PageTablePageMeta::lock_consts_wf);
-    assert(node.pte_auth()@[i] == node.children_perm.value()[i]);
+    assert(node.pte_auth()@[i] == node.pte_view@[i]);
     if t.child(i).value().is_node() {
         assert(t.child(i).value().node().inv());
     }
@@ -1287,12 +1291,10 @@ proof fn lemma_locked_cells_wf<C: PageTableConfig>(
     assert(<EntryOwner<C> as TreeNodeValue<INC_LEVELS>>::la_inv(t.value(), t.level()));
     assert(t.value().metaregion_sound(regions));
     reveal(PageTablePageMeta::lock_consts_wf);
-    lemma_count_where_raw::<C::E>(
-        node.children_perm.value(),
-        node.children_perm.value().len() as int,
-    );
+    lemma_count_where_raw::<C::E>(node.pte_view@, node.pte_view@.len() as int);
     assert(lt.value() == node.cell());
     assert(lt.level() == lvl);
+    reveal(lock_key_wf);
     assert(lt.value().inv_cell());
     assert forall|i: int|
         #![trigger lt.children()[i]]
@@ -1658,7 +1660,8 @@ unsafe fn dfs_release_lock<'rcu, C: PageTableConfig, A: InAtomicMode>(
         let child = {
             let tracked parent_owner = subtree.tracked_borrow_value().tracked_borrow_node();
             let tracked child_owner = subtree.tracked_borrow_child(i as int).tracked_borrow_value();
-            #[verus_spec(with Tracked(parent_owner), Tracked(child_owner), Tracked(&*regions))]
+            #[verus_spec(with Tracked(parent_owner), Tracked(child_owner), Tracked(&*regions),
+                Tracked(parent_owner.tracked_borrow_perm()))]
             cur_node.entry(i)
         };
         let child_ref = {

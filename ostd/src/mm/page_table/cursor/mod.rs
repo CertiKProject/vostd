@@ -433,6 +433,9 @@ impl<'rcu, C: PageTableConfig, A: InAtomicMode> Cursor<'rcu, C, A> {
         loop {
             let cur_va = self.va;
             let level = self.level;
+            proof {
+                owner.lemma_cur_node_locked(*guards);
+            }
 
             #[verus_spec(with Tracked(owner), Tracked(regions))]
             let entry = self.cur_entry();
@@ -906,6 +909,9 @@ impl<'rcu, C: PageTableConfig, A: InAtomicMode> Cursor<'rcu, C, A> {
                     CursorOwner::node_unlocked(*guards, owner.barrier_va),
                     cont.idx as int,
                 );
+            }
+            proof {
+                owner.lemma_cur_node_locked(*guards);
             }
             #[verus_spec(with Tracked(owner), Tracked(regions))]
             let mut cur_entry = self.cur_entry();
@@ -1752,6 +1758,8 @@ impl<'rcu, C: PageTableConfig, A: InAtomicMode> Cursor<'rcu, C, A> {
             old(self).path[old(self).level - 1] is Some,
             old(owner).metaregion_sound(*regions),
             regions.inv(),
+            // The cursor holds the current node's lock cell.
+            old(owner).continuations[old(owner).level - 1].entry_own.node().is_locked(),
         ensures
             final(owner).inv(),
             final(self).inv(),
@@ -1795,7 +1803,8 @@ impl<'rcu, C: PageTableConfig, A: InAtomicMode> Cursor<'rcu, C, A> {
         let res = {
             let tracked child_value = child.tracked_borrow_value();
             #[verus_spec(with Tracked(&parent_own),
-                Tracked(child_value), Tracked(&*regions))]
+                Tracked(child_value), Tracked(&*regions),
+                Tracked(parent_own.tracked_borrow_perm()))]
             node.entry(pte_index::<C>(self.va, self.level))
         };
 
@@ -2365,6 +2374,9 @@ impl<'rcu, C: PageTableConfig, A: InAtomicMode> CursorMut<'rcu, C, A> {
                         cont.idx as int,
                     );
                 }
+                proof {
+                    owner.lemma_cur_node_locked(*guards);
+                }
                 #[verus_spec(with Tracked(owner), Tracked(regions))]
                 let cur_entry = self.0.cur_entry();
 
@@ -2573,6 +2585,9 @@ impl<'rcu, C: PageTableConfig, A: InAtomicMode> CursorMut<'rcu, C, A> {
                     let ghost regions_before_split = *regions;
                     let ghost guards_before_split = *guards;
                     let ghost level_before_frame = cur_level;
+                    proof {
+                        owner.lemma_cur_node_locked(*guards);
+                    }
 
                     #[verus_spec(with Tracked(owner), Tracked(regions))]
                     let mut cur_entry = self.0.cur_entry();

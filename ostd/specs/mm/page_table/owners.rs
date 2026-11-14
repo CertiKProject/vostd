@@ -599,7 +599,7 @@ impl<C: PageTableConfig> PageTableOwner<C> {
             t2.value().inv(),
             t2.value().path == t.value().path,
             t2.value().parent_level == t.value().parent_level,
-            t2.value().node().children_perm == t.value().node().children_perm,
+            t2.value().node().pte_view == t.value().node().pte_view,
             t2.value().node().frame_permission == t.value().node().frame_permission,
             t2.value().node().tree_level == t.value().node().tree_level,
             t2.value().node().slot_index == t.value().node().slot_index,

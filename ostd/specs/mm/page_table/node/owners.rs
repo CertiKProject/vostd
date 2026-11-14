@@ -324,7 +324,6 @@ pub tracked struct NodeOwner<C: PageTableConfig> {
     pub lock_cell: Option<PtLockCell>,
     pub pte_view: GhostVar<PteRaws>,
     pub frame_permission: FracMetadataPerm,
-    pub children_perm: array_ptr::PointsTo<usize, NR_ENTRIES>,
     pub ghost tree_level: int,
     pub ghost slot_index: int,
     /// The configuration, which determines how the raw PTEs are decoded.
@@ -337,15 +336,14 @@ impl<C: PageTableConfig> Inv for NodeOwner<C> {
             &&& self.meta().inv()
             &&& self.pte_auth().id() == self.pte_view.id()
             &&& self.pte_auth()@ == self.pte_view@
+            &&& self.perm().wf()
+            &&& self.perm().is_init_all()
+            &&& self.perm().value() == self.pte_view@
+            &&& self.perm().addr() == paddr_to_vaddr(meta_to_frame(index_to_meta(self.slot_index)))
         }
-        &&& self.pte_view@ == self.children_perm.value()
+        &&& self.pte_view@.len() == NR_ENTRIES
         &&& self.frame_permission.frac() == 1
         &&& 1 <= self.level() <= NR_LEVELS
-        &&& self.children_perm.wf()
-        &&& self.children_perm.is_init_all()
-        &&& self.children_perm.addr() == paddr_to_vaddr(
-            meta_to_frame(index_to_meta(self.slot_index)),
-        )
         &&& self.tree_level == INC_LEVELS - self.level() - 1
         &&& 0 <= self.slot_index < max_meta_slots()
         &&& FRAME_METADATA_RANGE.start <= index_to_meta(self.slot_index) < FRAME_METADATA_RANGE.end
@@ -363,9 +361,61 @@ impl<C: PageTableConfig> NodeOwner<C> {
         self.lock_cell is Some
     }
 
-    /// The node's PTEs, decoded from the raw values in `children_perm`.
+    /// The node's PTEs, decoded from the PTE model. The model is always
+    /// present, and agrees with the PTE array whenever the lock is held.
     pub open spec fn ptes(self) -> Seq<C::E> {
-        self.children_perm.value().map_values(|r: usize| raw_decode::<C::E>(r))
+        self.pte_view@.map_values(|r: usize| raw_decode::<C::E>(r))
+    }
+
+    /// The permission for the node's PTE array. Only meaningful if
+    /// [`Self::is_locked`]: the permission travels with the lock cell.
+    pub open spec fn perm(self) -> array_ptr::PointsTo<usize, NR_ENTRIES> {
+        self.cell().value().ptes
+    }
+
+    /// `perm` is the permission for this node's PTE array, and its contents
+    /// agree with the node's PTE model. The node's own lock cell holds one when
+    /// [`Self::is_locked`]; a lock cell held elsewhere can provide one too.
+    pub open spec fn is_pte_perm(self, perm: array_ptr::PointsTo<usize, NR_ENTRIES>) -> bool {
+        &&& perm.wf()
+        &&& perm.is_init_all()
+        &&& perm.value() == self.pte_view@
+        &&& perm.addr() == paddr_to_vaddr(meta_to_frame(index_to_meta(self.slot_index)))
+    }
+
+    /// Borrows the PTE array permission of a locked node.
+    pub proof fn tracked_borrow_perm(tracked &self) -> (tracked res: &array_ptr::PointsTo<
+        usize,
+        NR_ENTRIES,
+    >)
+        requires
+            self.is_locked(),
+        ensures
+            *res == self.perm(),
+    {
+        &self.lock_cell.tracked_borrow().tracked_borrow_value().ptes
+    }
+
+    /// Mutably borrows the PTE array permission inside a held lock cell, given
+    /// only the owner's `lock_cell` field.
+    pub proof fn tracked_cell_perm_mut(tracked cell: &mut Option<PtLockCell>) -> (tracked res:
+        &mut array_ptr::PointsTo<usize, NR_ENTRIES>)
+        requires
+            (*old(cell)) is Some,
+        ensures
+            *res == (*old(cell))->Some_0.value().ptes,
+            (*final(cell)) is Some,
+            (*final(cell))->Some_0.loc() == (*old(cell))->Some_0.loc(),
+            (*final(cell))->Some_0.level() == (*old(cell))->Some_0.level(),
+            (*final(cell))->Some_0.value() == (PtLockPayload {
+                ptes: *final(res),
+                ..(*old(cell))->Some_0.value()
+            }),
+    {
+        match cell {
+            Some(c) => &mut c.tracked_borrow_mut_value().ptes,
+            None => proof_from_false(),
+        }
     }
 
     /// The lock cell. Only meaningful if [`Self::is_locked`].
@@ -411,7 +461,6 @@ impl<C: PageTableConfig> NodeOwner<C> {
             }),
             final(self).pte_view == old(self).pte_view,
             final(self).frame_permission == old(self).frame_permission,
-            final(self).children_perm == old(self).children_perm,
             final(self).tree_level == old(self).tree_level,
             final(self).slot_index == old(self).slot_index,
     {
@@ -449,7 +498,8 @@ impl<C: PageTableConfig> NodeOwner<C> {
         requires
             old(self).inv(),
             !old(self).is_locked(),
-            cell.value().meta.inv(),
+            cell.inv_cell(),
+            cell.key() == meta_to_frame(index_to_meta(old(self).slot_index)),
             cell.value().pte_auth.id() == old(self).pte_view.id(),
             cell.value().pte_auth@ == old(self).pte_view@,
         ensures
@@ -458,7 +508,6 @@ impl<C: PageTableConfig> NodeOwner<C> {
             final(self).cell() == cell,
             final(self).pte_view == old(self).pte_view,
             final(self).frame_permission == old(self).frame_permission,
-            final(self).children_perm == old(self).children_perm,
             final(self).tree_level == old(self).tree_level,
             final(self).slot_index == old(self).slot_index,
     {
@@ -472,7 +521,7 @@ impl<C: PageTableConfig> NodeOwner<C> {
             old(self).is_locked(),
             old(self).pte_auth().id() == old(self).pte_view.id(),
         ensures
-            final(self).pte_view@ == old(self).children_perm.value(),
+            final(self).pte_view@ == old(self).perm().value(),
             final(self).pte_auth()@ == final(self).pte_view@,
             final(self).pte_auth().id() == final(self).pte_view.id(),
             final(self).pte_view.id() == old(self).pte_view.id(),
@@ -486,13 +535,13 @@ impl<C: PageTableConfig> NodeOwner<C> {
                 ..old(self).cell().value()
             }),
             final(self).frame_permission == old(self).frame_permission,
-            final(self).children_perm == old(self).children_perm,
             final(self).tree_level == old(self).tree_level,
             final(self).slot_index == old(self).slot_index,
     {
         let tracked mut cell = self.lock_cell.tracked_take();
         let tracked payload = cell.tracked_borrow_mut_value();
-        payload.pte_auth.update(&mut self.pte_view, self.children_perm.value());
+        let ghost new_ptes = payload.ptes.value();
+        payload.pte_auth.update(&mut self.pte_view, new_ptes);
         self.lock_cell = Some(cell);
     }
 

@@ -429,10 +429,7 @@ impl<'a, C: PageTableConfig> PageTableNodeRef<'a, C> {
         proof {
             reveal(lock_key_wf);
             payload.tracked_borrow_value().pte_auth.agree(&owner.pte_view);
-            lemma_count_where_raw::<C::E>(
-                owner.children_perm.value(),
-                owner.children_perm.value().len() as int,
-            );
+            lemma_count_where_raw::<C::E>(owner.pte_view@, owner.pte_view@.len() as int);
             guards.guards = guards.guards.insert(owner.slot_vaddr());
         }
         proof_with!{ |= Tracked(payload) }
@@ -484,8 +481,10 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
         with Tracked(owner): Tracked<&NodeOwner<C>>,
              Tracked(child_owner): Tracked<&EntryOwner<C>>,
              Tracked(regions): Tracked<&MetaRegionOwners>,
+             Tracked(perm): Tracked<&array_ptr::PointsTo<usize, NR_ENTRIES>>,
         requires
             owner.inv(),
+            owner.is_pte_perm(*perm),
             child_owner.inv(),
             owner.relate_guard(*old(self)),
             child_owner.match_pte(
@@ -509,7 +508,7 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
         // SAFETY: The index is within the bound. `Entry::new_at` returns an
         // entry whose node is the guard value we were handed.
         unsafe {
-            #[verus_spec(with Tracked(child_owner), Tracked(owner), Tracked(regions))]
+            #[verus_spec(with Tracked(child_owner), Tracked(owner), Tracked(regions), Tracked(perm))]
             Entry::new_at(self, idx)
         }
     }
@@ -581,8 +580,10 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
     #[verus_spec(
         with Tracked(owner): Tracked<&NodeOwner<C>>,
              Tracked(regions): Tracked<&MetaRegionOwners>,
+             Tracked(perm): Tracked<&array_ptr::PointsTo<usize, NR_ENTRIES>>,
         requires
             self.inner.inner@.invariants(*owner),
+            owner.is_pte_perm(*perm),
             regions.inv(),
             regions.contains(owner.slot_index),
             idx < NR_ENTRIES,
@@ -599,7 +600,7 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
         // - The page table node is alive. The index is inside the bound, so the page table entry is valid.
         // - All page table entries are aligned and accessed with atomic operations only.
         unsafe {
-            #[verus_spec(with Tracked(&owner.children_perm))]
+            #[verus_spec(with Tracked(perm))]
             load_pte(ptr.add(idx), Ordering::Relaxed)
         }
     }
@@ -652,12 +653,12 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
         // - The page table node is alive. The index is inside the bound, so the page table entry is valid.
         // - All page table entries are aligned and accessed with atomic operations only.
         unsafe {
-            #[verus_spec(with Tracked(&mut owner.children_perm))]
+            #[verus_spec(with Tracked(NodeOwner::<C>::tracked_cell_perm_mut(&mut owner.lock_cell)))]
             store_pte(ptr.add(idx), pte, Ordering::Release)
         }
         proof {
-            assert(owner.children_perm.wf());
-            lemma_decode_update::<C::E>(old(owner).children_perm.value(), idx as int, pte);
+            assert(owner.perm().wf());
+            lemma_decode_update::<C::E>(old(owner).pte_view@, idx as int, pte);
             owner.tracked_sync_pte_model();
         }
     }
@@ -714,10 +715,8 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
         }
         proof {
             reveal(PageTablePageMeta::lock_consts_wf);
-            lemma_count_where_raw::<C::E>(
-                owner.children_perm.value(),
-                owner.children_perm.value().len() as int,
-            );
+            lemma_count_where_raw::<C::E>(owner.pte_view@, owner.pte_view@.len() as int);
+            reveal(lock_key_wf);
             assert(cell.inv_cell());
         }
         atomic_with_ghost! {
@@ -772,16 +771,23 @@ impl<C: PageTableConfig> PageTablePageMeta<C> {
     /// Creates the metadata of a new, empty page table node.
     ///
     /// The lock starts free, holding the node's [`PtLockCell`]: the permissions
-    /// for `nr_children` and `stray` and the authoritative half of the PTE model.
-    /// The other half, recording that all PTEs are absent, is returned for the
+    /// for `nr_children` and `stray`, the permission for the PTE array of the
+    /// (zeroed) frame, `ptes`, and the authoritative half of the PTE model. The
+    /// other half, recording that all PTEs are absent, is returned for the
     /// node's owner. The ghost `paddr`, the address of the frame the metadata
     /// will describe, is the lock's key.
     #[verus_spec(res =>
         with
             Ghost(paddr): Ghost<Paddr>,
+            Tracked(ptes): Tracked<array_ptr::PointsTo<usize, NR_ENTRIES>>,
             -> pte_view: Tracked<GhostVar<PteRaws>>,
         requires
             1 <= level <= NR_LEVELS,
+            // The node's frame, zeroed: every PTE is absent.
+            ptes.wf(),
+            ptes.is_init_all(),
+            ptes.value() == pte_raws(Seq::new(NR_ENTRIES as nat, |_i: int| C::E::new_absent_spec())),
+            ptes.addr() == paddr_to_vaddr(paddr),
         ensures
             res.lock_wf(),
             res.level == level,
@@ -806,6 +812,7 @@ impl<C: PageTableConfig> PageTablePageMeta<C> {
             child_of: raw_child_of_fn::<C::E>(),
             meta: PageMetaOwner { nr_children: nr_children_perm, stray: stray_perm },
             pte_auth,
+            ptes,
         };
         let tracked cell = PtLockCell::tracked_new(payload, (NR_LEVELS - level) as nat);
         let ghost k = cell.lock_const();
