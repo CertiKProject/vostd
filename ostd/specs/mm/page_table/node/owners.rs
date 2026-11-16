@@ -99,7 +99,9 @@ pub open spec fn raw_child_of<E: PageTableEntryTrait>(r: usize, level: PagingLev
 }
 
 /// [`raw_child_of`] as a function value, as stored in the lock constant.
-pub open spec fn raw_child_of_fn<E: PageTableEntryTrait>() -> spec_fn(usize, PagingLevel) -> Option<Paddr> {
+pub open spec fn raw_child_of_fn<E: PageTableEntryTrait>() -> spec_fn(usize, PagingLevel) -> Option<
+    Paddr,
+> {
     |r: usize, lv: PagingLevel| raw_child_of::<E>(r, lv)
 }
 
@@ -125,8 +127,10 @@ pub proof fn lemma_count_where_pte_raws<E: PageTableEntryTrait>(s: Seq<E>, n: in
     requires
         0 <= n <= s.len(),
     ensures
-        count_where_upto(|r: usize| raw_is_present::<E>(r), pte_raws(s), n)
-            == count_present_upto(s, n),
+        count_where_upto(|r: usize| raw_is_present::<E>(r), pte_raws(s), n) == count_present_upto(
+            s,
+            n,
+        ),
     decreases n,
 {
     if n > 0 {
@@ -134,7 +138,6 @@ pub proof fn lemma_count_where_pte_raws<E: PageTableEntryTrait>(s: Seq<E>, n: in
         lemma_raw_decode::<E>(s[n - 1]);
     }
 }
-
 
 /// Counting present PTEs among raw values gives the same result as counting
 /// the decoded PTEs.
@@ -302,26 +305,21 @@ impl<C: PageTableConfig> OwnerOf for PageTablePageMeta<C> {
 
 /// # Verification Design
 /// The owner type for a page table node. It contains:
-/// - `lock_cell`, the node's [`PtLockCell`]. It is `Some` exactly when this
-///   thread holds the node's lock; otherwise the cell is stored in the lock. Its
-///   [`PtLockPayload`] holds the permissions for the node-specific metadata
-///   fields `nr_children` and `stray` (see [`Self::meta`]) and the
-///   authoritative half of the PTE model (see [`Self::pte_auth`]).
-/// - `pte_view`, the other half of the PTE model, which always stays with the
-///   owner. It records the bytes of the PTEs in `children_perm`; agreement with
-///   `pte_auth` is what lets the lock state that `nr_children` counts the
-///   present PTEs without depending on the `PageTableConfig`.
-/// - `children_perm` is an array permission for the underlying frame in which the node
-///   is allocated, as `NR_ENTRIES` raw PTE values (`PageTableEntryTrait::as_usize`).
-///   The raw type keeps it independent of the `PageTableConfig`, so that it can be
-///   held by the node's lock. [`Self::ptes`] decodes it.
+/// - `pte_view`, one half of the node's PTE model: the raw values of its PTEs.
+///   The authoritative half (`PtLockPayload::pte_auth`) is in the node's lock
+///   cell, together with the permission for the PTE array itself and for the
+///   node-specific metadata fields `nr_children` and `stray`. The owner never
+///   holds the cell: it is in the node's lock, or held by whoever locked the
+///   node (see [`Self::holds`]). The PTE model lets specs read the PTEs of a
+///   node that is not locked, and lets the lock state that `nr_children`
+///   counts the present PTEs without depending on the `PageTableConfig`.
+/// - `frame_permission`, the permission for the node's frame metadata.
 /// - `slot_index` identifies the underlying frame's index in the metadata region
 /// - Each node is a page table with a level between 1 and 4 (on x86); `level` tracks
 ///   the level of this node.
 /// - `tree_level` is the level field of the `ghost_tree::TreeNode` that carries this object.
 ///   Carried here for convenience, though it can be computed from `level`.
 pub tracked struct NodeOwner<C: PageTableConfig> {
-    pub lock_cell: Option<PtLockCell>,
     pub pte_view: GhostVar<PteRaws>,
     pub frame_permission: FracMetadataPerm,
     pub ghost tree_level: int,
@@ -332,15 +330,6 @@ pub tracked struct NodeOwner<C: PageTableConfig> {
 
 impl<C: PageTableConfig> Inv for NodeOwner<C> {
     open spec fn inv(self) -> bool {
-        &&& self.is_locked() ==> {
-            &&& self.meta().inv()
-            &&& self.pte_auth().id() == self.pte_view.id()
-            &&& self.pte_auth()@ == self.pte_view@
-            &&& self.perm().wf()
-            &&& self.perm().is_init_all()
-            &&& self.perm().value() == self.pte_view@
-            &&& self.perm().addr() == paddr_to_vaddr(meta_to_frame(index_to_meta(self.slot_index)))
-        }
         &&& self.pte_view@.len() == NR_ENTRIES
         &&& self.frame_permission.frac() == 1
         &&& 1 <= self.level() <= NR_LEVELS
@@ -355,194 +344,128 @@ impl<C: PageTableConfig> Inv for NodeOwner<C> {
 }
 
 impl<C: PageTableConfig> NodeOwner<C> {
-    /// Whether this thread holds the node's lock, i.e., whether the lock's
-    /// cell has been moved into this owner.
-    pub open spec fn is_locked(self) -> bool {
-        self.lock_cell is Some
-    }
-
     /// The node's PTEs, decoded from the PTE model. The model is always
     /// present, and agrees with the PTE array whenever the lock is held.
     pub open spec fn ptes(self) -> Seq<C::E> {
         self.pte_view@.map_values(|r: usize| raw_decode::<C::E>(r))
     }
 
-    /// The permission for the node's PTE array. Only meaningful if
-    /// [`Self::is_locked`]: the permission travels with the lock cell.
-    pub open spec fn perm(self) -> array_ptr::PointsTo<usize, NR_ENTRIES> {
-        self.cell().value().ptes
+    /// The physical address of the node's frame, which is its lock's key.
+    pub open spec fn paddr(self) -> Paddr {
+        meta_to_frame(index_to_meta(self.slot_index))
     }
 
     /// `perm` is the permission for this node's PTE array, and its contents
-    /// agree with the node's PTE model. The node's own lock cell holds one when
-    /// [`Self::is_locked`]; a lock cell held elsewhere can provide one too.
+    /// agree with the node's PTE model.
     pub open spec fn is_pte_perm(self, perm: array_ptr::PointsTo<usize, NR_ENTRIES>) -> bool {
         &&& perm.wf()
         &&& perm.is_init_all()
         &&& perm.value() == self.pte_view@
-        &&& perm.addr() == paddr_to_vaddr(meta_to_frame(index_to_meta(self.slot_index)))
+        &&& perm.addr() == paddr_to_vaddr(self.paddr())
     }
 
-    /// Borrows the PTE array permission of a locked node.
-    pub proof fn tracked_borrow_perm(tracked &self) -> (tracked res: &array_ptr::PointsTo<
-        usize,
-        NR_ENTRIES,
-    >)
+    /// `cell` is this node's lock cell, and agrees with the owner: whoever
+    /// holds it has locked the node. This is what holding the node's lock
+    /// gives, except for `nr_children` counting the present PTEs
+    /// ([`Self::count_consistent`]), which is momentarily broken while an
+    /// entry is replaced.
+    pub open spec fn holds(self, cell: PtLockCell) -> bool {
+        &&& cell.lock_const() == self.meta_value().lock.constant()
+        &&& cell.value().meta.inv()
+        &&& self.meta_value().wf(cell.value().meta)
+        &&& cell.value().pte_auth.id() == self.pte_view.id()
+        &&& cell.value().pte_auth@ == self.pte_view@
+        &&& self.is_pte_perm(cell.value().ptes)
+    }
+
+    /// `guards` records this node's lock cell as held: the cell of this
+    /// node's lock is held by this thread.
+    pub open spec fn held_in(self, guards: super::Guards) -> bool {
+        guards.holds(self.slot_vaddr(), self.meta_value().lock.constant())
+    }
+
+    /// The node's lock cell, held by this thread and recorded in `guards`,
+    /// is the one in `cells`.
+    pub proof fn lemma_held_cell(self, guards: super::Guards, cells: Map<usize, PtLockCell>)
         requires
-            self.is_locked(),
+            self.held_in(guards),
+            guards.cells_wf(cells),
         ensures
-            *res == self.perm(),
+            cells.contains_key(self.slot_vaddr()),
+            cells[self.slot_vaddr()].lock_const() == self.meta_value().lock.constant(),
+            cells[self.slot_vaddr()].inv_cell(),
     {
-        &self.lock_cell.tracked_borrow().tracked_borrow_value().ptes
+        assert(guards.held.dom().contains(self.slot_vaddr()));
     }
 
-    /// Mutably borrows the PTE array permission inside a held lock cell, given
-    /// only the owner's `lock_cell` field.
-    pub proof fn tracked_cell_perm_mut(tracked cell: &mut Option<PtLockCell>) -> (tracked res:
-        &mut array_ptr::PointsTo<usize, NR_ENTRIES>)
+    /// `nr_children` in the lock cell counts the present PTEs.
+    pub open spec fn count_consistent(self, cell: PtLockCell) -> bool {
+        cell.value().meta.nr_children.value() == count_present(self.ptes())
+    }
+
+    /// A cell that is ready to be unlocked, and belongs to this node's lock,
+    /// agrees with the owner. This is how a holder of the cell (e.g. the
+    /// cursor, which keeps cells apart from the page table tree) recovers
+    /// [`Self::holds`].
+    pub proof fn tracked_lemma_holds(tracked &self, tracked cell: &PtLockCell)
         requires
-            (*old(cell)) is Some,
-        ensures
-            *res == (*old(cell))->Some_0.value().ptes,
-            (*final(cell)) is Some,
-            (*final(cell))->Some_0.loc() == (*old(cell))->Some_0.loc(),
-            (*final(cell))->Some_0.level() == (*old(cell))->Some_0.level(),
-            (*final(cell))->Some_0.value() == (PtLockPayload {
-                ptes: *final(res),
-                ..(*old(cell))->Some_0.value()
-            }),
-    {
-        match cell {
-            Some(c) => &mut c.tracked_borrow_mut_value().ptes,
-            None => proof_from_false(),
-        }
-    }
-
-    /// The lock cell. Only meaningful if [`Self::is_locked`].
-    pub open spec fn cell(self) -> PtLockCell {
-        self.lock_cell->Some_0
-    }
-
-    /// The metadata permissions. Only meaningful if [`Self::is_locked`].
-    pub open spec fn meta(self) -> PageMetaOwner {
-        self.cell().value().meta
-    }
-
-    /// The authoritative half of the PTE model. Only meaningful if
-    /// [`Self::is_locked`].
-    pub open spec fn pte_auth(self) -> GhostVarAuth<PteRaws> {
-        self.cell().value().pte_auth
-    }
-
-    /// Borrows the metadata permissions of a locked node.
-    pub proof fn tracked_borrow_meta(tracked &self) -> (tracked res: &PageMetaOwner)
-        requires
-            self.is_locked(),
-        ensures
-            *res == self.meta(),
-    {
-        &self.lock_cell.tracked_borrow().tracked_borrow_value().meta
-    }
-
-    /// Mutably borrows the metadata permissions of a locked node. Everything
-    /// else in the owner, including the rest of the cell, is unchanged.
-    pub proof fn tracked_borrow_mut_meta(tracked &mut self) -> (tracked res: &mut PageMetaOwner)
-        requires
-            old(self).is_locked(),
-        ensures
-            *res == old(self).meta(),
-            final(self).is_locked(),
-            final(self).meta() == *final(res),
-            final(self).cell().loc() == old(self).cell().loc(),
-            final(self).cell().level() == old(self).cell().level(),
-            final(self).cell().value() == (PtLockPayload {
-                meta: *final(res),
-                ..old(self).cell().value()
-            }),
-            final(self).pte_view == old(self).pte_view,
-            final(self).frame_permission == old(self).frame_permission,
-            final(self).tree_level == old(self).tree_level,
-            final(self).slot_index == old(self).slot_index,
-    {
-        match self.lock_cell {
-            Some(ref mut cell) => &mut cell.tracked_borrow_mut_value().meta,
-            None => proof_from_false(),
-        }
-    }
-
-    /// Mutably borrows the metadata permissions inside a held lock cell, given
-    /// only the owner's `lock_cell` field, so that other fields of the owner
-    /// (e.g. `frame_permission`) can stay borrowed meanwhile.
-    pub proof fn tracked_cell_meta_mut(tracked cell: &mut Option<PtLockCell>) -> (tracked res:
-        &mut PageMetaOwner)
-        requires
-            (*old(cell)) is Some,
-        ensures
-            *res == (*old(cell))->Some_0.value().meta,
-            (*final(cell)) is Some,
-            (*final(cell))->Some_0.loc() == (*old(cell))->Some_0.loc(),
-            (*final(cell))->Some_0.level() == (*old(cell))->Some_0.level(),
-            (*final(cell))->Some_0.value() == (PtLockPayload {
-                meta: *final(res),
-                ..(*old(cell))->Some_0.value()
-            }),
-    {
-        match cell {
-            Some(c) => &mut c.tracked_borrow_mut_value().meta,
-            None => proof_from_false(),
-        }
-    }
-
-    /// Moves the cell obtained by acquiring the node's lock into this owner.
-    pub proof fn tracked_install_lock_cell(tracked &mut self, tracked cell: PtLockCell)
-        requires
-            old(self).inv(),
-            !old(self).is_locked(),
+            self.inv(),
+            self.meta_value().lock_wf(),
+            self.pte_view.id() == self.meta_value().lock.constant().consts.pte_model_id,
+            lock_key_wf(self.meta_value(), self.slot_index),
             cell.inv_cell(),
-            cell.key() == meta_to_frame(index_to_meta(old(self).slot_index)),
-            cell.value().pte_auth.id() == old(self).pte_view.id(),
-            cell.value().pte_auth@ == old(self).pte_view@,
+            cell.lock_const() == self.meta_value().lock.constant(),
         ensures
-            final(self).inv(),
-            final(self).is_locked(),
-            final(self).cell() == cell,
-            final(self).pte_view == old(self).pte_view,
-            final(self).frame_permission == old(self).frame_permission,
-            final(self).tree_level == old(self).tree_level,
-            final(self).slot_index == old(self).slot_index,
+            self.holds(*cell),
+            self.count_consistent(*cell),
     {
-        self.lock_cell = Some(cell);
+        reveal(crate::mm::page_table::PageTablePageMeta::lock_consts_wf);
+        reveal(lock_key_wf);
+        cell.tracked_borrow_value().pte_auth.agree(&self.pte_view);
+        lemma_count_where_raw::<C::E>(self.pte_view@, self.pte_view@.len() as int);
     }
 
-    /// Updates the PTE model of a locked node to match its `children_perm`, after
-    /// the latter has been written.
-    pub proof fn tracked_sync_pte_model(tracked &mut self)
+    /// The other direction of [`Self::tracked_lemma_holds`]: a cell that this
+    /// node holds, and whose `nr_children` is consistent, is ready to be
+    /// unlocked.
+    pub proof fn lemma_holds_inv_cell(self, cell: PtLockCell)
         requires
-            old(self).is_locked(),
-            old(self).pte_auth().id() == old(self).pte_view.id(),
+            self.inv(),
+            self.meta_value().lock_wf(),
+            lock_key_wf(self.meta_value(), self.slot_index),
+            self.holds(cell),
+            self.count_consistent(cell),
         ensures
-            final(self).pte_view@ == old(self).perm().value(),
-            final(self).pte_auth()@ == final(self).pte_view@,
-            final(self).pte_auth().id() == final(self).pte_view.id(),
+            cell.inv_cell(),
+    {
+        reveal(crate::mm::page_table::PageTablePageMeta::lock_consts_wf);
+        reveal(lock_key_wf);
+        lemma_count_where_raw::<C::E>(self.pte_view@, self.pte_view@.len() as int);
+    }
+
+    /// Updates the PTE model to match the PTE array in `cell`, after the
+    /// latter has been written.
+    pub proof fn tracked_sync_pte_model(tracked &mut self, tracked cell: &mut PtLockCell)
+        requires
+            old(cell).value().pte_auth.id() == old(self).pte_view.id(),
+        ensures
+            final(self).pte_view@ == old(cell).value().ptes.value(),
+            final(cell).value().pte_auth@ == final(self).pte_view@,
+            final(cell).value().pte_auth.id() == final(self).pte_view.id(),
             final(self).pte_view.id() == old(self).pte_view.id(),
-            final(self).is_locked(),
-            final(self).meta() == old(self).meta(),
-            final(self).cell().lock_const() == old(self).cell().lock_const(),
-            final(self).cell().loc() == old(self).cell().loc(),
-            final(self).cell().level() == old(self).cell().level(),
-            final(self).cell().value() == (PtLockPayload {
-                pte_auth: final(self).pte_auth(),
-                ..old(self).cell().value()
+            final(cell).loc() == old(cell).loc(),
+            final(cell).level() == old(cell).level(),
+            final(cell).value() == (PtLockPayload {
+                pte_auth: final(cell).value().pte_auth,
+                ..old(cell).value()
             }),
             final(self).frame_permission == old(self).frame_permission,
             final(self).tree_level == old(self).tree_level,
             final(self).slot_index == old(self).slot_index,
     {
-        let tracked mut cell = self.lock_cell.tracked_take();
         let tracked payload = cell.tracked_borrow_mut_value();
         let ghost new_ptes = payload.ptes.value();
         payload.pte_auth.update(&mut self.pte_view, new_ptes);
-        self.lock_cell = Some(cell);
     }
 
     pub proof fn tracked_borrow_frame_metadata_perm(
@@ -593,9 +516,10 @@ impl<C: PageTableConfig> NodeOwner<C> {
         &&& self.meta_wf(regions)
         &&& self.meta_value().lock_wf()
         &&& self.pte_view.id() == self.meta_value().lock.constant().consts.pte_model_id
-        &&& lock_key_wf(self.meta_value(), self.slot_index)
-        &&& self.is_locked() ==> self.meta_value().wf(self.meta())
-        &&& self.is_locked() ==> self.cell().lock_const() == self.meta_value().lock.constant()
+        &&& lock_key_wf(
+            self.meta_value(),
+            self.slot_index,
+        )
         // A page-table node's slot is tracked with `PageTable` usage (guaranteed
         // by `PageTableNode::alloc`). This discriminates node slots from
         // data-frame slots (`Frame`) by `usage` alone, so a
@@ -603,20 +527,6 @@ impl<C: PageTableConfig> NodeOwner<C> {
         // existing live node — giving `alloc_if_none`/`split` the parent≠child
         // slot distinctness without a PointsTo-linearity axiom.
         &&& regions.slot_owners[self.slot_index].usage is PageTable
-        // `nr_children` counts the present PTEs in `children_perm`. A settled-node
-        // invariant (it is momentarily broken mid-`replace`/`alloc_if_none`, between
-        // the PTE write and the counter update, which is why it lives here rather
-        // than in `inv()`). Lets `nr_children_*_slot_bound` be proven, not axiomatized.
-        &&& self.count_consistent()
-    }
-
-    /// If the node is locked, `nr_children` equals the number of present PTEs in
-    /// `children_perm`. Held by a settled node (see `metaregion_sound_node`'s use
-    /// site). For an unlocked node the fact is kept by the lock instead.
-    pub open spec fn count_consistent(self) -> bool {
-        self.is_locked() ==> self.meta().nr_children.value() == count_present(
-            self.ptes(),
-        )
     }
 }
 
@@ -625,16 +535,15 @@ impl<C: PageTableConfig> NodeOwner<C> {
     /// `nr_children < NR_ENTRIES`. Proven (no longer axiomatized) from the
     /// `count_consistent` invariant: `nr_children` counts present PTEs, and an
     /// absent slot means not all `NR_ENTRIES` slots are present.
-    pub proof fn lemma_nr_children_absent_slot_bound(self, idx: usize)
+    pub proof fn lemma_nr_children_absent_slot_bound(self, cell: PtLockCell, idx: usize)
         requires
             self.inv(),
-            self.is_locked(),
-            self.count_consistent(),
+            self.count_consistent(cell),
             self.ptes().len() == NR_ENTRIES,
             idx < NR_ENTRIES,
             !self.ptes()[idx as int].is_present(),
         ensures
-            self.meta().nr_children.value() < NR_ENTRIES,
+            cell.value().meta.nr_children.value() < NR_ENTRIES,
     {
         lemma_count_present_upto_absent(self.ptes(), NR_ENTRIES as int, idx as int);
     }
@@ -642,16 +551,15 @@ impl<C: PageTableConfig> NodeOwner<C> {
     /// If a slot in `children_perm` holds a present PTE, then `nr_children > 0`.
     /// Dual of [`Self::lemma_nr_children_absent_slot_bound`]; proven from
     /// `count_consistent`.
-    pub proof fn nr_children_present_slot_bound(self, idx: usize)
+    pub proof fn nr_children_present_slot_bound(self, cell: PtLockCell, idx: usize)
         requires
             self.inv(),
-            self.is_locked(),
-            self.count_consistent(),
+            self.count_consistent(cell),
             self.ptes().len() == NR_ENTRIES,
             idx < NR_ENTRIES,
             self.ptes()[idx as int].is_present(),
         ensures
-            self.meta().nr_children.value() > 0,
+            cell.value().meta.nr_children.value() > 0,
     {
         lemma_count_present_upto_present(self.ptes(), NR_ENTRIES as int, idx as int);
     }

@@ -229,6 +229,7 @@ impl<'a> VmSpace<'a> {
                 owner.0.value().path,
                 crate::specs::mm::page_table::cursor::owners::node_unguarded::<UserPtConfig>(*old(guards)),
             ),
+            old(guards).held.dom() == Set::<usize>::empty(),
         ensures
             crate::mm::page_table::Cursor::<UserPtConfig, G>::cursor_new_success_conditions(*va) ==> (r matches Ok(_) && cursor_owner@ matches Some(_)),
             // On the success branch, the returned cursor owner satisfies
@@ -299,6 +300,7 @@ impl<'a> VmSpace<'a> {
                 owner.0.value().path,
                 crate::specs::mm::page_table::cursor::owners::node_unguarded::<UserPtConfig>(*old(guards)),
             ),
+            old(guards).held.dom() == Set::<usize>::empty(),
         ensures
             crate::mm::page_table::Cursor::<UserPtConfig, G>::cursor_new_success_conditions(*va) ==> (r matches Ok(_) && cursor_owner@ matches Some(_)),
             // See `cursor` above for the derivation.

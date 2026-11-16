@@ -249,7 +249,8 @@ impl<T: LockedValue, const N: usize, const L: usize> NodeLock<T, N, L> {
             ensures
                 got matches Some(c) && c.lock_const() == self.id() && c.inv_cell(),
         {
-            let res = atomic_with_ghost! {
+            let res =
+                atomic_with_ghost! {
                 self.atomic => compare_exchange(false, true);
                 returning res;
                 ghost g => {

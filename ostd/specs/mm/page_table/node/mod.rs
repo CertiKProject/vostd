@@ -4,7 +4,9 @@ pub mod owners;
 use vstd::prelude::*;
 use vstd_extra::{cast_ptr::Repr, drop_tracking::*};
 
-use crate::specs::mm::frame::meta_owners::{MetaSlotStorage, StoredPageTablePageMeta};
+use crate::specs::mm::frame::meta_owners::{
+    MetaSlotStorage, PtLockCell, PtLockConst, StoredPageTablePageMeta,
+};
 
 use crate::mm::{
     frame::Frame,
@@ -16,9 +18,23 @@ pub use owners::*;
 
 verus! {
 
+/// This thread's lock state, as ghost bookkeeping.
+///
+/// - `guards`: the nodes that have a live [`PageTableGuard`].
+/// - `held`: the nodes whose lock cell this thread holds, with each cell's
+///   [`LockConst`](vstd_extra::resource::flat_tree::LockConst). A node can be
+///   held without a guard: [`dfs_acquire_lock`] forgets the guards of the
+///   nodes it locks.
+///
+/// The cells themselves are tracked elsewhere (by the cursor, or by whoever
+/// locked the node), in a map that [`Self::cells_wf`] relates to `held`.
+/// Keeping `Guards` purely ghost means that writing to a held cell does not
+/// change it, so predicates over `Guards` survive such writes unchanged.
+///
+/// [`dfs_acquire_lock`]: crate::mm::page_table::cursor::locking
 pub tracked struct Guards {
-    /// The set of node addresses that are currently guarded (locked).
     pub ghost guards: Set<usize>,
+    pub ghost held: Map<usize, PtLockConst>,
 }
 
 impl Guards {
@@ -28,6 +44,61 @@ impl Guards {
 
     pub open spec fn lock_held(self, addr: usize) -> bool {
         self.guards.contains(addr)
+    }
+
+    /// This thread holds the lock cell of the node at `addr`, whose lock has
+    /// constant `k`.
+    pub open spec fn holds(self, addr: usize, k: PtLockConst) -> bool {
+        &&& self.held.contains_key(addr)
+        &&& self.held[addr] == k
+    }
+
+    /// `cells` are exactly the held cells, and each is ready to be unlocked.
+    pub open spec fn cells_wf(self, cells: Map<usize, PtLockCell>) -> bool {
+        &&& cells.dom() == self.held.dom()
+        &&& forall|a: usize| #[trigger]
+            cells.contains_key(a) ==> {
+                &&& cells[a].lock_const() == self.held[a]
+                &&& cells[a].inv_cell()
+            }
+    }
+
+    /// Putting back a held cell, after writing to it, keeps [`Self::cells_wf`].
+    pub proof fn lemma_cells_wf_replace(
+        self,
+        cells: Map<usize, PtLockCell>,
+        a: usize,
+        c: PtLockCell,
+    )
+        requires
+            self.cells_wf(cells),
+            cells.contains_key(a),
+            c.lock_const() == cells[a].lock_const(),
+            c.inv_cell(),
+        ensures
+            self.cells_wf(cells.insert(a, c)),
+            cells.remove(a).insert(a, c) == cells.insert(a, c),
+    {
+        assert(cells.insert(a, c).dom() =~= cells.dom());
+        assert(cells.remove(a).insert(a, c) =~= cells.insert(a, c));
+    }
+
+    /// Adding the cell of a node just locked keeps [`Self::cells_wf`].
+    pub proof fn lemma_cells_wf_insert(
+        self,
+        g1: Guards,
+        cells: Map<usize, PtLockCell>,
+        a: usize,
+        c: PtLockCell,
+    )
+        requires
+            self.cells_wf(cells),
+            g1.held == self.held.insert(a, c.lock_const()),
+            c.inv_cell(),
+        ensures
+            g1.cells_wf(cells.insert(a, c)),
+    {
+        assert(cells.insert(a, c).dom() =~= g1.held.dom());
     }
 }
 
@@ -53,6 +124,7 @@ impl<'rcu, C: PageTableConfig> TrackDrop for PageTableGuard<'rcu, C> {
         obl: Self::Obligation,
     ) -> bool {
         &&& s1.guards == s0.guards.remove(self.inner.inner@.ptr.addr())
+        &&& s1.held == s0.held
         &&& obl.value() == self.inner.inner@.ptr.addr()
     }
 
@@ -72,7 +144,8 @@ impl<'rcu, C: PageTableConfig> TrackDrop for PageTableGuard<'rcu, C> {
         s1: Self::State,
         obl: Self::Obligation,
     ) -> bool {
-        s1.guards == s0.guards.insert(self.inner.inner@.ptr.addr())
+        &&& s1.guards == s0.guards.insert(self.inner.inner@.ptr.addr())
+        &&& s1.held == s0.held
     }
 }
 

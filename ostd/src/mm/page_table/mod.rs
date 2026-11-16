@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 use vstd::{arithmetic::power2::*, prelude::*, std_specs::clone::*};
+use vstd_extra::drop_tracking::TrackDrop;
 use vstd_extra::{assert, panic::may_panic, prelude::*};
 
 use crate::specs::{
@@ -903,6 +904,7 @@ impl PageTable<KernelPtConfig> {
             kernel_owner.metaregion_sound(*old(regions)),
             // The kernel root is not currently locked.
             old(guards).unlocked(kernel_owner.0.value().node().slot_vaddr()),
+            !old(guards).held.contains_key(kernel_owner.0.value().node().slot_vaddr()),
         ensures
             final(regions).inv(),
     )]
@@ -951,13 +953,13 @@ impl PageTable<KernelPtConfig> {
             assert(kernel_owner.0.value().is_node());
             assert(kernel_owner.0.value().metaregion_sound(*regions));
         }
-        // The kernel page table's owner is shared, so the kernel root's lock cell
-        // cannot be installed in it. It is held here instead, and provides the
-        // permission to read the root's PTEs. It is not given back, since the
-        // guard is not dropped (there is no `Drop` for `PageTableGuard` yet).
+        // The lock cells are held here, apart from the page table owners: the
+        // kernel root's provides the permission to read its PTEs, and is given
+        // back when its guard is dropped below. The new root's stays held: its
+        // guard is not dropped (see the note at the end).
         proof_decl! {
             let tracked root_lock_cell: crate::specs::mm::frame::meta_owners::PtLockCell;
-            let tracked new_lock_cell: crate::specs::mm::frame::meta_owners::PtLockCell;
+            let tracked mut new_lock_cell: crate::specs::mm::frame::meta_owners::PtLockCell;
         }
         let mut root_node = {
             /* The root's counting permission is held by NodeOwner; borrowing
@@ -978,9 +980,6 @@ impl PageTable<KernelPtConfig> {
             #[verus_spec(with Tracked(&new_node_owner), Tracked(guards) => Tracked(new_lock_cell))]
             new_ref.lock(preempt_guard)
         };
-        proof {
-            new_node_owner.tracked_install_lock_cell(new_lock_cell);
-        }
         let mut i: usize = KernelPtConfig::TOP_LEVEL_INDEX_RANGE().start;
         while i < KernelPtConfig::TOP_LEVEL_INDEX_RANGE().end
             invariant
@@ -993,12 +992,15 @@ impl PageTable<KernelPtConfig> {
                 // Lock postcondition for the kernel root.
                 *root_owner == kernel_owner.0.value().node(),
                 root_owner.relate_guard(root_node),
+                root_owner.holds(root_lock_cell),
+                root_owner.count_consistent(root_lock_cell),
                 root_owner.is_pte_perm(root_lock_cell.value().ptes),
+                guards.lock_held(root_owner.slot_vaddr()),
                 // Tree-wide soundness of the kernel page table.
                 kernel_owner.metaregion_sound(*regions),
                 // The new node owner's invariants and guard relation.
                 new_node_owner.inv(),
-                new_node_owner.is_locked(),
+                new_node_owner.holds(new_lock_cell),
                 new_node_owner.relate_guard(new_node),
                 regions.contains(new_node_owner.slot_index),
             decreases KernelPtConfig::TOP_LEVEL_INDEX_RANGE().end - i,
@@ -1024,10 +1026,7 @@ impl PageTable<KernelPtConfig> {
                     kernel_owner.0.tracked_borrow_child(i as int);
                 entry_owner = child_subtree.tracked_borrow_value();
                 let kern_node = kernel_owner.0.value().node();
-                assert(entry_owner.match_pte(
-                    kern_node.ptes()[i as int],
-                    entry_owner.parent_level,
-                ));
+                assert(entry_owner.match_pte(kern_node.ptes()[i as int], entry_owner.parent_level));
                 assert(entry_owner.parent_level == kern_node.level());
                 assert(child_subtree.inv());
                 assert(entry_owner.inv());
@@ -1089,13 +1088,24 @@ impl PageTable<KernelPtConfig> {
                 assert(regions.contains(new_node_owner.slot_index));
             }
             unsafe {
-                #[verus_spec(with Tracked(&mut new_node_owner), Tracked(&*regions))]
+                #[verus_spec(with Tracked(&mut new_node_owner), Tracked(&*regions), Tracked(&mut new_lock_cell))]
                 new_node.write_pte(i, pte)
             };
 
             i = i + 1;
         }
 
+        // Upstream, `root_node` is dropped here, which unlocks the kernel root.
+        proof_decl! {
+            let tracked root_obl = root_node.tracked_redeem(guards);
+        }
+        #[verus_spec(with Tracked(root_owner), Tracked(root_lock_cell), Tracked(guards), Tracked(root_obl))]
+        root_node.unlock();
+
+        // Upstream also drops `new_node` here. It cannot be unlocked: the lock's
+        // invariant says `nr_children` counts the present PTEs, but the loop above
+        // copies the kernel's PTEs into the new root without counting them (as
+        // upstream does), so the new root's cell stays held.
         PageTable::<UserPtConfig> { root: new_root }
     }/*
     /// Protect the given virtual address range in the kernel page table.
@@ -1163,7 +1173,7 @@ impl<C: PageTableConfig> PageTable<C> {
             final(owner)@ is Some,
             final(owner)@->0.inv(),
             (final(owner)@->0).0.value().is_node(),
-            !(final(owner)@->0).0.value().node().is_locked(),
+            !final(guards).held.contains_key((final(owner)@->0).0.value().node().slot_vaddr()),
             r.root.ptr.addr() == (final(owner)@->0).0.value().node().slot_vaddr(),
             (final(owner)@->0).0.value().metaregion_sound(*final(regions)),
             r.relates_owner(final(owner)@->0, *final(regions)),
@@ -1172,6 +1182,7 @@ impl<C: PageTableConfig> PageTable<C> {
             // Allocating a fresh node does not change the lock set, so any node
             // that was (un)locked before remains so.
             final(guards).guards == old(guards).guards,
+            final(guards).held == old(guards).held,
             old(regions).contains(
                 frame_to_index(
                     (final(owner)@->0).0.value().meta_slot_paddr()->0)),
@@ -1258,6 +1269,7 @@ impl<C: PageTableConfig> PageTable<C> {
             va.end > 0,
             // No node of the page table has a live guard.
             owner.0.subtree_satisfies(owner.0.value().path, node_unguarded::<C>(*old(guards))),
+            old(guards).held.dom() == Set::<usize>::empty(),
         ensures
             final(regions).slots == old(regions).slots,
             forall|idx: int| #![trigger final(regions).slot_owners[idx]]
@@ -1320,6 +1332,7 @@ impl<C: PageTableConfig> PageTable<C> {
             va.end > 0,
             // No node of the page table has a live guard.
             owner.0.subtree_satisfies(owner.0.value().path, node_unguarded::<C>(*old(guards))),
+            old(guards).held.dom() == Set::<usize>::empty(),
         ensures
             final(regions).slots == old(regions).slots,
             forall|idx: int| #![trigger final(regions).slot_owners[idx]]

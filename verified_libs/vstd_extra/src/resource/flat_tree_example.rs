@@ -11,8 +11,8 @@
 //! - [`example_stray_child`]: `C` is unmapped from `P` while another cursor
 //!   holds `C`, and that cursor can still unlock it.
 use crate::resource::flat_tree::*;
-use vstd::cell::pcell::{PCell, PointsTo};
 use vstd::cell::CellId;
+use vstd::cell::pcell::{PCell, PointsTo};
 use vstd::prelude::*;
 
 verus! {

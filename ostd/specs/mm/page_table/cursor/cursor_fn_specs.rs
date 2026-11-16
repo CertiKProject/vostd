@@ -88,6 +88,7 @@ impl<'rcu, C: PageTableConfig, A: InAtomicMode> Cursor<'rcu, C, A> {
         &&& regions.inv()
         &&& owner.children_not_locked(guards)
         &&& owner.nodes_locked(guards)
+        &&& guards.cells_wf(owner.cells)
         &&& owner.metaregion_sound(regions)
         &&& !owner.popped_too_high
     }

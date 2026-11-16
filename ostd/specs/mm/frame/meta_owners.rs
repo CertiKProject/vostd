@@ -110,10 +110,10 @@ pub ghost struct PtLockConsts {
 /// The constant of a page table node lock: a [`flat_tree`] lock constant, keyed
 /// by the node's physical address.
 ///
-/// The notion of a Constant comes from the ghost Atomics,  AtomicU8<K, G, Pred>,  the K is the part 
-/// that does not change. Here, it refers to the identities of everything inside the cell, as opposed to the contents. 
+/// The notion of a Constant comes from the ghost Atomics,  AtomicU8<K, G, Pred>,  the K is the part
+/// that does not change. Here, it refers to the identities of everything inside the cell, as opposed to the contents.
 /// The identities are fixed for the node's whole lifetime. The contents change whenever the lock holder writes.
-/// 
+///
 /// [`flat_tree`]: vstd_extra::resource::flat_tree
 pub type PtLockConst = LockConst<Paddr, PtLockConsts>;
 

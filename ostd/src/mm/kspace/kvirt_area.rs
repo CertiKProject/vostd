@@ -238,6 +238,7 @@ fn collect_largest_pages(va: Vaddr, pa: Paddr, len: usize) -> alloc::vec::Vec<(P
         final(kernel_owner)@->0.metaregion_sound(*regions),
         res.relates_owner(*final(kernel_owner)@->0, *regions),
         guards.unlocked((final(kernel_owner)@->0).0.value().node().slot_vaddr()),
+        !guards.held.contains_key((final(kernel_owner)@->0).0.value().node().slot_vaddr()),
 )]
 pub(crate) fn get_kernel_page_table<'rcu>() -> &'static PageTable<KernelPtConfig> {
     KERNEL_PAGE_TABLE.get().unwrap()
@@ -452,6 +453,7 @@ impl KVirtArea {
                     *old(guards),
                 ),
             ),
+            old(guards).held.dom() == Set::<usize>::empty(),
             // For each frame, the map contains an appropriate owner keyed by
             // that frame's paddr. Duplicates in `frames` share the same owner.
             forall|i: int|
@@ -741,6 +743,7 @@ impl KVirtArea {
                     *old(guards),
                 ),
             ),
+            old(guards).held.dom() == Set::<usize>::empty(),
             Self::untracked_range_slots_in_regions(&pa_range, *old(regions)),
             forall|pa: Paddr, level: PagingLevel|
                 #[trigger]

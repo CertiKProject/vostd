@@ -32,10 +32,16 @@ mod child_specs;
 mod entry_specs;
 
 use vstd::{
-    atomic_ghost::AtomicInvariantPredicate, atomic_with_ghost, cell::pcell_maybe_uninit, prelude::*,
-    resource::ghost_var::{GhostVar, GhostVarAuth}, simple_pptr::PPtr,
+    atomic_ghost::AtomicInvariantPredicate,
+    atomic_with_ghost,
+    cell::pcell_maybe_uninit,
+    prelude::*,
+    resource::ghost_var::{GhostVar, GhostVarAuth},
+    simple_pptr::PPtr,
 };
-use vstd_extra::{array_ptr, cast_ptr::*, drop_tracking::DropObligation, ghost_tree::*, ownership::*};
+use vstd_extra::{
+    array_ptr, cast_ptr::*, drop_tracking::DropObligation, ghost_tree::*, ownership::*,
+};
 
 pub use crate::specs::mm::page_table::node::{entry_owners::*, owners::*};
 use crate::specs::mm::{
@@ -66,7 +72,11 @@ use crate::{
     specs::task::InAtomicMode,
 };
 pub use child::*;
-use core::{marker::PhantomData, ops::{Deref, Range}, sync::atomic::Ordering};
+use core::{
+    marker::PhantomData,
+    ops::{Deref, Range},
+    sync::atomic::Ordering,
+};
 pub use entry::*;
 
 verus! {
@@ -235,7 +245,7 @@ impl<C: PageTableConfig> PageTableNode<C> {
         ensures
             final(regions).inv(),
             allocated_empty_node_owner(owner@, level),
-            !owner@.value().node().is_locked(),
+            !guards.held.contains_key(owner@.value().node().slot_vaddr()),
             allocated_empty_node_grandchildren_none(owner@),
             res.ptr.addr() == owner@.value().node().slot_vaddr(),
             res.external_meta_wf(owner@.value().node().frame_permission.resource(), ()),
@@ -331,10 +341,11 @@ impl<'a, C: PageTableConfig> PageTableNodeRef<'a, C> {
         guards0: Guards,
         guards1: Guards,
     ) -> bool {
-        &&& forall|b: Range<Vaddr>| #[trigger] OwnerSubtree::implies(
-            CursorOwner::<'rcu, C>::node_unlocked(guards0, b),
-            CursorOwner::<'rcu, C>::node_unlocked_except(guards1, addr, b),
-        )
+        &&& forall|b: Range<Vaddr>| #[trigger]
+            OwnerSubtree::implies(
+                CursorOwner::<'rcu, C>::node_unlocked(guards0, b),
+                CursorOwner::<'rcu, C>::node_unlocked_except(guards1, addr, b),
+            )
         &&& forall|i: usize| guards0.lock_held(i) ==> guards1.lock_held(i)
         &&& forall|i: usize| guards0.unlocked(i) && i != addr ==> guards1.unlocked(i)
     }
@@ -352,10 +363,9 @@ impl<'a, C: PageTableConfig> PageTableNodeRef<'a, C> {
     /// - No guard for this node exists.
     /// ## Postconditions
     /// - Returns the lock's cell, whose payload holds the permissions for the node's
-    ///   `nr_children` and `stray` cells, and the authoritative half of its PTE model,
-    ///   which agrees with `owner`. Install it with
-    ///   [`NodeOwner::tracked_install_lock_cell`].
-    /// - The returned guard is recorded in `guards`.
+    ///   `nr_children` and `stray` cells, its PTE array, and the authoritative half
+    ///   of its PTE model, which agrees with `owner` ([`NodeOwner::holds`]).
+    /// - The returned guard is recorded in `guards`, and the cell as held.
     /// ## Key Verification Step
     /// The cell is extracted from the lock's atomic invariant when the
     /// compare-and-exchange succeeds, as in `SpinLock::acquire_lock`.
@@ -370,18 +380,18 @@ impl<'a, C: PageTableConfig> PageTableNodeRef<'a, C> {
             owner.pte_view.id() == owner.meta_value().lock.constant().consts.pte_model_id,
             lock_key_wf(owner.meta_value(), owner.slot_index),
             old(guards).unlocked(owner.slot_vaddr()),
+            // This thread does not hold the lock already.
+            !old(guards).held.contains_key(owner.slot_vaddr()),
         ensures
             final(guards).lock_held(owner.slot_vaddr()),
+            final(guards).held == old(guards).held.insert(owner.slot_vaddr(), cell@.lock_const()),
             Self::locks_preserved_except(owner.slot_vaddr(), *old(guards), *final(guards)),
             owner.relate_guard(res),
             cell@.lock_const() == owner.meta_value().lock.constant(),
             cell@.inv_cell(),
-            cell@.key() == meta_to_frame(index_to_meta(owner.slot_index)),
-            cell@.value().meta.inv(),
-            owner.meta_value().wf(cell@.value().meta),
-            cell@.value().pte_auth.id() == owner.pte_view.id(),
-            cell@.value().pte_auth@ == owner.pte_view@,
-            cell@.value().meta.nr_children.value() == count_present(owner.ptes()),
+            cell@.key() == owner.paddr(),
+            owner.holds(cell@),
+            owner.count_consistent(cell@),
     )]
     #[verifier::exec_allows_no_decreases_clause]
     pub fn lock<'rcu, A: InAtomicMode>(self, _guard: &'rcu A) -> PageTableGuard<'rcu, C> where
@@ -406,7 +416,8 @@ impl<'a, C: PageTableConfig> PageTableNodeRef<'a, C> {
                 payload is Some,
                 PtLockPred::atomic_inv(meta.lock.constant(), 0, payload),
         {
-            let res = atomic_with_ghost! {
+            let res =
+                atomic_with_ghost! {
                 meta.lock => compare_exchange(0, 1);
                 returning res;
                 ghost g => {
@@ -428,9 +439,9 @@ impl<'a, C: PageTableConfig> PageTableNodeRef<'a, C> {
         }
         proof {
             reveal(lock_key_wf);
-            payload.tracked_borrow_value().pte_auth.agree(&owner.pte_view);
-            lemma_count_where_raw::<C::E>(owner.pte_view@, owner.pte_view@.len() as int);
+            owner.tracked_lemma_holds(&payload);
             guards.guards = guards.guards.insert(owner.slot_vaddr());
+            guards.held = guards.held.insert(owner.slot_vaddr(), payload.lock_const());
         }
         proof_with!{ |= Tracked(payload) }
         guard
@@ -453,6 +464,7 @@ impl<'a, C: PageTableConfig> PageTableNodeRef<'a, C> {
             old(guards).unlocked(owner.slot_vaddr()),
         ensures
             final(guards).lock_held(owner.slot_vaddr()),
+            final(guards).held == old(guards).held,
             Self::locks_preserved_except(owner.slot_vaddr(), *old(guards), *final(guards)),
             owner.relate_guard(res),
     )]
@@ -523,13 +535,13 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
     /// - We require the caller to provide a permission token to ensure that this function is only called on a valid page table node.
     #[verus_spec(nr =>
         with Tracked(owner) : Tracked<&NodeOwner<C>>,
+             Tracked(cell) : Tracked<&PtLockCell>,
         requires
-            owner.is_locked(),
-            owner.meta().nr_children.id() == owner.meta_value().nr_children.id(),
+            owner.holds(*cell),
             self.inner.inner@.invariants(*owner),
             self.inner.inner@.external_meta_wf(owner.frame_permission.resource(), ()),
         returns
-            owner.meta().nr_children.value(),
+            cell.value().meta.nr_children.value(),
     )]
     pub fn nr_children(&self) -> u16 {
         #[verus_spec(with
@@ -538,7 +550,7 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
         )]
         let meta = self.meta();
 
-        *meta.nr_children.borrow(Tracked(&owner.tracked_borrow_meta().nr_children))
+        *meta.nr_children.borrow(Tracked(&cell.tracked_borrow_value().meta.nr_children))
     }
 
     /// Returns if the page table node is detached from its parent.
@@ -620,18 +632,19 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
     #[verus_spec(
         with Tracked(owner): Tracked<&mut NodeOwner<C>>,
              Tracked(regions): Tracked<&MetaRegionOwners>,
+             Tracked(cell): Tracked<&mut PtLockCell>,
         requires
             old(self).inner.inner@.invariants(*old(owner)),
-            old(owner).is_locked(),
+            old(owner).holds(*old(cell)),
             regions.inv(),
             regions.contains(old(owner).slot_index),
             idx < NR_ENTRIES,
         ensures
             final(owner).inv(),
             final(owner).level() == old(owner).level(),
-            final(owner).is_locked(),
-            final(owner).meta() == old(owner).meta(),
-            final(owner).cell().lock_const() == old(owner).cell().lock_const(),
+            final(owner).holds(*final(cell)),
+            final(cell).value().meta == old(cell).value().meta,
+            final(cell).lock_const() == old(cell).lock_const(),
             final(owner).pte_view.id() == old(owner).pte_view.id(),
             final(owner).frame_permission == old(owner).frame_permission,
             final(owner).slot_index == old(owner).slot_index,
@@ -653,13 +666,13 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
         // - The page table node is alive. The index is inside the bound, so the page table entry is valid.
         // - All page table entries are aligned and accessed with atomic operations only.
         unsafe {
-            #[verus_spec(with Tracked(NodeOwner::<C>::tracked_cell_perm_mut(&mut owner.lock_cell)))]
+            #[verus_spec(with Tracked(&mut cell.tracked_borrow_mut_value().ptes))]
             store_pte(ptr.add(idx), pte, Ordering::Release)
         }
         proof {
-            assert(owner.perm().wf());
+            assert(cell.value().ptes.wf());
             lemma_decode_update::<C::E>(old(owner).pte_view@, idx as int, pte);
-            owner.tracked_sync_pte_model();
+            owner.tracked_sync_pte_model(cell);
         }
     }
 
@@ -671,37 +684,37 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
     ///
     /// # Verified Properties
     /// ## Preconditions
-    /// - `owner` is the owner of this node and holds its lock cell, which belongs
-    ///   to this node's lock, and `nr_children` counts the present PTEs
-    ///   (`count_consistent`), as the lock's invariant requires. These are part
-    ///   of [`NodeOwner::metaregion_sound_node`].
+    /// - `cell` is this node's lock cell and agrees with `owner`
+    ///   ([`NodeOwner::holds`]), and `nr_children` counts the present PTEs
+    ///   ([`NodeOwner::count_consistent`]), as the lock's invariant requires.
     /// - The guard has been redeemed from the [`Guards`] ledger: `obl` is its
     ///   drop obligation (see [`TrackDrop::tracked_redeem`]). A caller holding a
     ///   guard recorded in the ledger redeems it first.
     /// ## Postconditions
-    /// - The cell has moved from `owner` back into the lock; nothing else in
-    ///   `owner` changes.
+    /// - The cell has moved back into the lock, and is no longer recorded as
+    ///   held in `guards`.
     /// ## Key Verification Step
     /// The lock cannot already hold a cell, since it would have the same lock
-    /// identity as `owner`'s ([`NodeCell::lemma_distinct`]).
+    /// identity as `cell` ([`NodeCell::lemma_distinct`]).
     ///
     /// [`NodeCell::lemma_distinct`]: vstd_extra::resource::flat_tree::NodeCell::lemma_distinct
     #[verus_spec(
-        with Tracked(owner): Tracked<&mut NodeOwner<C>>,
+        with Tracked(owner): Tracked<&NodeOwner<C>>,
+             Tracked(cell): Tracked<PtLockCell>,
+             Tracked(guards): Tracked<&mut Guards>,
              Tracked(obl): Tracked<DropObligation<usize>>,
         requires
-            old(owner).relate_guard(self),
-            old(owner).inv(),
-            old(owner).is_locked(),
-            self.inner.inner@.external_meta_wf(old(owner).frame_permission.resource(), ()),
-            old(owner).meta_value().lock_wf(),
-            lock_key_wf(old(owner).meta_value(), old(owner).slot_index),
-            old(owner).cell().lock_const() == old(owner).meta_value().lock.constant(),
-            old(owner).count_consistent(),
-            obl.value() == old(owner).slot_vaddr(),
+            owner.relate_guard(self),
+            owner.inv(),
+            self.inner.inner@.external_meta_wf(owner.frame_permission.resource(), ()),
+            owner.meta_value().lock_wf(),
+            lock_key_wf(owner.meta_value(), owner.slot_index),
+            owner.holds(cell),
+            owner.count_consistent(cell),
+            obl.value() == owner.slot_vaddr(),
         ensures
-            *final(owner) == (NodeOwner { lock_cell: None, ..*old(owner) }),
-            final(owner).inv(),
+            final(guards).guards == old(guards).guards,
+            final(guards).held == old(guards).held.remove(owner.slot_vaddr()),
     )]
     pub fn unlock(self) {
         #[verus_spec(with
@@ -711,13 +724,11 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
         let meta = self.meta();
 
         proof_decl! {
-            let tracked mut cell = owner.lock_cell.tracked_take();
+            let tracked mut cell = cell;
         }
         proof {
-            reveal(PageTablePageMeta::lock_consts_wf);
-            lemma_count_where_raw::<C::E>(owner.pte_view@, owner.pte_view@.len() as int);
-            reveal(lock_key_wf);
-            assert(cell.inv_cell());
+            owner.lemma_holds_inv_cell(cell);
+            guards.held = guards.held.remove(owner.slot_vaddr());
         }
         atomic_with_ghost! {
             meta.lock => store(0);

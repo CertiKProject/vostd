@@ -344,8 +344,7 @@ pub open spec fn allocated_empty_node_owner<C: PageTableConfig>(
     // "not all are present" clause; needed by `split_if_mapped_huge`'s
     // loop invariant which inspects each slot's PTE.)
     &&& forall|j: int|
-        0 <= j < NR_ENTRIES ==> #[trigger] owner.value().node().ptes()[j]
-            == C::E::new_absent_spec()
+        0 <= j < NR_ENTRIES ==> #[trigger] owner.value().node().ptes()[j] == C::E::new_absent_spec()
 }
 
 /// Grandchildren of a freshly-allocated PT node are all `None`. The absent
@@ -581,132 +580,6 @@ impl<C: PageTableConfig> PageTableOwner<C> {
         &&& self.0.inv()
         &&& self.pt_inv_at_depth((INC_LEVELS - self.0.level()) as nat)
     }
-
-    /// Replacing the root value of a node subtree by one that differs only in its
-    /// lock state keeps the subtree's invariants.
-    pub proof fn lemma_replace_root_value(
-        t: OwnerSubtree<C>,
-        t2: OwnerSubtree<C>,
-        regions: MetaRegionOwners,
-    )
-        requires
-            PageTableOwner(t).pt_inv(),
-            PageTableOwner(t).metaregion_sound(regions),
-            t.value().is_node(),
-            t2.level() == t.level(),
-            t2.children() == t.children(),
-            t2.value().is_node(),
-            t2.value().inv(),
-            t2.value().path == t.value().path,
-            t2.value().parent_level == t.value().parent_level,
-            t2.value().node().pte_view == t.value().node().pte_view,
-            t2.value().node().frame_permission == t.value().node().frame_permission,
-            t2.value().node().tree_level == t.value().node().tree_level,
-            t2.value().node().slot_index == t.value().node().slot_index,
-            t2.value().metaregion_sound(regions),
-        ensures
-            PageTableOwner(t2).pt_inv(),
-            PageTableOwner(t2).metaregion_sound(regions),
-    {
-        reveal(PageTableOwner::pt_inv_at_depth);
-        assert(<EntryOwner<C> as TreeNodeValue<INC_LEVELS>>::la_inv(t.value(), t.level()));
-        assert(t2.inv());
-        let depth = (INC_LEVELS - t.level()) as nat;
-        assert(depth > 0);
-        assert forall|i: int| 0 <= i < NR_ENTRIES implies #[trigger] t2.has_child(i)
-            && PageTableOwner::<C>::pt_edge_at(t2, i) && PageTableOwner(t2.child(i)).pt_inv_at_depth(
-            (depth - 1) as nat,
-        ) by {
-            PageTableOwner(t).pt_inv_unroll(i);
-            assert(t2.child(i) == t.child(i));
-        }
-        Self::lemma_pt_inv_intro(t2);
-        assert forall|i: int|
-            0 <= i < t2.children().len() && #[trigger] t2.has_child(i) implies t2.child(
-            i,
-        ).subtree_satisfies(t2.value().path.push_tail(i), PageTableOwner::<C>::metaregion_sound_pred(regions)) by {
-            assert(t.has_child(i));
-        }
-    }
-
-    /// Replacing child `i` of a node subtree by a sound subtree for the same
-    /// entry keeps the parent's invariants.
-    pub proof fn lemma_replace_child(
-        t: OwnerSubtree<C>,
-        i: int,
-        c2: OwnerSubtree<C>,
-        regions: MetaRegionOwners,
-    )
-        requires
-            PageTableOwner(t).pt_inv(),
-            PageTableOwner(t).metaregion_sound(regions),
-            t.value().is_node(),
-            0 <= i < NR_ENTRIES,
-            PageTableOwner(c2).pt_inv(),
-            PageTableOwner(c2).metaregion_sound(regions),
-            c2.level() == t.level() + 1,
-            c2.value().path == t.child(i).value().path,
-            c2.value().parent_level == t.child(i).value().parent_level,
-            c2.value().match_pte(
-                t.value().node().ptes()[i],
-                t.value().node().level(),
-            ),
-        ensures
-            PageTableOwner(t.insert(i, c2)).pt_inv(),
-            PageTableOwner(t.insert(i, c2)).metaregion_sound(regions),
-    {
-        reveal(PageTableOwner::pt_inv_at_depth);
-        let t2 = t.insert(i, c2);
-        PageTableOwner(t).pt_inv_unroll(i);
-        assert(<EntryOwner<C> as TreeNodeValue<INC_LEVELS>>::la_inv(t.value(), t.level()));
-        assert(t2.inv());
-        let depth = (INC_LEVELS - t.level()) as nat;
-        assert(depth > 0);
-        assert forall|j: int| 0 <= j < NR_ENTRIES implies #[trigger] t2.has_child(j)
-            && PageTableOwner::<C>::pt_edge_at(t2, j) && PageTableOwner(t2.child(j)).pt_inv_at_depth(
-            (depth - 1) as nat,
-        ) by {
-            if j != i {
-                PageTableOwner(t).pt_inv_unroll(j);
-                assert(t2.child(j) == t.child(j));
-            } else {
-                assert(t2.child(j) == c2);
-            }
-        }
-        Self::lemma_pt_inv_intro(t2);
-        assert forall|j: int|
-            0 <= j < t2.children().len() && #[trigger] t2.has_child(j) implies t2.child(
-            j,
-        ).subtree_satisfies(t2.value().path.push_tail(j), PageTableOwner::<C>::metaregion_sound_pred(regions)) by {
-            if j != i {
-                assert(t.has_child(j));
-            }
-        }
-    }
-
-    /// Introduces `pt_inv` for a node subtree from its per-child facts.
-    #[verifier::spinoff_prover]
-    pub proof fn lemma_pt_inv_intro(owner: OwnerSubtree<C>)
-        requires
-            owner.inv(),
-            owner.value().is_node(),
-            forall|i: int| 0 <= i < NR_ENTRIES ==> #[trigger] owner.has_child(i)
-                && Self::pt_edge_at(owner, i) && PageTableOwner(owner.child(i)).pt_inv_at_depth(
-                ((INC_LEVELS - owner.level()) as nat - 1) as nat),
-        ensures
-            PageTableOwner(owner).pt_inv(),
-    {
-        reveal(PageTableOwner::pt_inv_at_depth);
-        let depth = (INC_LEVELS - owner.level()) as nat;
-        assert(<EntryOwner<C> as TreeNodeValue<INC_LEVELS>>::la_inv(owner.value(), owner.level()));
-        assert forall|i: int| 0 <= i < NR_ENTRIES implies #[trigger] owner.has_child(i)
-            && Self::pt_edge_at(owner, i) && PageTableOwner(owner.child(i)).pt_inv_at_depth(
-            (depth - 1) as nat,
-        ) by {
-            assert(owner.has_child(i));
-        };
-    }
-
 
     #[verifier::spinoff_prover]
     #[verifier::spinoff_prover]
@@ -1465,11 +1338,11 @@ impl<C: PageTableConfig> PageTableOwner<C> {
     {
     }
 
-    /// A node with `nr_children == 0` has no present PTEs, so all children are
-    /// absent and the subtree contributes no mappings.
+    /// A node with no present PTEs (e.g. one whose `nr_children` is 0, by
+    /// [`NodeOwner::count_consistent`]) has only absent children, so the
+    /// subtree contributes no mappings.
     ///
-    /// `count_consistent` ties `nr_children` to `count_present(children_perm)`,
-    /// so `nr_children == 0` forces every PTE absent. `pt_edge_at` (from
+    /// No present PTEs forces every PTE absent. `pt_edge_at` (from
     /// `pt_inv`) then forces each ghost child `is_absent` — its `view_rec` is
     /// `∅` — and `lemma_view_rec_contains` lifts that to the whole node's
     /// `view_rec`. (At the top level the `borrowed` edge disjunct is ruled out:
@@ -1479,9 +1352,8 @@ impl<C: PageTableConfig> PageTableOwner<C> {
         requires
             self.pt_inv(),
             self.0.value().is_node(),
-            self.0.value().node().is_locked(),
-            self.0.value().node().meta().nr_children.value() == 0,
-            self.0.value().node().count_consistent(),
+            crate::specs::mm::page_table::node::owners::count_present(self.0.value().node().ptes())
+                == 0,
             path.len() <= INC_LEVELS - 1,
             path.len() == self.0.level(),
         ensures

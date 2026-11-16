@@ -93,14 +93,15 @@ pub proof fn subtree_unlock_upgrade<'rcu, C: PageTableConfig>(
 
             let child_path = path.push_tail(i);
 
-            subtree_unlock_upgrade(child,
+            subtree_unlock_upgrade(
+                child,
                 child_path,
                 guards,
                 regions,
                 excepted_addr,
                 excepted_path,
-                    barrier,
-                );
+                barrier,
+            );
         };
     } else if subtree.level() < INC_LEVELS - 1 && !subtree.value().is_node() {
         // Non-node: pt_inv gives children[i] is None, so subtree_satisfies
@@ -281,8 +282,6 @@ impl<'rcu, C: PageTableConfig> CursorOwner<'rcu, C> {
             self.cur_entry_owner().is_node(),
             // The child node's guard relates to the new guard
             self.cur_entry_owner().node().relate_guard(guard),
-            // The child node's lock is held
-            self.cur_entry_owner().node().is_locked(),
             // Guard distinctness: the new guard points to a different node than all existing continuations
             forall|i: int|
                 #![trigger self.continuations[i]]
@@ -407,9 +406,13 @@ impl<'rcu, C: PageTableConfig> CursorOwner<'rcu, C> {
 
         // The current child node overlaps the barrier range, so
         // `only_current_locked` says the cursor holds its lock cell.
-        assert(cur_entry.node().is_locked()) by {
+        assert(cur_entry.node().held_in(guards)) by {
             self.lemma_cur_entry_overlaps_barrier();
-            let g = CursorOwner::<'rcu, C>::node_unlocked_except(guards, cur_entry_addr, self.barrier_va);
+            let g = CursorOwner::<'rcu, C>::node_unlocked_except(
+                guards,
+                cur_entry_addr,
+                self.barrier_va,
+            );
             assert(old_cont.map_children(g));
             assert(old_cont.children[old_cont.idx as int] is Some);
             assert(old_cont.children[old_cont.idx as int]->0.subtree_satisfies(
@@ -421,7 +424,11 @@ impl<'rcu, C: PageTableConfig> CursorOwner<'rcu, C> {
         self.push_level_owner_preserves_inv(guard);
 
         let f = PageTableOwner::<C>::metaregion_sound_pred(regions);
-        let g_except = CursorOwner::<'rcu, C>::node_unlocked_except(guards, cur_entry_addr, self.barrier_va);
+        let g_except = CursorOwner::<'rcu, C>::node_unlocked_except(
+            guards,
+            cur_entry_addr,
+            self.barrier_va,
+        );
         let h = CursorOwner::<'rcu, C>::node_unlocked(guards, self.barrier_va);
 
         assert forall|i: int|
