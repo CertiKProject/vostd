@@ -1693,6 +1693,9 @@ impl<'rcu, C: PageTableConfig, A: InAtomicMode> Cursor<'rcu, C, A> {
             final(owner).guard_level == old(owner).guard_level,
             old(owner).in_barrier_va() ==> final(owner).in_barrier_va(),
             *final(regions) == *old(regions),
+            // Popping forgets the child's guard; nothing else changes.
+            final(guards).held == old(guards).held,
+            forall|a: usize| #[trigger] final(guards).lock_held(a) ==> old(guards).lock_held(a),
     )]
     #[verifier::spinoff_prover]
     fn pop_level(&mut self) {
