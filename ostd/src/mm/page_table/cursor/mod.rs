@@ -1080,6 +1080,11 @@ impl<'rcu, C: PageTableConfig> Cursor<'rcu, C> {
                             owner.continuations[owner.level - 1].lemma_pt_inv_children_unroll(
                                 owner.index() as int,
                             );
+                            // The child is a level below its parent, so not top-level.
+                            owner.continuations[owner.level - 1].lemma_inv_children_rel_unroll(
+                                owner.index() as int,
+                            );
+                            assert(subtree.value().node().level() < C::NR_LEVELS);
                             PageTableOwner(subtree).lemma_view_rec_nr_children_zero_empty(
                                 subtree.value().path,
                             );
@@ -2577,6 +2582,7 @@ impl<'rcu, C: PageTableConfig> CursorMut<'rcu, C> {
                     let ghost guards_pre_none = *guards;
                     proof {
                         self.0.lemma_pte_index_matches_owner(owner_pre_none);
+                        owner.lemma_cur_slot_owned();
                     }
                     let entry_idx = pte_index::<C>(self.0.va, self.0.level);
 
@@ -3615,6 +3621,9 @@ impl<'rcu, C: PageTableConfig> CursorMut<'rcu, C> {
         }
         let entry_idx = pte_index::<C>(self.0.va, self.0.level);
 
+        proof {
+            owner.lemma_cur_slot_owned();
+        }
         let tracked mut continuation = owner.continuations.tracked_remove(owner.level - 1);
         let ghost cont0 = continuation;
 
