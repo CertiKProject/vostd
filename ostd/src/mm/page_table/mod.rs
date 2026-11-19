@@ -988,6 +988,11 @@ impl PageTable<KernelPtConfig> {
                 new_node_owner.inv(),
                 new_node_owner.relate_guard(new_node),
                 regions.contains(new_node_owner.slot_index),
+                // The new root is a user page table's root, which does not own
+                // the kernel half it borrows, so copying it in keeps
+                // `nr_children` consistent.
+                new_node_owner.level() == UserPtConfig::NR_LEVELS(),
+                new_node_owner.count_consistent(),
             decreases KernelPtConfig::TOP_LEVEL_INDEX_RANGE().end - i,
         {
             proof {
@@ -1072,12 +1077,22 @@ impl PageTable<KernelPtConfig> {
             proof {
                 assert(regions.contains(new_node_owner.slot_index));
             }
+            let ghost new_node_owner0 = new_node_owner;
             unsafe {
                 #[verus_spec(with Tracked(&mut new_node_owner), Tracked(&*regions))]
                 new_node.write_pte(i, pte)
             };
+            proof {
+                // Slot `i` is in the kernel half, which the user root does not own.
+                assert(!new_node_owner0.owns_slot(i as int));
+                new_node_owner0.lemma_count_owned_update(new_node_owner, i as int, pte);
+            }
 
             i = i + 1;
+        }
+        proof {
+            // The new root stays consistent: its owner could be handed back.
+            assert(new_node_owner.count_consistent());
         }
 
         PageTable::<UserPtConfig> { root: new_root }

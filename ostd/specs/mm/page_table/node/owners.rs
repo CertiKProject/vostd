@@ -26,17 +26,18 @@ verus! {
 
 // ─── Present-PTE counting ──────────────────────────────────────────────────────
 // The intended meaning of `nr_children`: the number of *present* PTEs in the
-// node's `children_perm` array. `metaregion_sound_node` ties `nr_children` to
-// `count_present(children_perm.value())` (a settled-node invariant), which lets
-// the `nr_children_*_slot_bound` boundary facts be proven rather than axiomatized.
-/// Number of present PTEs among the first `n` entries of `s`.
-pub open spec fn count_present_upto<E: PageTableEntryTrait>(s: Seq<E>, n: int) -> int
-    decreases n,
+// slots the node owns (`NodeOwner::owned_range`). `metaregion_sound_node` ties
+// `nr_children` to that count (`NodeOwner::count_consistent`, a settled-node
+// invariant), which lets the `nr_children_*_slot_bound` boundary facts be
+// proven rather than axiomatized.
+/// Number of present PTEs among entries `lo..n` of `s`.
+pub open spec fn count_present_between<E: PageTableEntryTrait>(s: Seq<E>, lo: int, n: int) -> int
+    decreases n - lo,
 {
-    if n <= 0 {
+    if n <= lo {
         0
     } else {
-        count_present_upto(s, n - 1) + if s[n - 1].is_present() {
+        count_present_between(s, lo, n - 1) + if s[n - 1].is_present() {
             1int
         } else {
             0int
@@ -44,118 +45,115 @@ pub open spec fn count_present_upto<E: PageTableEntryTrait>(s: Seq<E>, n: int) -
     }
 }
 
-/// Number of present PTEs in `s`.
-pub open spec fn count_present<E: PageTableEntryTrait>(s: Seq<E>) -> int {
-    count_present_upto(s, s.len() as int)
-}
-
-/// `count_present_upto` is between `0` and `n`.
-pub proof fn lemma_count_present_upto_bound<E: PageTableEntryTrait>(s: Seq<E>, n: int)
+/// `count_present_between` is between `0` and `n - lo`.
+pub proof fn lemma_count_present_between_bound<E: PageTableEntryTrait>(s: Seq<E>, lo: int, n: int)
     requires
-        0 <= n,
+        lo <= n,
     ensures
-        0 <= count_present_upto(s, n) <= n,
-    decreases n,
+        0 <= count_present_between(s, lo, n) <= n - lo,
+    decreases n - lo,
 {
-    if n > 0 {
-        lemma_count_present_upto_bound(s, n - 1);
+    if n > lo {
+        lemma_count_present_between_bound(s, lo, n - 1);
     }
 }
 
-/// An absent slot below `n` makes the count strictly less than `n`.
-pub proof fn lemma_count_present_upto_absent<E: PageTableEntryTrait>(s: Seq<E>, n: int, idx: int)
+/// An absent slot in `lo..n` makes the count strictly less than `n - lo`.
+pub proof fn lemma_count_present_between_absent<E: PageTableEntryTrait>(
+    s: Seq<E>,
+    lo: int,
+    n: int,
+    idx: int,
+)
     requires
-        0 <= idx < n,
+        lo <= idx < n,
         !s[idx].is_present(),
     ensures
-        count_present_upto(s, n) < n,
-    decreases n,
+        count_present_between(s, lo, n) < n - lo,
+    decreases n - lo,
 {
-    lemma_count_present_upto_bound(s, n - 1);
+    lemma_count_present_between_bound(s, lo, n - 1);
     if idx < n - 1 {
-        lemma_count_present_upto_absent(s, n - 1, idx);
+        lemma_count_present_between_absent(s, lo, n - 1, idx);
     }
 }
 
-/// A present slot below `n` makes the count at least `1`.
-pub proof fn lemma_count_present_upto_present<E: PageTableEntryTrait>(s: Seq<E>, n: int, idx: int)
+/// A present slot in `lo..n` makes the count at least `1`.
+pub proof fn lemma_count_present_between_present<E: PageTableEntryTrait>(
+    s: Seq<E>,
+    lo: int,
+    n: int,
+    idx: int,
+)
     requires
-        0 <= idx < n,
+        lo <= idx < n,
         s[idx].is_present(),
     ensures
-        count_present_upto(s, n) >= 1,
-    decreases n,
+        count_present_between(s, lo, n) >= 1,
+    decreases n - lo,
 {
-    lemma_count_present_upto_bound(s, n - 1);
+    lemma_count_present_between_bound(s, lo, n - 1);
     if idx < n - 1 {
-        lemma_count_present_upto_present(s, n - 1, idx);
+        lemma_count_present_between_present(s, lo, n - 1, idx);
     }
 }
 
-/// Updating slot `idx` (with `idx < n`) shifts the count by the change in that
-/// slot's present-indicator.
-pub proof fn lemma_count_present_upto_update<E: PageTableEntryTrait>(
+/// If two sequences agree on `lo..n`, their counts there are equal.
+pub proof fn lemma_count_present_between_unchanged<E: PageTableEntryTrait>(
     s: Seq<E>,
+    s2: Seq<E>,
+    lo: int,
+    n: int,
+)
+    requires
+        forall|k: int| lo <= k < n ==> s[k] == s2[k],
+    ensures
+        count_present_between(s2, lo, n) == count_present_between(s, lo, n),
+    decreases n - lo,
+{
+    if n > lo {
+        lemma_count_present_between_unchanged(s, s2, lo, n - 1);
+    }
+}
+
+/// Updating slot `idx` shifts the count over `lo..n` by the change in that
+/// slot's present-indicator if `idx` is in `lo..n`, and leaves it unchanged
+/// otherwise.
+pub proof fn lemma_count_present_between_update<E: PageTableEntryTrait>(
+    s: Seq<E>,
+    lo: int,
     n: int,
     idx: int,
     pte: E,
 )
     requires
-        0 <= idx < n <= s.len(),
+        0 <= lo,
+        n <= s.len(),
+        0 <= idx < s.len(),
     ensures
-        count_present_upto(s.update(idx, pte), n) == count_present_upto(s, n) - (
-        if s[idx].is_present() {
-            1int
+        count_present_between(s.update(idx, pte), lo, n) == count_present_between(s, lo, n) + if lo
+            <= idx < n {
+            (if pte.is_present() {
+                1int
+            } else {
+                0int
+            }) - (if s[idx].is_present() {
+                1int
+            } else {
+                0int
+            })
         } else {
             0int
-        }) + (if pte.is_present() {
-            1int
-        } else {
-            0int
-        }),
-    decreases n,
+        },
+    decreases n - lo,
 {
     let s2 = s.update(idx, pte);
-    if n - 1 == idx {
-        // The first `idx` entries are unchanged.
-        assert(count_present_upto(s2, n - 1) == count_present_upto(s, n - 1)) by {
-            lemma_count_present_upto_unchanged(s, s2, n - 1);
+    if n > lo {
+        if n - 1 == idx {
+            lemma_count_present_between_unchanged(s, s2, lo, n - 1);
+        } else {
+            lemma_count_present_between_update(s, lo, n - 1, idx, pte);
         }
-    } else {
-        lemma_count_present_upto_update(s, n - 1, idx, pte);
-    }
-}
-
-/// A zero present-count up to `n` means every slot below `n` is absent.
-pub proof fn lemma_count_present_upto_zero_all_absent<E: PageTableEntryTrait>(s: Seq<E>, n: int)
-    requires
-        count_present_upto(s, n) == 0,
-        0 <= n,
-    ensures
-        forall|k: int| 0 <= k < n ==> !#[trigger] s[k].is_present(),
-    decreases n,
-{
-    if n > 0 {
-        lemma_count_present_upto_bound(s, n - 1);
-        lemma_count_present_upto_zero_all_absent(s, n - 1);
-    }
-}
-
-/// If two sequences agree on `[0, n)`, their counts up to `n` are equal.
-pub proof fn lemma_count_present_upto_unchanged<E: PageTableEntryTrait>(
-    s: Seq<E>,
-    s2: Seq<E>,
-    n: int,
-)
-    requires
-        0 <= n,
-        forall|k: int| 0 <= k < n ==> s[k] == s2[k],
-    ensures
-        count_present_upto(s2, n) == count_present_upto(s, n),
-    decreases n,
-{
-    if n > 0 {
-        lemma_count_present_upto_unchanged(s, s2, n - 1);
     }
 }
 
@@ -288,7 +286,50 @@ impl<C: PageTableConfig> NodeOwner<C> {
     /// `nr_children` equals the number of present PTEs in `children_perm`.
     /// Held by a settled node (see `metaregion_sound_node`'s use site).
     pub open spec fn count_consistent(self) -> bool {
-        self.meta_own.nr_children.value() == count_present(self.children_perm.value())
+        self.meta_own.nr_children.value() == self.count_owned()
+    }
+
+    /// The slots whose children this node owns, `lo..hi`. A top-level node owns
+    /// only the configuration's [`PageTableConfig::TOP_LEVEL_INDEX_RANGE`]: a user
+    /// page table borrows the kernel's half, which it does not count or drop
+    /// (upstream's `PageTablePageMeta::on_drop` walks only this range). Every
+    /// other node owns all its slots.
+    pub open spec fn owned_range(self) -> (int, int) {
+        if self.level() == C::NR_LEVELS() {
+            (
+                C::TOP_LEVEL_INDEX_RANGE_spec().start as int,
+                C::TOP_LEVEL_INDEX_RANGE_spec().end as int,
+            )
+        } else {
+            (0, NR_ENTRIES as int)
+        }
+    }
+
+    /// The node owns the child in slot `i`.
+    pub open spec fn owns_slot(self, i: int) -> bool {
+        self.owned_range().0 <= i < self.owned_range().1
+    }
+
+    /// The number of present PTEs in the slots the node owns: what `nr_children`
+    /// counts.
+    pub open spec fn count_owned(self) -> int {
+        count_present_between(
+            self.children_perm.value(),
+            self.owned_range().0,
+            self.owned_range().1,
+        )
+    }
+
+    /// The owned range is within the node's slots.
+    pub proof fn lemma_owned_range_bounds(self)
+        ensures
+            0 <= self.owned_range().0 <= self.owned_range().1 <= NR_ENTRIES,
+            self.owned_range().1 - self.owned_range().0 < NR_ENTRIES ==> self.level()
+                == C::NR_LEVELS(),
+    {
+        C::lemma_page_table_config_constant_properties();
+        C::lemma_paging_consts_properties();
+        C::axiom_current_paging_consts_hardcoded();
     }
 }
 
@@ -307,7 +348,12 @@ impl<C: PageTableConfig> NodeOwner<C> {
         ensures
             self.meta_own.nr_children.value() < NR_ENTRIES,
     {
-        lemma_count_present_upto_absent(self.children_perm.value(), NR_ENTRIES as int, idx as int);
+        let (lo, hi) = self.owned_range();
+        self.lemma_owned_range_bounds();
+        lemma_count_present_between_bound(self.children_perm.value(), lo, hi);
+        if lo <= idx < hi {
+            lemma_count_present_between_absent(self.children_perm.value(), lo, hi, idx as int);
+        }
     }
 
     /// If a slot in `children_perm` holds a present PTE, then `nr_children > 0`.
@@ -319,11 +365,41 @@ impl<C: PageTableConfig> NodeOwner<C> {
             self.count_consistent(),
             self.children_perm.value().len() == NR_ENTRIES,
             idx < NR_ENTRIES,
+            self.owns_slot(idx as int),
             self.children_perm.value()[idx as int].is_present(),
         ensures
             self.meta_own.nr_children.value() > 0,
     {
-        lemma_count_present_upto_present(self.children_perm.value(), NR_ENTRIES as int, idx as int);
+        let (lo, hi) = self.owned_range();
+        lemma_count_present_between_present(self.children_perm.value(), lo, hi, idx as int);
+    }
+
+    /// Writing slot `idx` changes the owned count by the change in that slot's
+    /// present-indicator, if the node owns the slot, and not at all otherwise.
+    pub proof fn lemma_count_owned_update(self, other: Self, idx: int, pte: C::E)
+        requires
+            self.children_perm.value().len() == NR_ENTRIES,
+            0 <= idx < NR_ENTRIES,
+            other.children_perm.value() == self.children_perm.value().update(idx, pte),
+            other.frame_permission == self.frame_permission,
+        ensures
+            other.count_owned() == self.count_owned() + if self.owns_slot(idx) {
+                (if pte.is_present() {
+                    1int
+                } else {
+                    0int
+                }) - (if self.children_perm.value()[idx].is_present() {
+                    1int
+                } else {
+                    0int
+                })
+            } else {
+                0int
+            },
+    {
+        let (lo, hi) = self.owned_range();
+        self.lemma_owned_range_bounds();
+        lemma_count_present_between_update(self.children_perm.value(), lo, hi, idx, pte);
     }
 }
 

@@ -1137,6 +1137,27 @@ impl<'rcu, C: PageTableConfig> CursorOwner<'rcu, C> {
         self.va >= self.barrier_va.end
     }
 
+    /// Inside its range, the cursor's current node owns the slot the cursor
+    /// points at: at the top level the slot is in the configured index range.
+    pub proof fn lemma_cur_slot_owned(self)
+        requires
+            self.inv(),
+            self.in_barrier_va(),
+            !self.popped_too_high,
+        ensures
+            self.continuations[self.level - 1].entry_own.node().owns_slot(self.index() as int),
+    {
+        C::lemma_paging_consts_properties();
+        C::axiom_current_paging_consts_hardcoded();
+        self.lemma_inv_continuation(self.level - 1);
+        let node = self.continuations[self.level - 1].entry_own.node();
+        node.lemma_owned_range_bounds();
+        if node.level() == C::NR_LEVELS() {
+            self.lemma_cur_pte_index();
+            self.lemma_in_barrier_va_top_index_bounds();
+        }
+    }
+
     /// Active cursor addresses select a root entry in the configured index range.
     pub proof fn lemma_in_barrier_va_top_index_bounds(self)
         requires

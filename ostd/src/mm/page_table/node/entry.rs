@@ -235,11 +235,7 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
             // present-status) and never touches `nr_children`, so the present
             // count and the counter are both unchanged — keeping the parent's
             // `count_consistent` invariant intact for the caller.
-            crate::specs::mm::page_table::node::owners::count_present(
-                final(parent_owner).children_perm.value(),
-            ) == crate::specs::mm::page_table::node::owners::count_present(
-                old(parent_owner).children_perm.value(),
-            ),
+            final(parent_owner).count_owned() == old(parent_owner).count_owned(),
             final(parent_owner).meta_own.nr_children.value() == old(
                 parent_owner,
             ).meta_own.nr_children.value(),
@@ -276,6 +272,8 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
              Tracked(new_owner): Tracked<&mut EntryOwner<C>>,
              Tracked(parent_owner): Tracked<&mut NodeOwner<C>>,
         requires
+            // The node owns the slot: writing it may change `nr_children`.
+            old(parent_owner).owns_slot(old(self).idx as int),
             old(self).invariants(*old(owner), *old(regions)),
             new_child.invariants(*old(new_owner), *old(regions)),
             old(self).node_matching(*old(owner), *old(parent_owner), *old(self).node),
@@ -481,12 +479,7 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
                     }
                 };
             };
-            crate::specs::mm::page_table::node::owners::lemma_count_present_upto_update(
-                cp0,
-                NR_ENTRIES as int,
-                self.idx as int,
-                new_pte,
-            );
+            old(parent_owner).lemma_count_owned_update(*parent_owner, self.idx as int, new_pte);
         }
 
         old_child
@@ -514,6 +507,8 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
             Tracked(regions): Tracked<&mut MetaRegionOwners>,
             Tracked(guards): Tracked<&mut Guards>,
         requires
+            // The node owns the slot: writing it may change `nr_children`.
+            old(parent_owner).owns_slot(old(self).idx as int),
             old(self).invariants(old(owner).value(), *old(regions)),
             old(owner).inv(),
             old(owner).value().path.len() == old(owner).level(),
@@ -676,9 +671,8 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
                 let tracked new_meta_slot = regions.tracked_borrow_mut_slot_owner(new_paddr);
                 new_meta_slot.paths_in_pt = set![owner.value().path];
 
-                crate::specs::mm::page_table::node::owners::lemma_count_present_upto_update(
-                    cp0,
-                    NR_ENTRIES as int,
+                old(parent_owner).lemma_count_owned_update(
+                    *parent_owner,
                     self.idx as int,
                     self.pte,
                 );
@@ -1159,12 +1153,7 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
 
         let ghost regions_before_registration = *regions;
         proof {
-            crate::specs::mm::page_table::node::owners::lemma_count_present_upto_update(
-                old(parent_owner).children_perm.value(),
-                NR_ENTRIES as int,
-                self.idx as int,
-                self.pte,
-            );
+            old(parent_owner).lemma_count_owned_update(*parent_owner, self.idx as int, self.pte);
             let tracked new_slot = regions.tracked_borrow_mut_slot_owner(
                 owner.value().meta_slot_paddr().unwrap(),
             );
@@ -1335,11 +1324,7 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
             forall|j: int| 0 <= j < NR_ENTRIES && j != idx ==>
                 #[trigger] final(parent_owner).children_perm.value()[j]
                     == old(parent_owner).children_perm.value()[j],
-            crate::specs::mm::page_table::node::owners::count_present(
-                final(parent_owner).children_perm.value(),
-            ) == crate::specs::mm::page_table::node::owners::count_present(
-                old(parent_owner).children_perm.value(),
-            ),
+            final(parent_owner).count_owned() == old(parent_owner).count_owned(),
             op.ensures((old(owner).frame().prop,), final(owner).frame().prop),
             *final(self) == *old(self),
     )]
@@ -1382,12 +1367,7 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
             // The PTE at `idx` stayed present (only `prop` changed), so the
             // present-count is unchanged by the `write_pte` update — preserving
             // `count_consistent` for the caller.
-            crate::specs::mm::page_table::node::owners::lemma_count_present_upto_update(
-                cp_old,
-                NR_ENTRIES as int,
-                idx as int,
-                pte,
-            );
+            old(parent_owner).lemma_count_owned_update(*parent_owner, idx as int, pte);
         }
 
         pte
@@ -1400,6 +1380,8 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
              Tracked(new_owner): Tracked<&mut EntryOwner<C>>,
              Tracked(parent_owner): Tracked<&mut NodeOwner<C>>,
         requires
+            // The node owns the slot: writing it may change `nr_children`.
+            old(parent_owner).owns_slot(idx as int),
             old(owner).inv(),
             old(owner).metaregion_sound(*old(regions)),
             old(owner).match_pte(
@@ -1560,12 +1542,7 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
         };
 
         proof {
-            crate::specs::mm::page_table::node::owners::lemma_count_present_upto_update(
-                cp0,
-                NR_ENTRIES as int,
-                idx as int,
-                new_pte,
-            );
+            old(parent_owner).lemma_count_owned_update(*parent_owner, idx as int, new_pte);
         }
 
         proof {
@@ -1649,6 +1626,8 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
              Tracked(regions): Tracked<&mut MetaRegionOwners>,
              Tracked(guards): Tracked<&mut Guards>,
         requires
+            // The node owns the slot: writing it may change `nr_children`.
+            old(parent_owner).owns_slot(idx as int),
             old(owner).inv(),
             old(owner).value().path.len() == old(owner).level(),
             old(owner).value().is_absent(),
@@ -1832,12 +1811,7 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
         nr_children.write(Tracked(&mut parent_owner.meta_own.nr_children), old_nr_children + 1);
 
         proof {
-            crate::specs::mm::page_table::node::owners::lemma_count_present_upto_update(
-                cp0,
-                NR_ENTRIES as int,
-                idx as int,
-                new_pte,
-            );
+            old(parent_owner).lemma_count_owned_update(*parent_owner, idx as int, new_pte);
             {
                 let tracked new_node_value = new_node_owner.tracked_borrow_mut_value();
                 new_node_value.parent_level = level as PagingLevel;
@@ -1906,6 +1880,8 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
              Tracked(new_owner): Tracked<&mut EntryOwner<C>>,
              Tracked(parent_owner): Tracked<&mut NodeOwner<C>>,
         requires
+            // The node owns the slot: writing it may change `nr_children`.
+            old(parent_owner).owns_slot(idx as int),
             old(owner).inv(),
             old(owner).is_absent(),
             old(owner).metaregion_sound(*old(regions)),
@@ -1975,12 +1951,7 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
         };
 
         proof {
-            crate::specs::mm::page_table::node::owners::lemma_count_present_upto_update(
-                cp0,
-                NR_ENTRIES as int,
-                idx as int,
-                new_pte,
-            );
+            old(parent_owner).lemma_count_owned_update(*parent_owner, idx as int, new_pte);
         }
     }
 }
