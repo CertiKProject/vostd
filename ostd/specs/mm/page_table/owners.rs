@@ -1339,19 +1339,20 @@ impl<C: PageTableConfig> PageTableOwner<C> {
     /// A node with `nr_children == 0` has no present PTEs, so all children are
     /// absent and the subtree contributes no mappings.
     ///
-    /// `count_consistent` ties `nr_children` to `count_present(children_perm)`,
-    /// so `nr_children == 0` forces every PTE absent. `pt_edge_at` (from
+    /// Below the top level, `count_consistent` ties `nr_children` to the number
+    /// of present PTEs in all slots, so `nr_children == 0` forces every PTE absent. `pt_edge_at` (from
     /// `pt_inv`) then forces each ghost child `is_absent` — its `view_rec` is
     /// `∅` — and `lemma_view_rec_contains` lifts that to the whole node's
     /// `view_rec`. (At the top level the `borrowed` edge disjunct is ruled out:
-    /// `borrowed_match_pte` needs a *present* PTE, which `count_present == 0`
-    /// denies.)
+    /// `borrowed_match_pte` needs a *present* PTE, which a zero count denies.)
     pub proof fn lemma_view_rec_nr_children_zero_empty(self, path: TreePath<NR_ENTRIES>)
         requires
             self.pt_inv(),
             self.0.value().is_node(),
             self.0.value().node().meta_own.nr_children.value() == 0,
             self.0.value().node().count_consistent(),
+            // Below the top level a node owns, and so counts, all its slots.
+            self.0.value().node().level() < C::NR_LEVELS(),
             path.len() <= INC_LEVELS - 1,
             path.len() == self.0.level(),
         ensures
@@ -1369,11 +1370,12 @@ impl<C: PageTableConfig> PageTableOwner<C> {
                         path.push_tail(i),
                     ).contains(m);
                 self.pt_inv_unroll(i);
-                // PTE `i` is absent — else `count_present(cp) >= 1`.
+                // PTE `i` is absent — else the count would be at least 1.
                 if cp[i].is_present() {
-                    crate::specs::mm::page_table::node::owners::lemma_count_present_upto_present(
+                    crate::specs::mm::page_table::node::owners::lemma_count_present_between_present(
                         cp,
-                        cp.len() as int,
+                        0,
+                        NR_ENTRIES as int,
                         i,
                     );
                 }
