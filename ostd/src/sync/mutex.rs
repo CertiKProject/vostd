@@ -70,8 +70,14 @@ impl<T  /* : ?Sized */ > Mutex<T> {
     ///
     /// This method runs in a block way until the mutex can be acquired.
     #[track_caller]
+    #[verus_spec(ret => ensures ret.rel_mutex(*self))]
     pub fn lock(&self) -> MutexGuard<'_, T> {
-        self.queue.wait_until(|| self.try_lock())
+        self.queue.wait_until(
+            || -> (ret: Option<MutexGuard<'_, T>>)
+                ensures
+                    ret is Some ==> ret->0.rel_mutex(*self),
+                { self.try_lock() },
+        )
     }
 
     /// Tries to acquire the mutex immediately.
@@ -106,16 +112,23 @@ impl<T  /* : ?Sized */ > Mutex<T> {
     } */
 
     /// Releases the mutex and wake up one thread which is blocked on this mutex.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that it has acquired the lock.
     #[verus_spec(
         with
             Tracked(perm): Tracked<PointsTo<T>>,
         requires
             perm.id() == self.cell_id(),
     )]
-    fn unlock(&self)
+    unsafe fn unlock(&self)
     {
-        proof_with!(Tracked(perm));
-        self.release_lock();
+        // SAFETY: The safety is upheld by the caller.
+        unsafe {
+            proof_with!(Tracked(perm));
+            self.release_lock();
+        }
         self.queue.wake_one();
     }
 
@@ -146,13 +159,16 @@ impl<T  /* : ?Sized */ > Mutex<T> {
         }.is_ok()
     }
 
+    /// # Safety
+    ///
+    /// The caller must ensure that it has acquired the lock.
     #[verus_spec(
         with
             Tracked(perm): Tracked<PointsTo<T>>,
         requires
             perm.id() == self.cell_id(),
     )]
-    fn release_lock(&self)
+    unsafe fn release_lock(&self)
     {
         proof! {
             use_type_invariant(self);
@@ -262,7 +278,8 @@ impl<T/* : ?Sized */> DerefMut for MutexGuard<'_, T> {
 /* impl<T  /* : ?Sized */ > Drop for MutexGuard<'_, T> {
     fn drop(&mut self)
     {
-        self.mutex.unlock();
+        // SAFETY: The mutex is locked.
+        unsafe { self.mutex.unlock() };
     }
 } */
 
@@ -271,17 +288,19 @@ impl<T: /* ?Sized*/ > MutexGuard<'_, T> {
     #[verus_spec]
     pub fn drop(self) {
         proof!{use_type_invariant(&self);}
-        proof_with!(self.tracked_perm);
-        self.mutex.unlock();
+        // SAFETY: The mutex is locked.
+        unsafe {
+            proof_with!(self.tracked_perm);
+            self.mutex.unlock();
+        }
     }
 }
 
-/* impl<T: /* ?Sized + */ fmt::Debug> fmt::Debug for MutexGuard<'_, T> {
-    #[verifier::external_body]
+impl<T: /*?Sized + */fmt::Debug> fmt::Debug for MutexGuard<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         fmt::Debug::fmt(&**self, f)
     }
-} */
+}
 
 impl<T  /* : ?Sized */ > !Send for MutexGuard<'_, T> {}
 
@@ -301,26 +320,89 @@ impl<'a, T  /* : ?Sized */ > MutexGuard<'a, T> {
 }
 
 } // verus!
-#[cfg(ktest)]
+
+/* #[cfg(ktest)] */
 mod test {
+    use vstd::invariant::AtomicInvariant;
+
     use super::*;
     use crate::prelude::*;
 
     // A regression test for a bug fixed in [#1279](https://github.com/asterinas/asterinas/pull/1279).
-    #[ktest]
+    /* #[ktest] */
+    #[verus_spec]
     fn test_mutex_try_lock_does_not_unlock() {
-        let lock = Mutex::new(0);
-        assert!(!lock.lock.load(Ordering::Relaxed));
+        /* Unfold Mutex::new so the initial load can use the atomic permission before
+         * it is hidden in an invariant. vstd's atomic loads are sequentially consistent.
+         * Origin Rust:
+         * let lock = Mutex::new(0);
+         * assert!(!lock.lock.load(Ordering::Relaxed));
+         */
+        let (val, perm) = PCell::new(0);
+        let (patomic, lock_perm) = vstd::atomic::PAtomicBool::new(false);
+        assert!(verus_exec_expr! { !patomic.load(Tracked(lock_perm.borrow())) });
+        let lock = Mutex {
+            lock: AtomicBool {
+                patomic,
+                atomic_inv: verus_exec_expr! {
+                    Tracked(AtomicInvariant::new(
+                        (val, patomic.id()), (lock_perm.get(), Some(perm.get())), 0,
+                    ))
+                },
+            },
+            queue: WaitQueue::new(),
+            val,
+        };
 
         // A successful lock
         let guard1 = lock.lock();
-        assert!(lock.lock.load(Ordering::Relaxed));
+        proof! {
+            use_type_invariant(&lock);
+            use_type_invariant(&guard1);
+        }
+        /* Open the atomic invariant to relate the loaded bit to the live guard's permission.
+         * Origin Rust: assert!(lock.lock.load(Ordering::Relaxed));
+         */
+        assert!(atomic_with_ghost! {
+            lock.lock => load();
+            returning locked;
+            ghost perms => {
+                if let Some(perm) = &mut perms {
+                    perm.is_exclusive(guard1.tracked_perm.borrow());
+                }
+            }
+        });
 
         // A failed `try_lock` won't drop the lock
-        assert!(lock.try_lock().is_none());
-        assert!(lock.lock.load(Ordering::Relaxed));
+        /* Name the result so its permission can be compared with the live guard's permission.
+         * Origin Rust: assert!(lock.try_lock().is_none());
+         */
+        let mut guard2 = lock.try_lock();
+        proof! {
+            use_type_invariant(&guard1);
+            if let Some(guard2) = &mut guard2 {
+                use_type_invariant(&*guard2);
+                guard2.tracked_perm.borrow_mut().is_exclusive(guard1.tracked_perm.borrow());
+            }
+        }
+        assert!(guard2.is_none());
+        /* Open the atomic invariant to relate the loaded bit to the live guard's permission.
+         * Origin Rust: assert!(lock.lock.load(Ordering::Relaxed));
+         */
+        assert!(atomic_with_ghost! {
+            lock.lock => load();
+            returning locked;
+            ghost perms => {
+                if let Some(perm) = &mut perms {
+                    perm.is_exclusive(guard1.tracked_perm.borrow());
+                }
+            }
+        });
 
         // Ensure the lock is held until here
-        drop(guard1);
+        /* Verus requires the guard's explicit release method because automatic Drop is unsupported.
+         * Origin Rust: drop(guard1);
+         */
+        guard1.drop();
     }
 }

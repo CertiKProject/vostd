@@ -1,0 +1,87 @@
+name: Publish verification dashboard
+description: >-
+  Download the `stats` job's snapshot artifact, record history on gh-pages, and
+  deploy Verusdoc, the dashboard, and benchmark history. Call only for eligible
+  main runs; expects a checkout, Pages permissions, and the
+  `stats-snapshot` / `doc-site` artifacts from this run.
+
+runs:
+  using: composite
+  steps:
+    - name: Download stats artifact
+      uses: actions/download-artifact@v8
+      with:
+        name: stats-snapshot
+        path: stats-artifact
+
+    # gh-pages holds the long-lived data: dev/bench (benchmark chart, pushed
+    # by `perf-history` just before) and stats/history.json (this job's line).
+    - name: Record verification stats on gh-pages
+      shell: bash
+      run: |
+        set -e
+        if git fetch --depth=1 origin gh-pages 2>/dev/null; then
+          git worktree add "$PWD/gh-pages" FETCH_HEAD
+        else
+          git worktree add --orphan -b gh-pages "$PWD/gh-pages"
+        fi
+        cd gh-pages
+        mkdir -p stats
+        python3 ../tools/verus_stats.py record \
+          --snapshot ../stats-artifact/stats-snapshot.json \
+          --history stats/history.json
+        git add stats
+        git -c user.name=github-actions -c user.email=41898282+github-actions[bot]@users.noreply.github.com \
+          commit -m "chore: record verification stats for ${GITHUB_SHA}"
+        if ! git push origin HEAD:gh-pages; then
+          echo "push rejected; rebasing once and retrying"
+          git fetch origin gh-pages
+          git rebase FETCH_HEAD
+          git push origin HEAD:gh-pages
+        fi
+        echo "recorded stats point for ${GITHUB_SHA}"
+
+    - name: Download doc artifact
+      uses: actions/download-artifact@v8
+      with:
+        name: doc-site
+        path: site/verusdoc
+
+    - name: Assemble and deploy the site
+      shell: bash
+      run: |
+        set -e
+        mkdir -p site
+        # Fresh snapshot/history just committed to the gh-pages worktree.
+        mkdir -p site/stats
+        cp gh-pages/stats/history.json site/stats/history.json
+        cp stats-artifact/stats-snapshot.json site/stats/snapshot.json
+        if [[ -d gh-pages/dev/bench ]]; then
+          mkdir -p site/dev
+          cp -r gh-pages/dev/bench site/dev/bench
+          echo "embedded dev/bench"
+        else
+          echo "no dev/bench on gh-pages yet; the bench card will 404 until the first perf push"
+        fi
+        # Apply the shared dashboard/bench UI after copying benchmark data.
+        cp -r tools/site/. site/
+        echo "site root:"; ls site
+
+    - name: Sync bugs found by verification
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        if ! python3 tools/verification_bugs.py site/stats/verification-bugs.json; then
+          rm -f site/stats/verification-bugs.json
+          echo "::warning::Could not sync verification bugs from asterinas/vostd#645"
+        fi
+
+    - name: Upload pages artifact
+      uses: actions/upload-pages-artifact@v5
+      with:
+        path: site
+
+    - name: Deploy to GitHub Pages
+      id: deployment
+      uses: actions/deploy-pages@v5

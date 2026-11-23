@@ -27,6 +27,8 @@
 //! This module provides API to detect such "sleep-like" actions.
 use core::sync::atomic::Ordering;
 
+use vstd::prelude::*;
+/*
 /// Marks a function as one that might sleep.
 ///
 /// This function will panic if it is executed in atomic mode.
@@ -42,7 +44,7 @@ pub fn might_sleep() {
             preempt_count, is_local_irq_enabled
         );
     }
-}
+}*/
 
 /// A marker trait for guard types that enforce the atomic mode.
 ///
@@ -58,20 +60,29 @@ pub fn might_sleep() {
 ///
 /// The implementer must ensure that the atomic mode is maintained while
 /// the guard type is alive.
+///
+/// A guard is only valid evidence about the task that created it: it proves
+/// nothing about any other task. Therefore, such guards must be `!Send` and
+/// `!Sync`, so that the guards and their references are confined to the
+/// creating task.
+#[verus_verify]
 pub unsafe trait InAtomicMode: core::fmt::Debug {}
 
 /// Abstracts any type from which one can obtain a reference to an atomic-mode guard.
+#[verus_verify]
 pub trait AsAtomicModeGuard {
     /// Returns a guard for the atomic mode.
     fn as_atomic_mode_guard(&self) -> &dyn InAtomicMode;
 }
 
+#[verus_verify]
 impl<G: InAtomicMode> AsAtomicModeGuard for G {
     fn as_atomic_mode_guard(&self) -> &dyn InAtomicMode {
         self
     }
 }
 
+#[verus_verify]
 impl AsAtomicModeGuard for dyn InAtomicMode + '_ {
     fn as_atomic_mode_guard(&self) -> &dyn InAtomicMode {
         self

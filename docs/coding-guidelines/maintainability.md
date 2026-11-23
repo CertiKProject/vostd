@@ -35,7 +35,10 @@ form a chain.
 <!-- guideline: use-returns-for-exact-results -->
 
 Use `returns expr` for an exact return value and `ensures` for other result or
-state properties. This also applies to `assume_specification`. Omit unused named
+state properties. This also applies to `assume_specification` and attribute-mode
+`#[verus_spec]`, including contracts with `with Tracked(..)`: keep state
+clauses such as `final(samples)@.inv()` in `ensures` and put the exact result
+expression in `returns`. Omit unused named
 return binders and unit return declarations such as `-> (ret: ())`.
 
 The expression must match the return type. Keep required casts, such as
@@ -46,7 +49,8 @@ See also: PR [#742](https://github.com/asterinas/vostd/pull/742#discussion_r3940
 [#742](https://github.com/asterinas/vostd/pull/742#discussion_r3946316792),
 [#742](https://github.com/asterinas/vostd/pull/742#discussion_r3946322891),
 [#742](https://github.com/asterinas/vostd/pull/742#discussion_r3947067359), and
-[#770](https://github.com/asterinas/vostd/pull/770#discussion_r4023879416).
+[#770](https://github.com/asterinas/vostd/pull/770#discussion_r4023879416), and
+[#905](https://github.com/asterinas/vostd/pull/905#discussion_r4535785273).
 
 ### Avoid redundant `as int` casts
 
@@ -89,6 +93,30 @@ still needs it:
   sequence's `nat` length), where the cast is the point of the expression.
 
 See also: PR [#770](https://github.com/asterinas/vostd/pull/770#discussion_r4023112584).
+
+### Use `addr()` for pointers
+
+<!-- guideline: use-addr-for-pointers -->
+
+Model pointer identity constraints through `ptr.addr()`, the form
+the pointer models themselves use — `ptr_is_null_spec` defines
+`is_null` as `ptr.addr() == 0` — instead of reaching into the
+pointer view's own field:
+
+```rust
+// Prefer this:
+src.addr() + size_of::<T>() <= usize::MAX,
+src.addr() % align_of::<T>() == 0,
+
+// Over this:
+src@.addr + size_of::<T>() <= usize::MAX,
+src@.addr % align_of::<T>() == 0,
+```
+
+See also:
+[`ptr_is_null_spec`](../../verified_libs/vstd_extra/src/external/ptr.rs#L53), PR
+[#819](https://github.com/asterinas/vostd/pull/819#discussion_r4226890291), and
+[#819](https://github.com/asterinas/vostd/pull/819#discussion_r4226891187).
 
 ### Seq range slicing
 
@@ -158,6 +186,37 @@ See also: PR [#718](https://github.com/asterinas/vostd/pull/718#issuecomment-547
 [#718](https://github.com/asterinas/vostd/pull/718#issuecomment-5473348502),
 [#718](https://github.com/asterinas/vostd/pull/718#discussion_r3840368904),
 and [#718](https://github.com/asterinas/vostd/pull/718#discussion_r3955173853).
+
+### Attach broadcast axioms once
+
+<!-- guideline: attach-broadcast-axioms-once -->
+
+When a function's proof needs a broadcast axiom, state the
+`broadcast use` once at the beginning of the function body.
+The axiom's facts stay in scope for the whole function, so there
+is no need to repeat the use — or to re-assert the axiom's
+conclusions — inside each branch's proof block:
+
+```rust
+fn try_from(value: usize) -> Result<Self, Self::Error> {
+    proof! {
+        broadcast use { axiom_cpu_count_bounds };
+    }
+    if value < num_cpus() {
+        Ok(CpuId(value as u32))
+    } else {
+        Err(CpuIdFromIntError)
+    }
+}
+```
+
+The per-branch `broadcast use` calls plus the `assert`s
+replaying the axiom's conclusions are proof scaffolding
+reviewers strip out; the single harness step carries the
+same facts.
+
+See also: [`CpuId::try_from`](../../ostd/src/cpu/mod.rs#L64), PR
+[#812](https://github.com/asterinas/vostd/pull/812#discussion_r4226399573).
 
 ### Group imports by crate
 
@@ -247,6 +306,45 @@ implication ungrouped unless the binding improves clarity.
 
 See also: PR [#728](https://github.com/asterinas/vostd/pull/728#discussion_r3893413063).
 
+### Match enum results
+
+<!-- guideline: match-enum-results -->
+
+Express the shape of an `Option`/`Result` result with `is` and
+`matches`, and state each direction of an exhaustive enum contract
+once:
+
+```rust
+// Prefer this:
+ret matches Ok(id) ==> id@ == value && cpu_count() > value,
+cpu_count() > value ==> ret is Ok,
+
+// Over this (the `Err` arm is the exhaustiveness contrapositive
+// of the `Ok` arms and adds no information):
+ret matches Ok(id) ==> id@ == value && cpu_count() > value,
+cpu_count() > value ==> ret is Ok,
+ret is Err ==> value >= cpu_count(),
+```
+
+Use `matches Ok(id) ==> { ... }` to bind the payload once and group
+the payload-dependent facts (generalizing
+[`bind-option-payloads`](#bind-option-payloads) to `Result`), and bare
+`ret is Ok` / `ret matches Err(_)` for the shape-only query. Avoid
+`is_ok()`/`is_err()`/`unwrap()` chains such as
+`res.is_ok() ==> res.unwrap().spec_bytes() =~= v@` — each clause
+re-queries the result and the projections need their own `is_ok`
+guard.
+
+An `Err` arm earns its place only by stating a fact the `Ok`
+arms do not, as in the `from_utf8` model's
+`res matches Err(_) ==> !valid_utf8(v@)`; the `Ok` arms there do
+not pin the invalid-input case.
+
+See also: [`CpuId`'s `TryFrom` contract](../../ostd/src/cpu/mod.rs#L59), PR
+[#812](https://github.com/asterinas/vostd/pull/812#discussion_r4226396180),
+[#812](https://github.com/asterinas/vostd/pull/812#discussion_r4227403322), and
+[#789](https://github.com/asterinas/vostd/pull/789#discussion_r4056395052).
+
 ### Preserve exec code
 
 <!-- guideline: preserve-exec-code -->
@@ -256,39 +354,107 @@ constants, methods, or modules. If Verus requires an executable change, keep it
 minimal, demonstrate unchanged runtime behavior, and show the original form in
 review.
 
-When verification does add, remove, or rewrite executable Rust relative to the
-original source, mark the modification with one block comment immediately
-before the modified code — at the original location for a pure removal with no
-replacement. The comment contains, in this order: a brief, concrete reason the
-executable code must differ, naming the Verus or vstd limitation when there is
-one instead of a vague "needed for verification"; and the original code,
-introduced by the exact label `Origin Rust:`, preserved accurately enough to
-compare control flow, calls, arguments, operators, and side effects:
+Before rewriting an executable call to reuse an existing external
+specification, prefer specifying the API the code already calls. Check the
+vendored vstd tree and Verus upstream for an existing model first, then add a
+faithful external specification for the exact callee in the owning verified
+library, such as `vstd_extra::external`, and follow
+[`upstream-reusable-specs`](workflow.md#upstream-reusable-specs) for
+standard-library APIs. Replace a call with a differently packaged equivalent
+only when the original callee cannot be specified — record the concrete
+obstacle in the review — and the replacement still counts as the executable
+change this section governs.
+
+When the target code or its module is commented out, enable it in place by
+uncommenting only the target code and its necessary dependencies; leave the
+rest commented out. Do not extract a new module, widen visibility, or change
+call paths merely to isolate verification.
+
+See also: PR [#906](https://github.com/asterinas/vostd/pull/906#discussion_r4525740735).
+
+When the enabled code needs items the original source imported at the top of
+the file, restore the original import statement in place instead of rewriting
+it as new flat `use` lines at another position. Entries the enabled code uses
+stay live at their original position in the import tree; entries still unused
+stay commented exactly where they stood, wrapped per item, keeping the tree's
+original order and shape:
 
 ```rust
-/* `Iterator::sum` has no model in the active vstd, so use an indexed loop with a
- * prefix-sum invariant while preserving the same word order and arithmetic.
- * Origin Rust: self.bits
- *     .iter()
- *     .map(|part| part.count_ones() as usize)
- *     .sum()
- */
+use crate::{
+    mm::{
+        /* Frame, FrameAllocOptions, PAGE_SIZE, Paddr,
+        frame::max_paddr, */
+        kspace::{
+            LINEAR_MAPPING_BASE_VADDR, /* MappedItem, VMALLOC_VADDR_RANGE, kvirt_area::KVirtArea, */
+            paddr_to_vaddr,
+        },
+        /* page_prop::{CachePolicy, PageFlags, PageProperty}, */
+    },
+    /* prelude::*, */
+};
 ```
 
-Continue a multi-line original on the following `*` lines; a one-line original
-stays on the label line. One comment covers one contiguous modified block, and
-neither a distant comment nor Git history substitutes for it. For executable
-code with no corresponding original statement, write `Origin Rust: <none; new
-executable code>`. Changes confined to `spec`, `proof`, ghost/tracked state,
-Verus attributes, or comments carry no marker. (The literalized constant below
-keeps its original on adjacent line comments — the single-line form of the same
-practice.)
+When an original line fails to compile only because one item is unavailable in
+this fork — for example a derive macro that is not vendored — keep the line
+verbatim and comment out just that item in place, rather than hand-writing a
+replacement implementation: `#[derive(Clone, Copy, PartialEq, Debug /*, Pod */)]`
+stands for the original `#[derive(Clone, Copy, PartialEq, Debug, Pod)]`.
 
-In review, treat a modification as noncompliant when its comment is missing,
-not immediately adjacent, not a block comment, omits the reason or the `Origin
-Rust:` label, puts the original before the reason, or does not faithfully
-represent the original. A compliant comment records why the executable code
-must differ; whether runtime behavior is preserved is reviewed separately.
+See also: PR [#924](https://github.com/asterinas/vostd/pull/924#discussion_r4560742281) and
+[#924](https://github.com/asterinas/vostd/pull/924#discussion_r4560759102).
+
+Preserve existing comments and rustdoc verbatim during proof work, including
+wording, units, and references. An apparent documentation error is a separate
+upstream correction; do not silently fix it while adding verification.
+
+Comments on executable code stay frozen with the code itself: verification
+work adds specifications and proofs, not prose about the implementation or the
+migration. An added comment on executable code must state a verified property
+or a caller-facing trust boundary, such as a check the caller owes, or be the
+`Origin Rust:` block required for an executable rewrite below. Migration
+rationale, upstream implementation details, and tool behavior belong in the PR
+description or the review text.
+
+When temporarily disabling unchanged imports or code outside the verified
+scope, wrap the original text directly in `/* ... */`. Do not add a reason,
+`Origin Rust:` label, or repeated status narration to each block. Put the
+closing delimiter immediately after the last original line:
+
+```rust
+/*use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+use log::info;*/
+```
+
+For an actual executable rewrite required by Verus, retain a concise adjacent
+`Origin Rust:` block with the original code and the concrete reason for the
+change. This requirement applies to executable replacements, additions, or
+removals, not to wrapping unchanged code in a comment or adding specs, proofs,
+ghost/tracked state, or Verus attributes. Do not request such markers for those
+cases.
+
+If verification exposes a potential runtime bug, check the latest upstream
+Asterinas code and establish whether the input can arise before changing
+behavior. Do not introduce overflow rejection or new `None` returns just to
+make a proof pass. PR #905's reviewers accepted a narrowly scoped no-overflow
+assumption for hardware inputs instead of a runtime change; this is a specific
+review decision, not permission to add assumptions elsewhere. New `assume`,
+`admit`, or `external_body` still requires explicit user authorization under
+`AGENTS.md`.
+
+When an `assume` is authorized, add a brief adjacent comment explaining why
+the assumption is justified, such as a hardware bound or an environmental
+guarantee. State the reason in one sentence rather than repeating the assumed
+predicate or saying only that it is needed for verification.
+
+See also: PR [#905](https://github.com/asterinas/vostd/pull/905#discussion_r4525095238),
+[#905](https://github.com/asterinas/vostd/pull/905#discussion_r4525099006),
+[#905](https://github.com/asterinas/vostd/pull/905#discussion_r4537787219),
+[#905](https://github.com/asterinas/vostd/pull/905#discussion_r4537793407),
+[#905](https://github.com/asterinas/vostd/pull/905#discussion_r4537795023),
+[#905](https://github.com/asterinas/vostd/pull/905#discussion_r4537796815),
+[#905](https://github.com/asterinas/vostd/pull/905#discussion_r4535699456), and
+[#905](https://github.com/asterinas/vostd/pull/905#discussion_r4535895602).
 
 Preserve upstream API shapes and round-trip conversion directions. Adapt
 ownership with local proof lemmas; do not reverse conversion lemmas, reconstruct
@@ -343,8 +509,14 @@ external consumer. Search for call sites before adding the helper and again
 before review. Do not expand the specification API merely for symmetry,
 convenience, or anticipated future proofs; add the operation with the proof
 that needs it. Remove newly introduced helpers that remain unused.
+Reviewers flag a lemma with zero call sites outright, so
+collect a series of dead helpers and delete them in one
+change.
 
-See also: PR [#778](https://github.com/asterinas/vostd/pull/778#discussion_r4045503423).
+See also: PR [#778](https://github.com/asterinas/vostd/pull/778#discussion_r4045503423),
+[#820](https://github.com/asterinas/vostd/pull/820#discussion_r4227846100),
+[#820](https://github.com/asterinas/vostd/pull/820#discussion_r4227853351), and
+[#820](https://github.com/asterinas/vostd/pull/820#discussion_r4227854716).
 
 ### Inline single-use proof helpers
 
@@ -447,71 +619,46 @@ Reserve `pub open spec fn` for the model callers reason about in contracts.
 When an outer module genuinely needs a representation fact, export a lemma
 that carries the fact instead of exposing the helper.
 
-See also: PR [#770](https://github.com/asterinas/vostd/pull/770#discussion_r4044364876)
-and [#770](https://github.com/asterinas/vostd/pull/770#discussion_r4044824466).
+A caller-provable precondition is the counterweight: a
+predicate that appears in `requires` clauses callers must
+discharge cannot rest on a `closed` helper — its body is not
+unfolded outside the module, so callers would be unable to
+prove the precondition. Such a predicate is contract surface
+and has to be `pub open` (or carry an exported lemma), even
+when it stays implementation-specific — PR #789's
+[`valid_device_scopes`](../../ostd/src/arch/x86/kernel/acpi/remapping.rs#L265)
+is one, `pub open` so its callers can prove it entry by
+entry.
+
+See also: PR [#770](https://github.com/asterinas/vostd/pull/770#discussion_r4044364876),
+[#770](https://github.com/asterinas/vostd/pull/770#discussion_r4044824466), and
+[#789](https://github.com/asterinas/vostd/pull/789#discussion_r4060261778).
 
 ### Document verified APIs
 
 <!-- guideline: document-verified-apis -->
 
-Preserve runtime documentation. Add rustdoc for public verified APIs and proof
-functions or modules whose properties matter to callers or maintainers. Explain
-critical contracts and invariants in language kernel developers can understand,
-without restating every Verus clause.
+Preserve existing runtime documentation when adding verification, following
+[`preserve-exec-code`](#preserve-exec-code). Adding a contract or proving a
+function does not by itself require additional rustdoc, a `Verified Properties`
+block, or `Preconditions`, `Postconditions`, `Safety`, and `Functional
+Correctness` subsections. Existing examples using these sections are not a
+mandatory template.
 
-For public executable APIs, append a `Verified Properties` section containing:
+Add documentation only when it supplies information a caller needs that is not
+already clear from the name, signature, existing rustdoc, or formal contract.
+For a new spec or proof API, explain a non-obvious mathematical meaning or usage
+constraint when necessary; do not require a summary sentence on every helper.
+Keep any added prose brief and claim only what verification establishes.
 
-- `Safety`: Identify the classes of undefined behavior ruled out and remaining
-  trusted boundaries. Claim only what verification establishes.
-- `Functional Correctness`, when applicable: Summarize the verified behavior.
-- `Preconditions`: State caller obligations.
-- `Postconditions`: State return guarantees, including absence of panic if proved.
+In review, identify the concrete missing caller information before requesting
+an explanation. Missing headings, absence of a verification summary, or the
+mere presence of a public verified API are not findings. Do not request prose
+that translates `requires`/`ensures`, narrates proof steps, or repeats a trust
+boundary already described at its owning module.
 
-Format the section as level-2 rustdoc subsections, not inline fields: write
-`## Safety`, `## Functional Correctness`, `## Preconditions`, and
-`## Postconditions` in that order, and give each verified fact its own `-`
-bullet so the bullets mirror the conjuncts of the function's
-`requires`/`ensures`. Do not merge the fields into single inline entries such
-as `- Safety: ...`. Keep a verified module's `Verified Properties` paragraph
-as prose.
-
-Omit the section when the verified contract adds nothing beyond the signature
-and the type's own invariant. Two common cases:
-
-- **Field getters** — the spec only fixes the return value to a field or a spec
-  function of it (`returns` / `ret == self.field`); the one-line rustdoc
-  summary ("Gets the end physical address of the contiguous frames.") already
-  says everything the section would.
-- **Invariant-only mutators** — the only `requires`/`ensures` clauses are
-  `inv()` being required and re-established, with no verified functional
-  relationship between `old(self)` and `final(self)`.
-
-In both cases keep the ordinary rustdoc summary — the exemption is from the
-`Verified Properties` block, not from documenting the item. Write the block
-once any clause goes further: a functional postcondition relating `old(self)`
-and `final(self)`, a `Safety` claim, or a guarantee not evident from the
-accessor's body.
-
-The `Preconditions` and `Postconditions` fields apply to executable APIs only.
-Spec and proof functions are erased at runtime; their `requires` and `ensures`
-clauses already state obligations and results formally, so do not add
-`Preconditions` or `Postconditions` sections that merely restate them (see
-[`document-real-proof-debt`](#document-real-proof-debt)). Document a `spec fn`
-with the mathematical meaning of the value it denotes, and a `proof fn` with one
-sentence summarizing the proved fact; add further prose only when an obligation
-or guarantee is non-obvious and not apparent from the signature.
-
-For verified modules, add a `Verified Properties` section covering verification
-design, critical invariants, safety, and any verified functional correctness.
-
-See also:
-[`SpinLock`](../../ostd/src/sync/spin.rs#L18),
-[`AlignExt`](../../ostd/libs/align_ext/src/lib.rs#L98), and
-[`entails_and_temp_reverse`](../../verified_libs/vstd_extra/src/temporal_logic/rules.rs#L793).
-A canonical subsection-formatted block:
-[`VmSpace::reader`](../../ostd/src/mm/vm_space.rs#L347).
-An omitted block for a field getter:
-[`Segment::start_paddr`](../../ostd/src/mm/frame/segment.rs#L507).
+See also: PR [#905](https://github.com/asterinas/vostd/pull/905#discussion_r4525099006)
+and [`document-real-proof-debt`](#document-real-proof-debt).
 
 ### Narrow lint suppressions
 
@@ -534,6 +681,46 @@ interface.
 
 See also: PR [#699](https://github.com/asterinas/vostd/pull/699#discussion_r3740713899).
 
+### Generate repeated spec helpers
+
+<!-- guideline: generate-repeated-spec-helpers -->
+
+Derive spec functions whose bodies repeat verbatim across per-type
+instantiations from a `macro_rules!` macro instead of hand-copying
+them. The generated definitions stay byte-identical to their siblings
+and cannot drift when one of them changes; the invocation stamps one
+line per type, so reviewers see the full set at a glance:
+
+```rust
+macro_rules! impl_header_spec {
+    ($(($struct:ident, $header:ident),)*) => {
+        verus! {
+            $(impl $struct {
+                #[doc = concat!("The header of [`", stringify!($struct), "`].")]
+                pub closed spec fn header_spec(self) -> $header {
+                    self.header
+                }
+            })*
+        }
+    };
+}
+
+impl_header_spec!(
+    (Drhd, DrhdHeader),
+    (Rmrr, RmrrHeader),
+    (Atsr, AtsrHeader),
+    /* four more pairs */
+);
+```
+
+Reach for the macro only when the bodies genuinely coincide; a
+template that needs per-type exceptions is not worth saving,
+and hand-written definitions stay plain.
+
+See also: [`impl_header_spec!`](../../ostd/src/arch/x86/kernel/acpi/remapping.rs#L281),
+PR [#789](https://github.com/asterinas/vostd/pull/789#discussion_r4059031532) and
+[#789](https://github.com/asterinas/vostd/pull/789#discussion_r4060179620).
+
 ### Document real proof debt
 
 <!-- guideline: document-real-proof-debt -->
@@ -542,13 +729,29 @@ Keep proof comments brief and focused on non-obvious, current constraints and
 their consequences. Document shared trust boundaries once at module level.
 Avoid restating code, speculating about tool limitations, or recounting failed
 proof attempts. Update or remove comments when the constraints change.
-Add a `TODO` for temporary limitations that need follow-up.
+Add a `TODO` only for a concrete unresolved task that needs follow-up; a
+comment is not required merely because verification has limited scope.
+
+Wordiness is reviewed explicitly: comments repeating neighboring
+code ("Redundant comment"), multi-clause narration of a step the
+name or the contract already names ("Too wordy"), and detailed
+explanations reviewers call unnecessary are all flagged and
+trimmed in review. A step needing prose deserves one sentence
+naming the fact, not a paragraph restating it.
 
 See also: PR [#699](https://github.com/asterinas/vostd/pull/699#discussion_r3820204595),
 [#699](https://github.com/asterinas/vostd/pull/699#discussion_r3819464685),
 [#742](https://github.com/asterinas/vostd/pull/742#discussion_r3940894244),
-[#742](https://github.com/asterinas/vostd/pull/742#discussion_r3940913907), and
-[#742](https://github.com/asterinas/vostd/pull/742#discussion_r3943825219).
+[#742](https://github.com/asterinas/vostd/pull/742#discussion_r3940913907),
+[#742](https://github.com/asterinas/vostd/pull/742#discussion_r3943825219),
+[#812](https://github.com/asterinas/vostd/pull/812#discussion_r4227371962),
+[#812](https://github.com/asterinas/vostd/pull/812#discussion_r4227372826),
+[#812](https://github.com/asterinas/vostd/pull/812#discussion_r4227374356),
+[#812](https://github.com/asterinas/vostd/pull/812#discussion_r4227375834),
+[#812](https://github.com/asterinas/vostd/pull/812#discussion_r4227382178),
+[#812](https://github.com/asterinas/vostd/pull/812#discussion_r4227387737),
+[#812](https://github.com/asterinas/vostd/pull/812#issuecomment-6075882967), and
+[#820](https://github.com/asterinas/vostd/pull/820#discussion_r4227840071).
 
 ### Qualified Verus spec calls
 
@@ -587,8 +790,23 @@ both modes honest:
   calls `CpuId::as_usize()`, which spec mode cannot, so `part_idx_spec(i: int)`
   holds the formula.
 - Add `#[verifier::when_used_as_spec(twin)]` when the twin's signature
-  matches, and spec mode can call the helper by its exec name
-  (`parts_for_cpus`, `sub_ptr::to_repr`).
+  matches (`parts_for_cpus`, `sub_ptr::to_repr`). Once mapped, prefer the
+  executable API name in specifications, contracts, invariants, and proofs
+  instead of calling the spec twin directly. This keeps specifications in
+  the API's vocabulary while Verus selects the model.
+
+```rust
+// Prefer this, when get_type has when_used_as_spec(program_header_type):
+program.get_type() is Ok
+
+// Over this:
+program_header_type(&program) is Ok
+```
+
+When adding or reviewing a mapping, check all affected call sites for direct
+calls to the mapped spec function, not just the reported occurrence. Direct
+model calls remain appropriate in the connecting contract or when reasoning
+explicitly about the model.
 
 Keep a spec fn with different argument types when the truthful model requires
 a shape the exec helper cannot offer:
@@ -606,4 +824,5 @@ re-signing the executable function, which
 
 See also: PR [#770](https://github.com/asterinas/vostd/pull/770#discussion_r4032758336),
 [#770](https://github.com/asterinas/vostd/pull/770#discussion_r4035293382),
-and [#770](https://github.com/asterinas/vostd/pull/770#discussion_r4035681677).
+[#770](https://github.com/asterinas/vostd/pull/770#discussion_r4035681677), and
+[#931](https://github.com/asterinas/vostd/pull/931#discussion_r4594851037).

@@ -1,9 +1,10 @@
-name: Format and Verify VOSTD (Main)
+name: Verify VOSTD
 
-# One verification run feeds everything: a verify leg runs with
-# --time-expanded and uploads the log, `perf` parses it (never re-verifies),
-# `doc` builds the docs in parallel, and `doc-deploy` merges those docs with
-# the gh-pages benchmark before deploying. `format` delegates to `cargo verus fmt`.
+# Pipeline: verify legs (per os/target, --time-expanded) upload logs; perf parses
+# the x86_64 leg's log; doc builds the docs; perf-history pushes the verify-perf
+# chart; stats takes the verification snapshot; publish (pushes only) records
+# the history point on gh-pages and deploys the site (dashboard at the root,
+# /stats/, /verusdoc/, /dev/bench/).
 
 on:
   push:
@@ -36,9 +37,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-24.04
-          - macos-14
+        include:
+          # RISC-V/LoongArch on Linux only; the triple selects the arch module
+          # in `ostd/src/lib.rs`.
+          - os: ubuntu-latest
+            rust_target: x86_64-unknown-none
+          - os: ubuntu-latest
+            rust_target: riscv64imac-unknown-none-elf
+          - os: ubuntu-latest
+            rust_target: loongarch64-unknown-none-softfloat
+          - os: macos-latest
+            rust_target: x86_64-unknown-none
     timeout-minutes: 240
     steps:
       - name: Checkout repository
@@ -46,89 +55,21 @@ jobs:
         with:
           # push: the pushed commit; pull_request: the merge commit.
           ref: ${{ github.sha }}
-          submodules: recursive
 
-      - name: Set up toolchain and caches
-        uses: ./.github/actions/setup-verus
+      - name: Verify OSTD and publish log
+        uses: ./.github/actions/verify
         with:
-          verus: 'true'
-          install-verusfmt: 'false'
-
-      # `make` plus --time-expanded for the perf job's log.
-      - name: Run verification
-        run: |
-          set -o pipefail
-          if ! cargo dv verify --package ostd -- --time-expanded 2>&1 | tee verify_output.txt; then
-            echo "❌ Verification failed"
-            echo "VERIFY_FAILED=1" >> "$GITHUB_ENV"
-            exit 1
-          else
-            echo "✅ Verification passed!"
-          fi
-
-      - name: Check for verification warnings
-        if: always() && runner.os == 'Linux'
-        run: |
-          WARNINGS=(
-            "note: automatically chose triggers for this expression:|auto-trigger notes"
-            "warning: use of deprecated method \`vstd::set::Set::<A>::finite\`|deprecated Set::finite()"
-            "warning: use of deprecated associated function \`vstd::set::Set::<A>::new_assuming_finite\`|deprecated Set::new_assuming_finite()"
-          )
-
-          FAILED=0
-          for ITEM in "${WARNINGS[@]}"; do
-            PATTERN="${ITEM%%|*}"
-            LABEL="${ITEM##*|}"
-            if grep -q "$PATTERN" verify_output.txt 2>/dev/null; then
-              echo "❌ Found $LABEL"
-              grep -n "$PATTERN" verify_output.txt
-              FAILED=1
-            else
-              echo "✅ No $LABEL found"
-            fi
-          done
-
-          if [[ "$FAILED" == "1" ]]; then
-            echo "VERIFY_WARNINGS_FOUND=1" >> "$GITHUB_ENV"
-            exit 1
-          fi
-
-      - name: Upload verification log
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: verify-log-${{ matrix.os }}
-          path: verify_output.txt
-          retention-days: 7
-          if-no-files-found: warn
-
-      - name: Publish summary
-        if: always()
-        run: |
-          {
-            echo "# CI Summary (${{ matrix.os }})"
-            if [[ "${VERIFY_FAILED:-0}" == "1" ]]; then
-              echo "- Verification: ❌ failed"
-            else
-              echo "- Verification: ✅ passed"
-            fi
-            if [[ "${VERIFY_WARNINGS_FOUND:-0}" == "1" ]]; then
-              echo "- Verification warnings: ❌ found"
-            else
-              echo "- Verification warnings: ✅ none"
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
+          rust-target: ${{ matrix.rust_target }}
+          runner-label: ${{ matrix.os }}
 
   format:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     timeout-minutes: 45
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
-        with:
-          submodules: recursive
 
       - name: Set up toolchain and caches
         uses: ./.github/actions/setup-verus
@@ -143,7 +84,6 @@ jobs:
           if [[ -n $(git status --porcelain) ]]; then
             echo "Code is not properly formatted. Run 'make fmt'."
             git diff
-            echo "FMT_FAILED=1" >> "$GITHUB_ENV"
             exit 1
           fi
 
@@ -152,25 +92,52 @@ jobs:
         run: |
           {
             echo "# Format Summary"
-            if [[ "${FMT_FAILED:-0}" == "1" ]]; then
+            if [[ "${{ job.status }}" != "success" ]]; then
               echo "- Formatting: ❌ failed"
             else
               echo "- Formatting: ✅ passed"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
+  stats:
+    # Takes the per-module verification snapshot against the phaseII/mainline
+    # baseline and uploads it for `publish`; skips the verified-API count when
+    # doc's rustdoc JSON artifact is missing.
+    needs: [doc]
+    if: >
+      always() &&
+      !cancelled()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Take verification statistics snapshot
+        uses: ./.github/actions/stats
+
+      - name: Publish summary
+        if: always()
+        run: |
+          {
+            echo "# Stats Summary"
+            echo "- Verification snapshot: ${{ job.status == 'success' && '✅ taken and uploaded' || '❌ failed' }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   perf:
-    # Every event: parses the verify leg's log and computes the verification
-    # cost compared to the measurement from last main. The comparison lands
-    # in the job summary and the report artifact.
+    # Parses the verify log and reports the verification cost vs. last main.
     needs: [verify]
     if: >
       always() &&
       !cancelled() &&
       needs.verify.result != 'cancelled'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     permissions:
       contents: read
+    outputs:
+      baseline-cache-hit: ${{ steps.perf.outputs.baseline-cache-hit }}
     timeout-minutes: 30
     steps:
       - name: Checkout repository
@@ -178,84 +145,43 @@ jobs:
         with:
           ref: ${{ github.sha }}
 
-      - name: Record which commit was checked out
-        run: echo "CUR_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
-
-      - name: Restore prior measurement (baseline)
-        uses: actions/cache/restore@v6
+      - name: Analyze verification performance
+        id: perf
+        uses: ./.github/actions/perf
         with:
-          path: perf-store
-          key: perf-metrics-${{ github.sha }}
-          restore-keys: |
-            perf-metrics-
+          verification-result: ${{ needs.verify.result }}
 
-      - name: Save aside the baseline (if any)
-        run: |
-          if [[ -f perf-store/metrics.json ]]; then
-            BASELINE_SHA=$(cat perf-store/source-sha.txt 2>/dev/null || echo unknown)
-            echo "BASELINE_SHA=$BASELINE_SHA" >> "$GITHUB_ENV"
-            mv perf-store/metrics.json perf-baseline.json
-            echo "Baseline: $BASELINE_SHA"
-          else
-            echo "No prior measurement cached; nothing to compare against yet."
-          fi
-
-      - name: Download verification log
-        uses: actions/download-artifact@v8
+  perf-history:
+    # Main only: pushes the verify-perf chart to gh-pages and saves the
+    # next baseline.
+    needs: [verify, perf]
+    if: >
+      github.event_name != 'pull_request' &&
+      github.ref == 'refs/heads/main' &&
+      needs.verify.result == 'success' &&
+      needs.perf.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
         with:
-          name: verify-log-ubuntu-24.04
+          ref: ${{ github.sha }}
 
-      - name: Parse cost metrics
-        run: |
-          mkdir -p perf-store
-          python3 tools/verus_perf.py parse verify_output.txt > perf-store/metrics.json
-          echo "$CUR_SHA" > perf-store/source-sha.txt
-          echo "recorded run for: $CUR_SHA"
-          cat perf-store/metrics.json
-
-      - name: Compare against the prior measurement
-        run: |
-          mkdir -p out
-          if [[ -f perf-baseline.json ]]; then
-            {
-              echo "## Verification cost"
-              echo
-              echo "Comparing this run (\`$CUR_SHA\`) against the last main measurement (\`${BASELINE_SHA:-unknown}\`)."
-              echo
-              python3 tools/verus_perf.py compare perf-baseline.json perf-store/metrics.json
-            } > out/perf-report.md
-          else
-            {
-              echo "## Verification cost: first recorded baseline"
-              echo
-              echo "No prior measurement was cached; nothing to compare against yet. This run's cost (\`$CUR_SHA\`):"
-              echo
-              echo '```'
-              cat perf-store/metrics.json
-              echo '```'
-            } > out/perf-report.md
-          fi
-          cat out/perf-report.md
-          cat out/perf-report.md >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Upload report artifact
-        if: always()
-        uses: actions/upload-artifact@v7
+      - name: Publish performance history
+        uses: ./.github/actions/perf-history
         with:
-          name: verify-perf-report
-          path: |
-            out/perf-report.md
-            perf-store/metrics.json
-            perf-baseline.json
-          if-no-files-found: ignore
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          baseline-cache-hit: ${{ needs.perf.outputs.baseline-cache-hit }}
 
   doc:
-    # PRs build the docs; pushes also upload the artifact for `doc-deploy`,
-    # which merges in the gh-pages benchmark and deploys.
+    # Builds the docs; stats counts verified APIs from the uploaded rustdoc JSON.
     if: >
       always() &&
       !cancelled()
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       statuses: write   # ci/doc pending status on push
@@ -285,26 +211,9 @@ jobs:
 
       - name: Checkout repository
         uses: actions/checkout@v7
-        with:
-          submodules: recursive
 
-      - name: Set up toolchain and caches
-        uses: ./.github/actions/setup-verus
-        with:
-          verus: 'true'
-          dv-cache: 'restore'
-
-      - name: Build docs
-        run: make doc
-
-      - name: Upload doc artifact
-        if: github.event_name != 'pull_request'
-        uses: actions/upload-artifact@v7
-        with:
-          name: doc-site
-          path: doc
-          retention-days: 7
-          if-no-files-found: error
+      - name: Build documentation and publish artifacts
+        uses: ./.github/actions/build-docs
 
       - name: Publish summary
         if: always()
@@ -314,62 +223,45 @@ jobs:
             echo "- Docs build: ${{ job.status == 'success' && '✅ passed' || '❌ failed' }}"
           } >> "$GITHUB_STEP_SUMMARY"
 
-  doc-deploy:
-    # Pushes only: merge the doc artifact with the gh-pages benchmark chart
-    # (pushed by `perf`) and deploy. Needs verify so a failed
-    # verification can't deploy docs.
-    needs: [doc, perf, verify]
+  publish:
+    # Records the stats history point on gh-pages and deploys the site —
+    # dashboard at the root, /verusdoc/, /dev/bench/, /stats/.
+    # Requires doc explicitly: stats succeeds even without doc's rustdoc JSON
+    # (it just skips the API count), so stats alone would deploy a hole.
+    needs: [doc, perf, perf-history, verify, stats]
     if: >
       always() &&
       !cancelled() &&
       github.event_name != 'pull_request' &&
+      github.ref == 'refs/heads/main' &&
       needs.verify.result == 'success' &&
       needs.doc.result == 'success' &&
-      (needs.perf.result == 'success' || needs.perf.result == 'skipped')
+      needs.stats.result == 'success' &&
+      (needs.perf.result == 'success' || needs.perf.result == 'skipped') &&
+      (needs.perf-history.result == 'success' || needs.perf-history.result == 'skipped')
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write   # push the stats history point to gh-pages
       pages: write      # deploy to GitHub Pages
       id-token: write   # deploy to GitHub Pages
-    timeout-minutes: 15
+    timeout-minutes: 60
     steps:
       - name: Checkout repository
-        # Provides the git dir for the gh-pages fetch below.
         uses: actions/checkout@v7
 
-      - name: Download doc artifact
-        uses: actions/download-artifact@v8
-        with:
-          name: doc-site
-          path: doc
+      - name: Publish history and deploy Pages
+        uses: ./.github/actions/pages
 
-      # Serve the benchmark chart at <site>/dev/bench/.
-      - name: Embed verify-perf benchmark into the doc artifact
+      - name: Publish summary
+        if: always()
         run: |
-          set -e
-          if ! git fetch --depth=1 origin gh-pages 2>/dev/null; then
-            echo "no gh-pages branch yet; benchmark not embedded"
-            exit 0
-          fi
-          git checkout FETCH_HEAD -- dev/bench || { echo "no dev/bench on gh-pages; skipping"; exit 0; }
-          mkdir -p doc/dev
-          mv dev/bench doc/dev/bench
-          rmdir dev 2>/dev/null || true
-          echo "embedded dev/bench into the doc artifact:"
-          ls doc/dev/bench
-
-      - name: Upload pages artifact
-        uses: actions/upload-pages-artifact@v5
-        with:
-          path: doc
-
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v5
+          {
+            echo "# Publish Summary"
+            echo "- Verification dashboard: ${{ job.status == 'success' && '✅ recorded and deployed' || '❌ failed' }}"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   report:
-    # `ci/doc` status for push runs; `always()` flips pending -> failure.
-    needs: [doc, doc-deploy]
+    needs: [doc, publish]
     if: always() && github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
@@ -389,7 +281,7 @@ jobs:
             const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
 
             const buildResult = '${{ needs.doc.result }}';
-            const deployResult = '${{ needs.doc-deploy.result }}';
+            const deployResult = '${{ needs.publish.result }}';
             // deploy is skipped when docs aren't published -- not a failure.
             const ok = buildResult === 'success' &&
               (deployResult === 'success' || deployResult === 'skipped');

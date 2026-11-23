@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 //! The standard library for Asterinas and other Rust OSes.
 #![feature(alloc_error_handler)]
-#![feature(allocator_api)]
+#![feature(allocator_ext)]
 #![feature(btree_cursors)]
 #![feature(const_trait_impl)]
 #![feature(core_intrinsics)]
@@ -31,23 +31,26 @@
 
 extern crate alloc;
 
-//#[cfg(target_arch = "x86_64")]
+#[cfg(target_arch = "x86_64")]
 #[path = "arch/x86/mod.rs"]
 pub mod arch;
-//#[cfg(target_arch = "riscv64")]
-//#[path = "arch/riscv/mod.rs"]
-//pub mod arch;
+#[cfg(target_arch = "riscv64")]
+#[path = "arch/riscv/mod.rs"]
+pub mod arch;
+#[cfg(target_arch = "loongarch64")]
+#[path = "arch/loongarch/mod.rs"]
+pub mod arch;
 pub mod boot;
-/*pub mod bus;
-pub mod console;*/
+pub mod bus;
+/*pub mod console;*/
 pub mod cpu;
 pub mod error;
-/*pub mod io;
-pub mod logger;*/
+pub mod io;
+/*pub mod logger;*/
 pub mod mm;
-/*pub mod panic;
+/*pub mod panic;*/
 pub mod prelude;
-pub mod smp;*/
+/*pub mod smp;*/
 pub mod sync;
 pub mod task;
 pub mod timer;
@@ -64,9 +67,10 @@ pub use ostd_macros::{
     panic_handler,
 };*/
 pub use ostd_pod::Pod;
-/*
+
 pub use self::{error::Error, prelude::Result};
 
+/*
 /// Initializes OSTD.
 ///
 /// This function represents the first phase booting up the system. It makes

@@ -15,6 +15,8 @@
 //! spec and, where a `requires` fits, excluded by that precondition;
 //! `SmallVec::reserve` rounds the capacity up to the next power of two, so those
 //! bounds use a factor of 2.
+use crate::layout::{lemma_atomic_u64_layout, lemma_primitive_layout};
+
 use core::{
     ops::{Deref, DerefMut, Index, IndexMut},
     slice::SliceIndex,
@@ -35,11 +37,7 @@ type U64Array2 = [u64; 2];
 
 type AtomicU64Array2 = [AtomicU64; 2];
 
-global layout u64 is size == 8, align == 8;
-
 global layout U64Array2 is size == 16, align == 8;
-
-global layout AtomicU64 is size == 8, align == 8;
 
 global layout AtomicU64Array2 is size == 16, align == 8;
 
@@ -88,23 +86,25 @@ pub broadcast axiom fn axiom_smallvec_array_size_of_array<T, const N: usize>()
 ;
 
 /// The `[u64; 2]` used by `CpuSet` is a well-formed `SmallVec` backing store.
-/// Its concrete layout declarations above are checked by rustc.
+/// Its array and shared element layouts are checked by rustc.
 pub broadcast proof fn lemma_smallvec_array_u64_2()
     ensures
         #[trigger] obeys_smallvec_array::<[u64; 2]>(),
 {
     broadcast use axiom_smallvec_array_size_of_array;
 
+    lemma_primitive_layout();
 }
 
 /// The `[AtomicU64; 2]` used by `AtomicCpuSet` is a well-formed `SmallVec`
-/// backing store. Its concrete layout declarations above are checked by rustc.
+/// backing store. Its array and shared element layouts are checked by rustc.
 pub broadcast proof fn lemma_smallvec_array_atomic_u64_2()
     ensures
         #[trigger] obeys_smallvec_array::<[AtomicU64; 2]>(),
 {
     broadcast use axiom_smallvec_array_size_of_array;
 
+    lemma_atomic_u64_layout();
 }
 
 /// `SmallVec`'s single-position indexing precondition is the slice bounds check.
@@ -277,7 +277,7 @@ pub assume_specification<A: Array>[ <SmallVec<A> as IntoIterator>::into_iter ](
     ensures
         obeys_smallvec_array::<A>() ==> {
             &&& IteratorSpec::obeys_prophetic_iter_laws(&iter)
-            &&& IteratorSpec::will_return_none(&iter)
+            &&& IteratorSpec::produces(&iter) == Seq::new(smallvec_view(&v).len(), |i: int| true)
             &&& IteratorSpec::remaining(&iter) == smallvec_view(&v)
             &&& IteratorSpec::decrease(&iter) == Some(smallvec_view(&v).len())
         },
@@ -288,11 +288,16 @@ pub assume_specification<A: Array>[ <SmallVec<A> as IntoIterator>::into_iter ](
 /// (E0117) prevents implementing `FromIteratorSpecImpl` for `SmallVec` here.
 pub broadcast axiom fn axiom_smallvec_from_iter_ensures<A: Array>(
     remaining: Seq<A::Item>,
+    produces: Seq<bool>,
     s: SmallVec<A>,
 )
     ensures
-        obeys_smallvec_array::<A>() ==> #[trigger] FromIteratorSpec::from_iter_ensures(remaining, s)
-            == (remaining == smallvec_view(&s)),
+        obeys_smallvec_array::<A>() ==> #[trigger] FromIteratorSpec::from_iter_ensures(
+            remaining,
+            produces,
+            s,
+        ) == (produces.len() == remaining.len() && produces.all(|p: bool| p) && remaining
+            == smallvec_view(&s)),
 ;
 
 } // verus!
