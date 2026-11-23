@@ -487,6 +487,63 @@ pub proof fn tracked_detach<T: LockedValue, const N: usize, const L: usize>(
     (rest, child)
 }
 
+/// Every cell in `t` belongs to the lock that `id` names for its key. Locking
+/// establishes this for each cell taken (`NodeLock::lock` returns a cell whose
+/// [`NodeCell::lock_const`] is the lock's `id`), and it is what unlocking a
+/// whole tree needs: following a key to its lock finds the lock each cell goes
+/// back to.
+pub open spec fn cells_belong_at<T: LockedValue, const N: usize, const L: usize>(
+    t: LockedTree<T, N, L>,
+    id: spec_fn(T::Key) -> LockConst<T::Key, T::Consts>,
+    depth: nat,
+) -> bool
+    decreases depth,
+{
+    &&& t.value().lock_const() == id(t.value().key())
+    &&& depth > 0 ==> forall|i: int|
+        0 <= i < N && #[trigger] t.has_child(i) ==> cells_belong_at(
+            t.child(i),
+            id,
+            (depth - 1) as nat,
+        )
+}
+
+pub open spec fn cells_belong<T: LockedValue, const N: usize, const L: usize>(
+    t: LockedTree<T, N, L>,
+    id: spec_fn(T::Key) -> LockConst<T::Key, T::Consts>,
+) -> bool {
+    cells_belong_at(t, id, (L - t.level()) as nat)
+}
+
+/// Detaching a child keeps [`cells_belong`] for both parts.
+pub proof fn lemma_cells_belong_detach<T: LockedValue, const N: usize, const L: usize>(
+    parent: LockedTree<T, N, L>,
+    i: int,
+    id: spec_fn(T::Key) -> LockConst<T::Key, T::Consts>,
+)
+    requires
+        tree_wf(parent),
+        cells_belong(parent, id),
+        0 <= i < N,
+        parent.has_child(i),
+    ensures
+        cells_belong(parent.remove(i), id),
+        cells_belong(parent.child(i), id),
+{
+    let depth = (L - parent.level()) as nat;
+    let rest = parent.remove(i);
+    assert(parent.inv());
+    assert(parent.child(i).level() == parent.level() + 1);
+    assert forall|j: int| 0 <= j < N && #[trigger] rest.has_child(j) implies cells_belong_at(
+        rest.child(j),
+        id,
+        (depth - 1) as nat,
+    ) by {
+        assert(parent.has_child(j));
+        assert(rest.child(j) == parent.child(j));
+    }
+}
+
 /// Turns a childless held tree back into its cell, ready to be unlocked.
 pub proof fn tracked_into_cell<T: LockedValue, const N: usize, const L: usize>(
     tracked t: LockedTree<T, N, L>,
