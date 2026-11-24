@@ -22,6 +22,8 @@ use crate::mm::{
     page_table::{PageTableGuard, *},
 };
 
+use crate::specs::mm::frame::frame_specs::FrameRawPerms;
+
 verus! {
 
 // ─── Present-PTE counting ──────────────────────────────────────────────────────
@@ -321,6 +323,9 @@ impl<C: PageTableConfig> OwnerOf for PageTablePageMeta<C> {
 ///   Carried here for convenience, though it can be computed from `level`.
 pub tracked struct NodeOwner<C: PageTableConfig> {
     pub pte_view: GhostVar<PteRaws>,
+    /// The tree's half of the slot snapshots; the authoritative half
+    /// (`PtLockPayload::slot_auth`) is in the node's lock cell.
+    pub slot_view: GhostVar<SlotSnapshots>,
     /// Identity snapshots; the incoming PTE or owning Frame holds the token.
     pub ghost metadata: MetadataPerm,
     pub ghost metadata_id: Loc,
@@ -333,6 +338,7 @@ pub tracked struct NodeOwner<C: PageTableConfig> {
 impl<C: PageTableConfig> Inv for NodeOwner<C> {
     open spec fn inv(self) -> bool {
         &&& self.pte_view@.len() == NR_ENTRIES
+        &&& self.slot_view@.len() == NR_ENTRIES
         &&& 1 <= self.level() <= C::NR_LEVELS
         &&& self.tree_level == tree_level_for::<C>(self.level())
         &&& 0 <= self.slot_index < max_meta_slots()
@@ -376,6 +382,10 @@ impl<C: PageTableConfig> NodeOwner<C> {
         &&& self.meta_value().wf(cell.value().meta)
         &&& cell.value().pte_auth.id() == self.pte_view.id()
         &&& cell.value().pte_auth@ == self.pte_view@
+        &&& cell.value().slot_auth.id() == self.slot_view.id()
+        &&& cell.value().slot_auth@ == self.slot_view@
+        &&& node_tokens_match(cell.value().slot_auth@, cell.value().node_tokens)
+        &&& frame_perms_match(cell.value().slot_auth@, cell.value().frame_perms)
         &&& self.is_pte_perm(cell.value().ptes)
     }
 
@@ -413,6 +423,7 @@ impl<C: PageTableConfig> NodeOwner<C> {
             self.inv(),
             self.meta_value().lock_wf(),
             self.pte_view.id() == self.meta_value().lock.constant().consts.pte_model_id,
+            self.slot_view.id() == self.meta_value().lock.constant().consts.slot_model_id,
             lock_key_wf(self.meta_value(), self.slot_index),
             cell.inv_cell(),
             cell.lock_const() == self.meta_value().lock.constant(),
@@ -423,6 +434,7 @@ impl<C: PageTableConfig> NodeOwner<C> {
         reveal(crate::mm::page_table::PageTablePageMeta::lock_consts_wf);
         reveal(lock_key_wf);
         cell.tracked_borrow_value().pte_auth.agree(&self.pte_view);
+        cell.tracked_borrow_value().slot_auth.agree(&self.slot_view);
         lemma_count_where_raw::<C::E>(self.pte_view@, self.pte_view@.len() as int);
     }
 
@@ -444,6 +456,188 @@ impl<C: PageTableConfig> NodeOwner<C> {
         lemma_count_where_raw::<C::E>(self.pte_view@, self.pte_view@.len() as int);
     }
 
+    /// Takes the child-node token of slot `idx` out of the node's cell, and records in
+    /// both halves of the slot snapshots that the slot holds none.
+    pub proof fn tracked_take_slot_node(
+        tracked &mut self,
+        tracked cell: &mut PtLockCell,
+        idx: int,
+    ) -> (tracked res: Option<FracMetadataPerm>)
+        requires
+            old(cell).value().slot_auth.id() == old(self).slot_view.id(),
+            node_tokens_match(old(cell).value().slot_auth@, old(cell).value().node_tokens),
+            frame_perms_match(old(cell).value().slot_auth@, old(cell).value().frame_perms),
+            0 <= idx < old(self).slot_view@.len(),
+        ensures
+            res == old(self).slot_view@[idx].node,
+            final(self).slot_view@ == old(self).slot_view@.update(
+                idx,
+                SlotSnapshot { node: None, ..old(self).slot_view@[idx] },
+            ),
+            *final(self) == (NodeOwner { slot_view: final(self).slot_view, ..*old(self) }),
+            final(self).slot_view.id() == old(self).slot_view.id(),
+            final(cell).value().slot_auth@ == final(self).slot_view@,
+            final(cell).value().slot_auth.id() == final(self).slot_view.id(),
+            node_tokens_match(final(cell).value().slot_auth@, final(cell).value().node_tokens),
+            frame_perms_match(final(cell).value().slot_auth@, final(cell).value().frame_perms),
+            final(cell).value() == (PtLockPayload {
+                slot_auth: final(cell).value().slot_auth,
+                node_tokens: final(cell).value().node_tokens,
+                frame_perms: final(cell).value().frame_perms,
+                ..old(cell).value()
+            }),
+            final(cell).loc() == old(cell).loc(),
+            final(cell).level() == old(cell).level(),
+    {
+        let tracked payload = cell.tracked_borrow_mut_value();
+        payload.slot_auth.agree(&self.slot_view);
+        let ghost snaps = payload.slot_auth@;
+        let tracked res = if payload.node_tokens.contains_key(idx) {
+            Some(payload.node_tokens.tracked_remove(idx))
+        } else {
+            None
+        };
+        let ghost new_snaps = snaps.update(idx, SlotSnapshot { node: None, ..snaps[idx] });
+        payload.slot_auth.update(&mut self.slot_view, new_snaps);
+        res
+    }
+
+    /// Puts the child-node token `x` into slot `idx` of the node's cell, which holds
+    /// none, and records it in both halves of the slot snapshots.
+    pub proof fn tracked_put_slot_node(
+        tracked &mut self,
+        tracked cell: &mut PtLockCell,
+        idx: int,
+        tracked x: Option<FracMetadataPerm>,
+    )
+        requires
+            old(cell).value().slot_auth.id() == old(self).slot_view.id(),
+            node_tokens_match(old(cell).value().slot_auth@, old(cell).value().node_tokens),
+            frame_perms_match(old(cell).value().slot_auth@, old(cell).value().frame_perms),
+            0 <= idx < old(self).slot_view@.len(),
+            old(self).slot_view@[idx].node is None,
+        ensures
+            final(self).slot_view@ == old(self).slot_view@.update(
+                idx,
+                SlotSnapshot { node: x, ..old(self).slot_view@[idx] },
+            ),
+            *final(self) == (NodeOwner { slot_view: final(self).slot_view, ..*old(self) }),
+            final(self).slot_view.id() == old(self).slot_view.id(),
+            final(cell).value().slot_auth@ == final(self).slot_view@,
+            final(cell).value().slot_auth.id() == final(self).slot_view.id(),
+            node_tokens_match(final(cell).value().slot_auth@, final(cell).value().node_tokens),
+            frame_perms_match(final(cell).value().slot_auth@, final(cell).value().frame_perms),
+            final(cell).value() == (PtLockPayload {
+                slot_auth: final(cell).value().slot_auth,
+                node_tokens: final(cell).value().node_tokens,
+                frame_perms: final(cell).value().frame_perms,
+                ..old(cell).value()
+            }),
+            final(cell).loc() == old(cell).loc(),
+            final(cell).level() == old(cell).level(),
+    {
+        let ghost x0 = x;
+        let tracked payload = cell.tracked_borrow_mut_value();
+        payload.slot_auth.agree(&self.slot_view);
+        let ghost snaps = payload.slot_auth@;
+        if x is Some {
+            payload.node_tokens.tracked_insert(idx, x.tracked_unwrap());
+        }
+        let ghost new_snaps = snaps.update(idx, SlotSnapshot { node: x0, ..snaps[idx] });
+        payload.slot_auth.update(&mut self.slot_view, new_snaps);
+    }
+
+    /// Takes the frame item permission of slot `idx` out of the node's cell, and records in
+    /// both halves of the slot snapshots that the slot holds none.
+    pub proof fn tracked_take_slot_frame(
+        tracked &mut self,
+        tracked cell: &mut PtLockCell,
+        idx: int,
+    ) -> (tracked res: Option<FrameRawPerms>)
+        requires
+            old(cell).value().slot_auth.id() == old(self).slot_view.id(),
+            node_tokens_match(old(cell).value().slot_auth@, old(cell).value().node_tokens),
+            frame_perms_match(old(cell).value().slot_auth@, old(cell).value().frame_perms),
+            0 <= idx < old(self).slot_view@.len(),
+        ensures
+            res == old(self).slot_view@[idx].frame,
+            final(self).slot_view@ == old(self).slot_view@.update(
+                idx,
+                SlotSnapshot { frame: None, ..old(self).slot_view@[idx] },
+            ),
+            *final(self) == (NodeOwner { slot_view: final(self).slot_view, ..*old(self) }),
+            final(self).slot_view.id() == old(self).slot_view.id(),
+            final(cell).value().slot_auth@ == final(self).slot_view@,
+            final(cell).value().slot_auth.id() == final(self).slot_view.id(),
+            node_tokens_match(final(cell).value().slot_auth@, final(cell).value().node_tokens),
+            frame_perms_match(final(cell).value().slot_auth@, final(cell).value().frame_perms),
+            final(cell).value() == (PtLockPayload {
+                slot_auth: final(cell).value().slot_auth,
+                node_tokens: final(cell).value().node_tokens,
+                frame_perms: final(cell).value().frame_perms,
+                ..old(cell).value()
+            }),
+            final(cell).loc() == old(cell).loc(),
+            final(cell).level() == old(cell).level(),
+    {
+        let tracked payload = cell.tracked_borrow_mut_value();
+        payload.slot_auth.agree(&self.slot_view);
+        let ghost snaps = payload.slot_auth@;
+        let tracked res = if payload.frame_perms.contains_key(idx) {
+            Some(payload.frame_perms.tracked_remove(idx))
+        } else {
+            None
+        };
+        let ghost new_snaps = snaps.update(idx, SlotSnapshot { frame: None, ..snaps[idx] });
+        payload.slot_auth.update(&mut self.slot_view, new_snaps);
+        res
+    }
+
+    /// Puts the frame item permission `x` into slot `idx` of the node's cell, which holds
+    /// none, and records it in both halves of the slot snapshots.
+    pub proof fn tracked_put_slot_frame(
+        tracked &mut self,
+        tracked cell: &mut PtLockCell,
+        idx: int,
+        tracked x: Option<FrameRawPerms>,
+    )
+        requires
+            old(cell).value().slot_auth.id() == old(self).slot_view.id(),
+            node_tokens_match(old(cell).value().slot_auth@, old(cell).value().node_tokens),
+            frame_perms_match(old(cell).value().slot_auth@, old(cell).value().frame_perms),
+            0 <= idx < old(self).slot_view@.len(),
+            old(self).slot_view@[idx].frame is None,
+        ensures
+            final(self).slot_view@ == old(self).slot_view@.update(
+                idx,
+                SlotSnapshot { frame: x, ..old(self).slot_view@[idx] },
+            ),
+            *final(self) == (NodeOwner { slot_view: final(self).slot_view, ..*old(self) }),
+            final(self).slot_view.id() == old(self).slot_view.id(),
+            final(cell).value().slot_auth@ == final(self).slot_view@,
+            final(cell).value().slot_auth.id() == final(self).slot_view.id(),
+            node_tokens_match(final(cell).value().slot_auth@, final(cell).value().node_tokens),
+            frame_perms_match(final(cell).value().slot_auth@, final(cell).value().frame_perms),
+            final(cell).value() == (PtLockPayload {
+                slot_auth: final(cell).value().slot_auth,
+                node_tokens: final(cell).value().node_tokens,
+                frame_perms: final(cell).value().frame_perms,
+                ..old(cell).value()
+            }),
+            final(cell).loc() == old(cell).loc(),
+            final(cell).level() == old(cell).level(),
+    {
+        let ghost x0 = x;
+        let tracked payload = cell.tracked_borrow_mut_value();
+        payload.slot_auth.agree(&self.slot_view);
+        let ghost snaps = payload.slot_auth@;
+        if x is Some {
+            payload.frame_perms.tracked_insert(idx, x.tracked_unwrap());
+        }
+        let ghost new_snaps = snaps.update(idx, SlotSnapshot { frame: x0, ..snaps[idx] });
+        payload.slot_auth.update(&mut self.slot_view, new_snaps);
+    }
+
     /// Updates the PTE model to match the PTE array in `cell`, after the
     /// latter has been written.
     pub proof fn tracked_sync_pte_model(tracked &mut self, tracked cell: &mut PtLockCell)
@@ -454,6 +648,7 @@ impl<C: PageTableConfig> NodeOwner<C> {
             final(cell).value().pte_auth@ == final(self).pte_view@,
             final(cell).value().pte_auth.id() == final(self).pte_view.id(),
             final(self).pte_view.id() == old(self).pte_view.id(),
+            final(self).slot_view == old(self).slot_view,
             final(cell).loc() == old(cell).loc(),
             final(cell).level() == old(cell).level(),
             final(cell).value() == (PtLockPayload {
@@ -506,6 +701,7 @@ impl<C: PageTableConfig> NodeOwner<C> {
         &&& self.meta_wf(regions)
         &&& self.meta_value().lock_wf()
         &&& self.pte_view.id() == self.meta_value().lock.constant().consts.pte_model_id
+        &&& self.slot_view.id() == self.meta_value().lock.constant().consts.slot_model_id
         &&& lock_key_wf(
             self.meta_value(),
             self.slot_index,

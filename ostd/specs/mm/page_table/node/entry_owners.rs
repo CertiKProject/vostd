@@ -6,7 +6,7 @@ use crate::specs::{
     mm::{
         frame::{
             mapping::*,
-            meta_owners::{FracMetadataPerm, PageUsage, PtLockCell},
+            meta_owners::{FracMetadataPerm, PageUsage, PtLockCell, SlotSnapshot},
             meta_region_owners::MetaRegionOwners,
         },
         page_table::*,
@@ -23,6 +23,8 @@ use crate::mm::{
 };
 use core::marker::PhantomData;
 
+use crate::specs::mm::frame::frame_specs::FrameRawPerms;
+
 verus! {
 
 /// # Verification Design
@@ -33,7 +35,10 @@ verus! {
 pub tracked struct FrameEntryOwner<C: PageTableConfig> {
     pub ghost mapped_pa: usize,
     pub ghost prop: PageProperty,
-    pub permission: Option<C::Perm>,
+    /// A snapshot of the item permission of a tracked frame; the permission
+    /// itself is in the parent node's lock cell (`PtLockPayload::frame_perms`).
+    pub ghost permission: Option<FrameRawPerms>,
+    pub ghost _config: core::marker::PhantomData<C>,
 }
 
 pub tracked enum EntryOwnerKind<C: PageTableConfig> {
@@ -54,26 +59,17 @@ pub tracked enum EntryOwnerKind<C: PageTableConfig> {
 
 pub tracked struct EntryOwner<C: PageTableConfig> {
     pub kind: EntryOwnerKind<C>,
-    /// The incoming node PTE owns Some(token). While an owning Frame holds the
-    /// this field is None.
-    pub node_permission: Option<FracMetadataPerm>,
+    /// A snapshot of the counted metadata token that the incoming node PTE
+    /// owns: `Some(token)` while a PTE points to the node, `None` while an
+    /// owning `Frame` holds the token. The token itself is in the parent
+    /// node's lock cell (`PtLockPayload::node_tokens`), whose slot snapshot
+    /// agrees with this one.
+    pub ghost node_permission: Option<FracMetadataPerm>,
     pub ghost path: TreePath<NR_ENTRIES>,
     pub ghost parent_level: PagingLevel,
 }
 
 impl<C: PageTableConfig> EntryOwner<C> {
-    /// Transfers a removed PTE's counted reference back to its owning Frame.
-    pub proof fn tracked_take_node_permission(tracked &mut self) -> (tracked permission:
-        FracMetadataPerm)
-        requires
-            old(self).node_permission is Some,
-        ensures
-            permission == old(self).node_permission->0,
-            *final(self) == (EntryOwner { node_permission: None, ..*old(self) }),
-    {
-        self.node_permission.tracked_take()
-    }
-
     #[verifier::inline]
     pub open spec fn is_node(self) -> bool {
         self.kind is Node
@@ -102,11 +98,25 @@ impl<C: PageTableConfig> EntryOwner<C> {
         self.kind->Frame_0
     }
 
-    pub open spec fn frame_permission(self) -> Option<C::Perm>
+    pub open spec fn frame_permission(self) -> Option<FrameRawPerms>
         recommends
             self.is_frame(),
     {
         self.frame().permission
+    }
+
+    /// What this entry's slot in its parent owns, as recorded by the parent's
+    /// slot snapshots: the child node's counted token, or a frame's item
+    /// permission.
+    pub open spec fn slot_snapshot(self) -> SlotSnapshot {
+        SlotSnapshot {
+            node: self.node_permission,
+            frame: if self.is_frame() {
+                self.frame_permission()
+            } else {
+                None
+            },
+        }
     }
 
     pub open spec fn frame_is_tracked(self) -> bool
@@ -129,10 +139,17 @@ impl<C: PageTableConfig> EntryOwner<C> {
         path: TreePath<NR_ENTRIES>,
         parent_level: PagingLevel,
         prop: PageProperty,
-        permission: Option<C::Perm>,
+        permission: Option<FrameRawPerms>,
     ) -> Self {
         EntryOwner {
-            kind: EntryOwnerKind::Frame(FrameEntryOwner { mapped_pa: paddr, prop, permission }),
+            kind: EntryOwnerKind::Frame(
+                FrameEntryOwner {
+                    mapped_pa: paddr,
+                    prop,
+                    permission,
+                    _config: core::marker::PhantomData,
+                },
+            ),
             node_permission: None,
             path,
             parent_level,
@@ -219,61 +236,15 @@ impl<C: PageTableConfig> EntryOwner<C> {
         match old_kind {
             EntryOwnerKind::Frame(frame) => {
                 let ghost mapped_pa = frame.mapped_pa;
-                let tracked permission = frame.permission;
-                self.kind = EntryOwnerKind::Frame(FrameEntryOwner { mapped_pa, prop, permission });
-            },
-            _ => proof_from_false(),
-        }
-    }
-
-    pub proof fn tracked_take_frame_permission(tracked &mut self) -> (tracked res: Option<C::Perm>)
-        requires
-            old(self).is_frame(),
-        ensures
-            res == old(self).frame_permission(),
-            *final(self) == (EntryOwner {
-                kind: EntryOwnerKind::Frame(
-                    FrameEntryOwner { permission: None, ..old(self).frame() },
-                ),
-                ..*old(self)
-            }),
-    {
-        let tracked mut old_kind = EntryOwnerKind::Absent;
-        tracked_swap(&mut self.kind, &mut old_kind);
-        match old_kind {
-            EntryOwnerKind::Frame(frame) => {
-                let ghost mapped_pa = frame.mapped_pa;
-                let ghost prop = frame.prop;
-                let tracked permission = frame.permission;
+                let ghost permission = frame.permission;
                 self.kind = EntryOwnerKind::Frame(
-                    FrameEntryOwner { mapped_pa, prop, permission: None },
+                    FrameEntryOwner {
+                        mapped_pa,
+                        prop,
+                        permission,
+                        _config: core::marker::PhantomData,
+                    },
                 );
-                permission
-            },
-            _ => proof_from_false(),
-        }
-    }
-
-    pub proof fn tracked_put_frame_permission(
-        tracked &mut self,
-        tracked permission: Option<C::Perm>,
-    )
-        requires
-            old(self).is_frame(),
-            old(self).frame_permission() is None,
-        ensures
-            *final(self) == (EntryOwner {
-                kind: EntryOwnerKind::Frame(FrameEntryOwner { permission, ..old(self).frame() }),
-                ..*old(self)
-            }),
-    {
-        let tracked mut old_kind = EntryOwnerKind::Absent;
-        tracked_swap(&mut self.kind, &mut old_kind);
-        match old_kind {
-            EntryOwnerKind::Frame(frame) => {
-                let ghost mapped_pa = frame.mapped_pa;
-                let ghost prop = frame.prop;
-                self.kind = EntryOwnerKind::Frame(FrameEntryOwner { mapped_pa, prop, permission });
             },
             _ => proof_from_false(),
         }
@@ -284,13 +255,20 @@ impl<C: PageTableConfig> EntryOwner<C> {
         path: TreePath<NR_ENTRIES>,
         parent_level: PagingLevel,
         prop: PageProperty,
-        tracked permission: Option<C::Perm>,
+        permission: Option<FrameRawPerms>,
     ) -> tracked Self
         returns
             Self::new_frame(paddr, path, parent_level, prop, permission),
     {
         Self {
-            kind: EntryOwnerKind::Frame(FrameEntryOwner { mapped_pa: paddr, prop, permission }),
+            kind: EntryOwnerKind::Frame(
+                FrameEntryOwner {
+                    mapped_pa: paddr,
+                    prop,
+                    permission,
+                    _config: core::marker::PhantomData,
+                },
+            ),
             node_permission: None,
             path,
             parent_level,
@@ -330,7 +308,12 @@ impl<C: PageTableConfig> EntryOwner<C> {
         C::lemma_page_table_config_constant_properties();
         Self {
             kind: EntryOwnerKind::Frame(
-                FrameEntryOwner { mapped_pa: paddr, prop, permission: None },
+                FrameEntryOwner {
+                    mapped_pa: paddr,
+                    prop,
+                    permission: None,
+                    _config: core::marker::PhantomData,
+                },
             ),
             node_permission: None,
             path: TreePath(Seq::empty()),

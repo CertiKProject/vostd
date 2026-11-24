@@ -29,11 +29,7 @@ pub tracked struct Payload {
     pub tracked ptes: PointsTo<[usize; 2]>,
 }
 
-impl LockedValue for Payload {
-    type Key = usize;
-
-    type Consts = CellId;
-
+impl LockedValue<usize, CellId> for Payload {
     open spec fn key(self) -> usize {
         self.addr
     }
@@ -56,15 +52,15 @@ impl LockedValue for Payload {
     }
 }
 
-pub type ExCell = NodeCell<Payload, 2, 2>;
+pub type ExCell = NodeCell<Payload, usize, CellId, 2, 2>;
 
-pub type ExTree = LockedTree<Payload, 2, 2>;
+pub type ExTree = LockedTree<Payload, usize, CellId, 2, 2>;
 
 /// One node: its lock, and the PTE array the lock protects.
 pub struct ExNode {
     pub addr: usize,
     pub ptes: PCell<[usize; 2]>,
-    pub lock: NodeLock<Payload, 2, 2>,
+    pub lock: NodeLock<Payload, usize, CellId, 2, 2>,
 }
 
 impl ExNode {

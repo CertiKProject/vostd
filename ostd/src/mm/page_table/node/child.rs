@@ -56,11 +56,14 @@ impl<C: PageTableConfig> Child<C> {
     /// - A mapped frame must satisfy the PTE implementation's
     ///   [`new_page_req`](PageTableEntryTrait::new_page_req) requirements.
     /// ## Postconditions
-    /// - For a page table node, its metadata permission moves into the
-    ///   entry owner's `node_permission`. All other owner fields are preserved;
-    ///   for a mapped frame or absent child, the owner is unchanged.
+    /// - For a page table node, its metadata permission moves out through
+    ///   `token`, for the parent node's lock cell, and the entry owner's
+    ///   `node_permission` records it. All other owner fields are preserved;
+    ///   for a mapped frame or absent child, the owner is unchanged and
+    ///   `token` stays `None`.
     #[verus_spec(res =>
         with Tracked(owner): Tracked<&mut EntryOwner<C>>,
+            -> token: Tracked<Option<crate::specs::mm::frame::meta_owners::FracMetadataPerm>>,
         requires
             old(owner).inv(),
             self.wf(*old(owner)),
@@ -69,6 +72,7 @@ impl<C: PageTableConfig> Child<C> {
             final(owner).inv(),
             final(owner).match_pte(res, final(owner).parent_level),
             *final(owner) == old(owner).into_pte_owner_spec(self),
+            token@ == final(owner).node_permission,
             old(owner).is_node() ==> res == C::E::new_pt(
                 meta_to_frame(old(owner).node().slot_vaddr()),
             ),
@@ -84,14 +88,24 @@ impl<C: PageTableConfig> Child<C> {
              */
             Child::PageTable(mut node) => {
                 let paddr = node.start_paddr();
+                proof_decl! {
+                    let tracked t = node.tracked_metadata_perm.tracked_take();
+                }
                 proof {
-                    owner.node_permission = Some(node.tracked_metadata_perm.tracked_take());
+                    owner.node_permission = Some(t);
                 }
                 let _ = ManuallyDrop::new(node);
+                proof_with!(|= Tracked(Some(t)));
                 C::E::new_pt(paddr)
             },
-            Child::Frame(paddr, level, prop) => { C::E::new_page(paddr, level, prop) },
-            Child::None => { C::E::new_absent() },
+            Child::Frame(paddr, level, prop) => {
+                proof_with!(|= Tracked(None));
+                C::E::new_page(paddr, level, prop)
+            },
+            Child::None => {
+                proof_with!(|= Tracked(None));
+                C::E::new_absent()
+            },
         }
     }
 
@@ -109,8 +123,10 @@ impl<C: PageTableConfig> Child<C> {
     ///   metadata permission for a page table node.
     /// - `level` must equal the entry owner's parent level.
     /// ## Postconditions
-    /// - For a page table node, the returned frame takes the entry owner's
-    ///   metadata permission, leaving `node_permission` as `None`.
+    /// - For a page table node, the returned frame takes the metadata
+    ///   permission `token`, which the caller took out of the parent node's
+    ///   lock cell and which the entry owner's `node_permission` records,
+    ///   leaving `node_permission` as `None`.
     ///   All other owner fields are preserved; for a mapped frame or absent
     ///   entry, the owner is unchanged.
     /// - The returned child satisfies [`Child::invariants`] with the updated
@@ -118,8 +134,10 @@ impl<C: PageTableConfig> Child<C> {
     #[verus_spec(res =>
         with Tracked(regions): Tracked<& MetaRegionOwners>,
              Tracked(entry_own): Tracked<&mut EntryOwner<C>>,
+             Tracked(token): Tracked<Option<crate::specs::mm::frame::meta_owners::FracMetadataPerm>>,
         requires
             old(entry_own).pte_invariants(pte, *regions),
+            token == old(entry_own).node_permission,
             level == old(entry_own).parent_level,
         ensures
             res.invariants(*final(entry_own), *regions),
@@ -140,7 +158,10 @@ impl<C: PageTableConfig> Child<C> {
             }
             let tracked slot_perm = regions.tracked_borrow_slot(paddr);
 
-            let tracked permission = entry_own.tracked_take_node_permission();
+            let tracked permission = token.tracked_unwrap();
+            proof {
+                entry_own.node_permission = None;
+            }
             // SAFETY: The caller ensures that this node was created by
             // `into_pte`, so that restoring the forgotten reference is safe.
             let node = unsafe {

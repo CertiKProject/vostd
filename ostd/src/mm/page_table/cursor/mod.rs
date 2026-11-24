@@ -72,6 +72,8 @@ use crate::{
     task::atomic_mode::InAtomicMode,
 };
 
+use crate::specs::mm::frame::frame_specs::FrameRawPerms;
+
 verus! {
 
 broadcast use group_ghost_tree_lemmas;
@@ -567,10 +569,39 @@ impl<'rcu, C: PageTableConfig> Cursor<'rcu, C> {
                         owner.level - 1,
                     );
                     let tracked mut child_owner = continuation.tracked_take_child();
+                    // The frame's item permission is in the node's lock cell,
+                    // which the cursor holds: borrow it out of the cell for the
+                    // clone, and put it back unchanged.
+                    let ghost query_parent_addr = continuation.entry_own.node().slot_vaddr();
+                    let ghost query_idx = continuation.idx as int;
+                    let tracked mut query_cell = owner.cells.tracked_remove(query_parent_addr);
+                    let ghost query_cell0 = query_cell;
+                    proof {
+                        owner_before_permission_take.lemma_cur_node_locked(*guards);
+                        continuation.entry_own.tracked_borrow_node().tracked_lemma_holds(
+                            &query_cell,
+                        );
+                        let ghost lvl = owner_before_permission_take.level - 1;
+                        owner_before_permission_take.lemma_inv_continuation(lvl);
+                        owner_before_permission_take.continuations[lvl].lemma_inv_children_rel_unroll(
+                        query_idx);
+                    }
                     let tracked raw_permission = {
-                        let tracked child_value = child_owner.tracked_borrow_mut_value();
-                        child_value.tracked_take_frame_permission()
+                        let tracked payload = query_cell.tracked_borrow_mut_value();
+                        if payload.frame_perms.contains_key(query_idx) {
+                            Some(payload.frame_perms.tracked_remove(query_idx))
+                        } else {
+                            None
+                        }
                     };
+                    proof {
+                        // The cell's permission is the one the tree's entry records.
+                        let ghost node = continuation.entry_own.node();
+                        assert(node.holds(query_cell0));
+                        assert(query_cell0.value().slot_auth@ == node.slot_view@);
+                        assert(child_owner.value().slot_snapshot() == node.slot_view@[query_idx]);
+                        assert(raw_permission == child_owner.value().frame_permission());
+                    }
 
                     // debug_assert_eq!(ch_level, level);
                     // SAFETY:
@@ -614,8 +645,22 @@ impl<'rcu, C: PageTableConfig> Cursor<'rcu, C> {
 
                     let (_pa, _level, _prop, Tracked(restored_permission)) = C::item_into_raw(item);
                     proof {
-                        let tracked child_value = child_owner.tracked_borrow_mut_value();
-                        child_value.tracked_put_frame_permission(restored_permission);
+                        let ghost query_cell1 = query_cell;
+                        {
+                            let tracked payload = query_cell.tracked_borrow_mut_value();
+                            if restored_permission is Some {
+                                payload.frame_perms.tracked_insert(
+                                    query_idx,
+                                    restored_permission.tracked_unwrap(),
+                                );
+                            }
+                            assert(payload.frame_perms =~= query_cell0.value().frame_perms);
+                        }
+                        query_cell0.lemma_with_value(query_cell1.value(), query_cell.value());
+                        assert(query_cell.value() == query_cell0.value());
+                        assert(query_cell == query_cell0);
+                        owner.cells.tracked_insert(query_parent_addr, query_cell);
+                        assert(owner.cells =~= owner_before_permission_take.cells);
                         continuation.tracked_put_child(child_owner);
                         owner.continuations.tracked_insert(owner.level - 1, continuation);
                         let idx = frame_to_index(pa);
@@ -2085,7 +2130,7 @@ impl<'rcu, C: PageTableConfig> CursorMut<'rcu, C> {
             old(owner).cur_entry_owner().is_frame(),
             forall |p: PageProperty| op.requires((p,)),
             forall |pa: Paddr, level: PagingLevel, p_in: PageProperty, p_out: PageProperty,
-                perm: Tracked<Option<C::Perm>>| #![auto]
+                perm: Tracked<Option<FrameRawPerms>>| #![auto]
                 op.ensures((p_in,), p_out)
                     && C::raw_item_well_formed((pa, level, p_in, perm)) ==> (
                     C::item_into_raw(C::item_from_raw(pa, level, p_out, perm)).3@
@@ -3238,7 +3283,7 @@ impl<'rcu, C: PageTableConfig> CursorMut<'rcu, C> {
             );
         }
 
-        #[verus_spec(with Tracked(owner), Tracked(new_owner), Tracked(regions), Tracked(guards))]
+        #[verus_spec(with Tracked(owner), Tracked(new_owner), Tracked(regions), Tracked(guards), Tracked(raw_permission))]
         let frag = self.replace_cur_entry(Child::Frame(pa, level, prop));
 
         let ghost owner2 = *owner;
@@ -3428,7 +3473,7 @@ impl<'rcu, C: PageTableConfig> CursorMut<'rcu, C> {
             }
         }
 
-        #[verus_spec(with Tracked(owner), Tracked(subtree), Tracked(regions), Tracked(guards))]
+        #[verus_spec(with Tracked(owner), Tracked(subtree), Tracked(regions), Tracked(guards), Tracked(None))]
         let frag = self.replace_cur_entry(Child::None);
 
         proof {
@@ -3608,7 +3653,7 @@ impl<'rcu, C: PageTableConfig> CursorMut<'rcu, C> {
             old(self).0.invariants(*old(owner), *old(regions), *old(guards)),
             forall |p: PageProperty| op.requires((p,)),
             forall |pa: Paddr, level: PagingLevel, p_in: PageProperty, p_out: PageProperty,
-                perm: Tracked<Option<C::Perm>>| #![auto]
+                perm: Tracked<Option<FrameRawPerms>>| #![auto]
                 op.ensures((p_in,), p_out)
                     && C::raw_item_well_formed((pa, level, p_in, perm)) ==> (
                     C::item_into_raw(C::item_from_raw(pa, level, p_out, perm)).3@
@@ -3675,7 +3720,9 @@ impl<'rcu, C: PageTableConfig> CursorMut<'rcu, C> {
              Tracked(new_owner): Tracked<OwnerSubtree<C>>,
              Tracked(regions): Tracked<&mut MetaRegionOwners>,
              Tracked(guards): Tracked<&mut Guards>,
+             Tracked(new_frame_perm): Tracked<Option<crate::specs::mm::frame::frame_specs::FrameRawPerms>>,
         requires
+            new_frame_perm == new_owner.value().slot_snapshot().frame,
             allowed_to_panic_if(old(owner).cur_entry_owner().is_node()
                 && old(regions).ref_count(frame_to_index(old(owner).cur_entry_owner().meta_slot_paddr()->0)) >= REF_COUNT_MAX),
             allowed_to_panic_if(!C::TOP_LEVEL_CAN_UNMAP && old(self).0.level >= C::NR_LEVELS && old(owner).cur_entry_owner().is_node()),
@@ -3839,6 +3886,9 @@ impl<'rcu, C: PageTableConfig> CursorMut<'rcu, C> {
             continuation.entry_own.tracked_borrow_node().tracked_lemma_holds(&parent_cell);
         }
 
+        proof_decl! {
+            let tracked old_frame_perm: Option<crate::specs::mm::frame::frame_specs::FrameRawPerms>;
+        }
         let old = {
             let node = path_slot_as_mut(&mut self.0.path, level as usize - 1);
 
@@ -3849,6 +3899,7 @@ impl<'rcu, C: PageTableConfig> CursorMut<'rcu, C> {
                 Tracked(new_value),
                 Tracked(continuation.entry_own.tracked_borrow_mut_node()),
                 Tracked(&mut parent_cell),
+                Tracked(new_frame_perm) => Tracked(old_frame_perm)
             )]
             node.replace_child(entry_idx, new_child)
         };
@@ -3996,10 +4047,7 @@ impl<'rcu, C: PageTableConfig> CursorMut<'rcu, C> {
         let result = match old {
             Child::None => None,
             Child::Frame(pa, ch_level, prop) => {
-                let tracked raw_permission = {
-                    let tracked old_child_value = old_child_owner.tracked_borrow_mut_value();
-                    old_child_value.tracked_take_frame_permission()
-                };
+                let tracked raw_permission = old_frame_perm;
                 // SAFETY:
                 // This is part of (if `split_huge` happens) a page table item mapped
                 // with a previous call to `C::item_into_raw`, where:

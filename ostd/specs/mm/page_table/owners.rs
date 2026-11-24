@@ -323,7 +323,14 @@ pub open spec fn allocated_empty_node_owner<C: PageTableConfig>(
     // depth + 1.
     &&& owner.level() == tree_level_for::<C>(level)
     &&& owner.value().node().inv()
-    &&& !owner.value().node().ptes().all(|child: C::E| child.is_present())
+    &&& !owner.value().node().ptes().all(
+        |child: C::E| child.is_present(),
+    )
+    // Nor does any slot hold a child-node token or a frame permission (as `PageTablePageMeta::new`
+    // establishes for the lock cell's half of the slot snapshots).
+    &&& forall|i: int|
+        0 <= i < NR_ENTRIES ==> (#[trigger] owner.value().node().slot_view@[i]) == (
+        crate::specs::mm::frame::meta_owners::SlotSnapshot { node: None, frame: None })
     &&& forall|i: int|
         0 <= i < NR_ENTRIES ==> {
             &&& #[trigger] owner.has_child(i)
@@ -532,6 +539,7 @@ impl<C: PageTableConfig> PageTableOwner<C> {
     pub open spec fn pt_edge_at(parent: OwnerSubtree<C>, i: int) -> bool {
         &&& parent.has_child(i)
         &&& parent.child(i).value().is_node() ==> parent.child(i).value().node_permission is Some
+        &&& parent.child(i).value().slot_snapshot() == parent.value().node().slot_view@[i]
         &&& parent.child(i).value().path.len() == parent.value().node().tree_level
             + 1
         // The child either matches its PTE as an owned node/frame/absent
@@ -652,6 +660,15 @@ impl<C: PageTableConfig> PageTableOwner<C> {
                     &&& owner.child(i).value().parent_level == owner.value().node().level()
                 },
             allocated_empty_node_grandchildren_none(owner),
+            // No slot holds a child-node token or a frame permission: the
+            // children are not nodes, and frames among them are untracked.
+            forall|i: int|
+                0 <= i < NR_ENTRIES && #[trigger] owner.child(i).value().is_frame() ==> owner.child(
+                    i,
+                ).value().frame_permission() is None,
+            forall|i: int|
+                0 <= i < NR_ENTRIES ==> (#[trigger] owner.value().node().slot_view@[i]) == (
+                crate::specs::mm::frame::meta_owners::SlotSnapshot { node: None, frame: None }),
         ensures
             PageTableOwner(owner).pt_inv(),
     {
@@ -667,6 +684,11 @@ impl<C: PageTableConfig> PageTableOwner<C> {
         ).pt_inv_at_depth((depth - 1) as nat) by {
             let child = owner.child(i);
             assert(owner.has_child(i));
+            // A non-node, untracked entry claims nothing, as its slot records.
+            assert(child.inv());
+            assert(child.value().inv());
+            assert(owner.value().node().slot_view@[i] == (
+            crate::specs::mm::frame::meta_owners::SlotSnapshot { node: None, frame: None }));
             PageTableOwner(child).lemma_non_node_pt_inv_at_depth((depth - 1) as nat);
         };
         // Unfold the parent after establishing the opaque child invariants.

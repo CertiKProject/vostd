@@ -47,6 +47,8 @@ mod test;
 
 //pub(crate) mod boot_pt;
 
+use crate::specs::mm::frame::frame_specs::FrameRawPerms;
+
 verus! {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -135,15 +137,11 @@ pub unsafe trait PageTableConfig: Clone + Debug + Send + Sync + 'static {
     /// [`item_into_raw`]: PageTableConfig::item_into_raw
     type Item: RCClone;
 
-    /// Verification-only type of the permission carried by a tracked item.
-    /// An untracked item carries `None` in its raw representation.
-    type Perm;
-
     spec fn item_into_raw_spec(item: Self::Item) -> (
         Paddr,
         PagingLevel,
         PageProperty,
-        Tracked<Option<Self::Perm>>,
+        Tracked<Option<FrameRawPerms>>,
     );
 
     /// Consumes the item and returns the physical address, the paging level,
@@ -156,7 +154,7 @@ pub unsafe trait PageTableConfig: Clone + Debug + Send + Sync + 'static {
         Paddr,
         PagingLevel,
         PageProperty,
-        Tracked<Option<Self::Perm>>,
+        Tracked<Option<FrameRawPerms>>,
     ))
         requires
             Self::item_well_formed(item),
@@ -175,7 +173,7 @@ pub unsafe trait PageTableConfig: Clone + Debug + Send + Sync + 'static {
         paddr: Paddr,
         level: PagingLevel,
         prop: PageProperty,
-        perm: Tracked<Option<Self::Perm>>,
+        perm: Tracked<Option<FrameRawPerms>>,
     ) -> Self::Item;
 
     /// Restores the item from the physical address and the paging level.
@@ -207,7 +205,7 @@ pub unsafe trait PageTableConfig: Clone + Debug + Send + Sync + 'static {
         paddr: Paddr,
         level: PagingLevel,
         prop: PageProperty,
-        perm: Tracked<Option<Self::Perm>>,
+        perm: Tracked<Option<FrameRawPerms>>,
     ) -> (res: Self::Item)
         requires
             Self::raw_item_well_formed((paddr, level, prop, perm)),
@@ -222,13 +220,13 @@ pub unsafe trait PageTableConfig: Clone + Debug + Send + Sync + 'static {
 
     /// Predicate that captures the well-formedness of raw items.
     spec fn raw_item_well_formed(
-        item: (Paddr, PagingLevel, PageProperty, Tracked<Option<Self::Perm>>),
+        item: (Paddr, PagingLevel, PageProperty, Tracked<Option<FrameRawPerms>>),
     ) -> bool;
 
     /// Relates an item's optional permission to the global metadata region.
     spec fn perm_well_formed_with_region(
         pa: Paddr,
-        perm: Tracked<Option<Self::Perm>>,
+        perm: Tracked<Option<FrameRawPerms>>,
         regions: MetaRegionOwners,
     ) -> bool;
 
@@ -241,7 +239,7 @@ pub unsafe trait PageTableConfig: Clone + Debug + Send + Sync + 'static {
 
     proof fn lemma_perm_well_formed_with_region_preserved(
         pa: Paddr,
-        perm: Tracked<Option<Self::Perm>>,
+        perm: Tracked<Option<FrameRawPerms>>,
         old_regions: MetaRegionOwners,
         new_regions: MetaRegionOwners,
     )
@@ -260,7 +258,7 @@ pub unsafe trait PageTableConfig: Clone + Debug + Send + Sync + 'static {
         level: PagingLevel,
         old_prop: PageProperty,
         new_prop: PageProperty,
-        perm: Tracked<Option<Self::Perm>>,
+        perm: Tracked<Option<FrameRawPerms>>,
     )
         requires
             valid_frame_paddr(pa),
@@ -278,7 +276,7 @@ pub unsafe trait PageTableConfig: Clone + Debug + Send + Sync + 'static {
         prop: PageProperty,
         child_pa: Paddr,
         child_idx: usize,
-        perm: Tracked<Option<Self::Perm>>,
+        perm: Tracked<Option<FrameRawPerms>>,
     )
         requires
             valid_frame_paddr(pa),
@@ -298,7 +296,7 @@ pub unsafe trait PageTableConfig: Clone + Debug + Send + Sync + 'static {
         pa: Paddr,
         level: PagingLevel,
         prop: PageProperty,
-        perm: Tracked<Option<Self::Perm>>,
+        perm: Tracked<Option<FrameRawPerms>>,
     )
         requires
             Self::raw_item_well_formed((pa, level, prop, perm)),
@@ -312,7 +310,7 @@ pub unsafe trait PageTableConfig: Clone + Debug + Send + Sync + 'static {
         pa: Paddr,
         level: PagingLevel,
         prop: PageProperty,
-        perm: Tracked<Option<Self::Perm>>,
+        perm: Tracked<Option<FrameRawPerms>>,
     )
         requires
             valid_frame_paddr(pa),
@@ -326,7 +324,7 @@ pub unsafe trait PageTableConfig: Clone + Debug + Send + Sync + 'static {
         pa: Paddr,
         level: PagingLevel,
         prop: PageProperty,
-        perm: Tracked<Option<Self::Perm>>,
+        perm: Tracked<Option<FrameRawPerms>>,
     )
         requires
             valid_frame_paddr(pa),
@@ -346,7 +344,7 @@ pub unsafe trait PageTableConfig: Clone + Debug + Send + Sync + 'static {
         pa: Paddr,
         level: PagingLevel,
         prop: PageProperty,
-        perm: Tracked<Option<Self::Perm>>,
+        perm: Tracked<Option<FrameRawPerms>>,
     )
         requires
             valid_frame_paddr(pa),

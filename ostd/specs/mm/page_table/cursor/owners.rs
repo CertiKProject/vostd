@@ -43,6 +43,8 @@ use crate::mm::{
 };
 use core::{marker::PhantomData, ops::Range};
 
+use crate::specs::mm::frame::frame_specs::FrameRawPerms;
+
 verus! {
 
 broadcast use group_ghost_tree_lemmas;
@@ -292,6 +294,7 @@ impl<'rcu, C: PageTableConfig> CursorContinuation<'rcu, C> {
             {
                 child is Some ==> {
                     &&& child->0.value().is_node() ==> child->0.value().node_permission is Some
+                    &&& child->0.value().slot_snapshot() == self.entry_own.node().slot_view@[i]
                     &&& child->0.value().parent_level == self.level()
                     &&& child->0.level() == self.tree_level + 1
                     &&& child->0.value().path.len() == self.entry_own.node().tree_level + 1
@@ -334,6 +337,7 @@ impl<'rcu, C: PageTableConfig> CursorContinuation<'rcu, C> {
         ensures
             self.children[i]->0.value().is_node()
                 ==> self.children[i]->0.value().node_permission is Some,
+            self.children[i]->0.value().slot_snapshot() == self.entry_own.node().slot_view@[i],
             self.children[i]->0.value().parent_level == self.level(),
             self.children[i]->0.level() == self.tree_level + 1,
             self.children[i]->0.value().path.len() == self.entry_own.node().tree_level + 1,
@@ -481,6 +485,7 @@ impl<'rcu, C: PageTableConfig> CursorContinuation<'rcu, C> {
             child_value.path.len() == parent_owner.tree_level + 1,
         ensures
             child_value.is_node() ==> child_value.node_permission is Some,
+            child_value.slot_snapshot() == parent_owner.slot_view@[idx as int],
             child_value.path.len() == parent_owner.tree_level + 1,
             child_value.match_pte(parent_owner.ptes()[idx as int], parent_owner.level()),
             child_value.path == entry_own.path.push_tail(idx as int),
@@ -529,6 +534,9 @@ impl<'rcu, C: PageTableConfig> CursorContinuation<'rcu, C> {
             forall|j: int|
                 0 <= j < NR_ENTRIES && j != self.idx ==> #[trigger] self.entry_own.node().ptes()[j]
                     == parent_old.ptes()[j],
+            forall|j: int|
+                0 <= j < NR_ENTRIES && j != self.idx
+                    ==> #[trigger] self.entry_own.node().slot_view@[j] == parent_old.slot_view@[j],
             // Children at j != idx untouched
             forall|j: int|
                 0 <= j < NR_ENTRIES && j != self.idx ==> #[trigger] self.children[j]
@@ -545,6 +553,8 @@ impl<'rcu, C: PageTableConfig> CursorContinuation<'rcu, C> {
             self.children[self.idx as int]->0.inv(),
             self.children[self.idx as int]->0.value().is_node()
                 ==> self.children[self.idx as int]->0.value().node_permission is Some,
+            self.children[self.idx as int]->0.value().slot_snapshot()
+                == self.entry_own.node().slot_view@[self.idx as int],
             self.children[self.idx as int]->0.value().parent_level == self.level(),
             self.children[self.idx as int]->0.value().path == self.path().push_tail(
                 self.idx as int,
@@ -570,7 +580,7 @@ impl<'rcu, C: PageTableConfig> CursorContinuation<'rcu, C> {
         tracked &self,
         paddr: Paddr,
         prop: PageProperty,
-        tracked permission: Option<C::Perm>,
+        permission: Option<FrameRawPerms>,
         tracked regions: &mut MetaRegionOwners,
     ) -> (tracked res: OwnerSubtree<C>)
         requires
@@ -751,6 +761,8 @@ impl<'rcu, C: PageTableConfig> Inv for CursorOwner<'rcu, C> {
                 )
                 &&& self.continuations[2].entry_own.parent_level
                     == self.continuations[3].entry_own.node().level()
+                &&& self.continuations[2].entry_own.slot_snapshot()
+                    == self.continuations[3].entry_own.node().slot_view@[self.continuations[3].idx as int]
             }
         }
         &&& self.level <= 2 <= C::NR_LEVELS ==> {
@@ -778,6 +790,8 @@ impl<'rcu, C: PageTableConfig> Inv for CursorOwner<'rcu, C> {
                 )
                 &&& self.continuations[1].entry_own.parent_level
                     == self.continuations[2].entry_own.node().level()
+                &&& self.continuations[1].entry_own.slot_snapshot()
+                    == self.continuations[2].entry_own.node().slot_view@[self.continuations[2].idx as int]
             }
         }
         &&& self.level <= 1 <= C::NR_LEVELS ==> {
@@ -807,6 +821,8 @@ impl<'rcu, C: PageTableConfig> Inv for CursorOwner<'rcu, C> {
                 )
                 &&& self.continuations[0].entry_own.parent_level
                     == self.continuations[1].entry_own.node().level()
+                &&& self.continuations[0].entry_own.slot_snapshot()
+                    == self.continuations[1].entry_own.node().slot_view@[self.continuations[1].idx as int]
             }
         }
     }

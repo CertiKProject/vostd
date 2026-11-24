@@ -17,7 +17,7 @@
 //!
 //! So here the cells are *flat*: a [`NodeCell`] lives in its own node's
 //! [`NodeLock`], and a parent refers to a child only by the child's
-//! [`LockedValue::Key`], which the parent's value already determines (for a
+//! key ([`LockedValue::key`]), which the parent's value already determines (for a
 //! page table: the physical address in the PTE). Locking a node is one
 //! operation on one lock, at any level, with no dependence on the parent.
 //!
@@ -66,21 +66,21 @@ verus! {
 broadcast use crate::ghost_tree::group_ghost_tree_lemmas;
 
 /// The contents of a lockable tree node.
-pub trait LockedValue: Sized {
-    /// How a parent names a child, e.g. the physical address of a page-table
-    /// node. Fixed for the node's lifetime.
-    type Key;
+///
+/// `K` is how a parent names a child, e.g. the physical address of a
+/// page-table node; `C` is further identity that a parent does not see, e.g.
+/// the ids of the permissions inside the value. Both are fixed for the node's
+/// lifetime. They are type parameters rather than associated types so that a
+/// value may own permissions to memory that holds locks of this kind (as a
+/// page-table node owns its children's metadata): Verus rejects such a type
+/// cycle when it runs through an associated type.
+pub trait LockedValue<K, C>: Sized {
+    spec fn key(self) -> K;
 
-    /// Further identity that a parent does not see, e.g. the ids of the
-    /// permissions inside the value. Fixed for the node's lifetime.
-    type Consts;
-
-    spec fn key(self) -> Self::Key;
-
-    spec fn consts(self) -> Self::Consts;
+    spec fn consts(self) -> C;
 
     /// Which node, if any, child slot `i` points to.
-    spec fn child_key(self, i: int) -> Option<Self::Key>;
+    spec fn child_key(self, i: int) -> Option<K>;
 
     /// Node-local invariant at tree depth `level`, required whenever the node
     /// is unlocked.
@@ -98,13 +98,14 @@ pub ghost struct LockConst<K, C> {
 
 /// The contents of one node: its value, plus a unique token whose location
 /// ties the cell to exactly one lock.
-pub tracked struct NodeCell<T: LockedValue, const N: usize, const L: usize> {
+pub tracked struct NodeCell<T: LockedValue<K, C>, K, C, const N: usize, const L: usize> {
     tracked token: UniqueToken,
     tracked value: T,
     ghost level: nat,
+    ghost _kc: PhantomData<(K, C)>,
 }
 
-impl<T: LockedValue, const N: usize, const L: usize> NodeCell<T, N, L> {
+impl<T: LockedValue<K, C>, K, C, const N: usize, const L: usize> NodeCell<T, K, C, N, L> {
     pub closed spec fn loc(self) -> Loc {
         self.token.id()
     }
@@ -117,12 +118,12 @@ impl<T: LockedValue, const N: usize, const L: usize> NodeCell<T, N, L> {
         self.level
     }
 
-    pub open spec fn key(self) -> T::Key {
+    pub open spec fn key(self) -> K {
         self.value().key()
     }
 
     /// The constant of the lock this cell belongs to.
-    pub open spec fn lock_const(self) -> LockConst<T::Key, T::Consts> {
+    pub open spec fn lock_const(self) -> LockConst<K, C> {
         LockConst {
             loc: self.loc(),
             level: self.level(),
@@ -145,7 +146,7 @@ impl<T: LockedValue, const N: usize, const L: usize> NodeCell<T, N, L> {
             res.value() == value,
             res.level() == level,
     {
-        NodeCell { token: UniqueToken::alloc(()), value, level }
+        NodeCell { token: UniqueToken::alloc(()), value, level, _kc: PhantomData }
     }
 
     pub proof fn tracked_borrow_value(tracked &self) -> (tracked res: &T)
@@ -164,8 +165,28 @@ impl<T: LockedValue, const N: usize, const L: usize> NodeCell<T, N, L> {
             final(self).value() == *final(res),
             final(self).loc() == old(self).loc(),
             final(self).level() == old(self).level(),
+            *final(self) == old(self).with_value(final(self).value()),
     {
         &mut self.value
+    }
+
+    /// This cell with its value replaced by `v`: what
+    /// [`Self::tracked_borrow_mut_value`] leaves behind.
+    pub closed spec fn with_value(self, v: T) -> Self {
+        NodeCell { value: v, ..self }
+    }
+
+    /// Replacing a cell's value by the one it has changes nothing, and a
+    /// second replacement overrides the first: so a cell whose value is
+    /// changed and then restored is the cell it was.
+    pub proof fn lemma_with_value(self, v: T, w: T)
+        ensures
+            self.with_value(self.value()) == self,
+            self.with_value(v).with_value(w) == self.with_value(w),
+            self.with_value(v).value() == v,
+            self.with_value(v).loc() == self.loc(),
+            self.with_value(v).level() == self.level(),
+    {
     }
 
     /// Two cells never share a lock identity.
@@ -180,17 +201,17 @@ impl<T: LockedValue, const N: usize, const L: usize> NodeCell<T, N, L> {
 
 /// Atomic invariant of a [`NodeLock`]: when unlocked, the lock holds the cell
 /// whose identity is the lock's constant.
-pub struct CellPred<T, const N: usize, const L: usize>(PhantomData<T>);
+pub struct CellPred<T, K, C, const N: usize, const L: usize>(PhantomData<(T, K, C)>);
 
-impl<T: LockedValue, const N: usize, const L: usize> AtomicInvariantPredicate<
-    LockConst<T::Key, T::Consts>,
+impl<T: LockedValue<K, C>, K, C, const N: usize, const L: usize> AtomicInvariantPredicate<
+    LockConst<K, C>,
     bool,
-    Option<NodeCell<T, N, L>>,
-> for CellPred<T, N, L> {
+    Option<NodeCell<T, K, C, N, L>>,
+> for CellPred<T, K, C, N, L> {
     open spec fn atomic_inv(
-        k: LockConst<T::Key, T::Consts>,
+        k: LockConst<K, C>,
         locked: bool,
-        g: Option<NodeCell<T, N, L>>,
+        g: Option<NodeCell<T, K, C, N, L>>,
     ) -> bool {
         match g {
             None => locked,
@@ -205,13 +226,13 @@ impl<T: LockedValue, const N: usize, const L: usize> AtomicInvariantPredicate<
 
 /// The lock of one node. Locking yields the node's [`NodeCell`]; no other
 /// node's lock is involved.
-pub struct NodeLock<T: LockedValue, const N: usize, const L: usize> {
-    atomic: AtomicBool<LockConst<T::Key, T::Consts>, Option<NodeCell<T, N, L>>, CellPred<T, N, L>>,
+pub struct NodeLock<T: LockedValue<K, C>, K, C, const N: usize, const L: usize> {
+    atomic: AtomicBool<LockConst<K, C>, Option<NodeCell<T, K, C, N, L>>, CellPred<T, K, C, N, L>>,
 }
 
-impl<T: LockedValue, const N: usize, const L: usize> NodeLock<T, N, L> {
+impl<T: LockedValue<K, C>, K, C, const N: usize, const L: usize> NodeLock<T, K, C, N, L> {
     /// The identity of the node this lock protects.
-    pub closed spec fn id(&self) -> LockConst<T::Key, T::Consts> {
+    pub closed spec fn id(&self) -> LockConst<K, C> {
         self.atomic.constant()
     }
 
@@ -220,7 +241,7 @@ impl<T: LockedValue, const N: usize, const L: usize> NodeLock<T, N, L> {
     }
 
     /// Creates an unlocked lock holding `cell`.
-    pub fn new(Tracked(cell): Tracked<NodeCell<T, N, L>>) -> (res: Self)
+    pub fn new(Tracked(cell): Tracked<NodeCell<T, K, C, N, L>>) -> (res: Self)
         requires
             cell.inv_cell(),
         ensures
@@ -233,14 +254,14 @@ impl<T: LockedValue, const N: usize, const L: usize> NodeLock<T, N, L> {
 
     /// Acquires the lock and returns the node's cell.
     #[verifier::exec_allows_no_decreases_clause]
-    pub fn lock(&self) -> (res: Tracked<NodeCell<T, N, L>>)
+    pub fn lock(&self) -> (res: Tracked<NodeCell<T, K, C, N, L>>)
         requires
             self.wf(),
         ensures
             res@.lock_const() == self.id(),
             res@.inv_cell(),
     {
-        let tracked mut got: Option<NodeCell<T, N, L>> = None;
+        let tracked mut got: Option<NodeCell<T, K, C, N, L>> = None;
         loop
             invariant_except_break
                 got is None,
@@ -270,7 +291,7 @@ impl<T: LockedValue, const N: usize, const L: usize> NodeLock<T, N, L> {
     ///
     /// The cell's identity says which lock it goes to, so the caller needs
     /// nothing from the node's parent.
-    pub fn unlock(&self, Tracked(cell): Tracked<NodeCell<T, N, L>>)
+    pub fn unlock(&self, Tracked(cell): Tracked<NodeCell<T, K, C, N, L>>)
         requires
             self.wf(),
             cell.lock_const() == self.id(),
@@ -293,9 +314,13 @@ impl<T: LockedValue, const N: usize, const L: usize> NodeLock<T, N, L> {
 }
 
 /// A subtree of held cells, as an ordinary ghost tree.
-pub type LockedTree<T, const N: usize, const L: usize> = TreeNode<NodeCell<T, N, L>, N, L>;
+pub type LockedTree<T, K, C, const N: usize, const L: usize> = TreeNode<
+    NodeCell<T, K, C, N, L>,
+    N,
+    L,
+>;
 
-impl<T: LockedValue, const N: usize, const L: usize> Inv for NodeCell<T, N, L> {
+impl<T: LockedValue<K, C>, K, C, const N: usize, const L: usize> Inv for NodeCell<T, K, C, N, L> {
     open spec fn inv(self) -> bool {
         true
     }
@@ -305,9 +330,15 @@ impl<T: LockedValue, const N: usize, const L: usize> Inv for NodeCell<T, N, L> {
 /// [`TreeNodeValue`], whose default-value lemmas rule out an edge relation
 /// that depends on the parent's contents (as the page table's `EntryOwner`
 /// does too).
-impl<T: LockedValue, const N: usize, const L: usize> TreeNodeValue<L> for NodeCell<T, N, L> {
+impl<T: LockedValue<K, C>, K, C, const N: usize, const L: usize> TreeNodeValue<L> for NodeCell<
+    T,
+    K,
+    C,
+    N,
+    L,
+> {
     closed spec fn default(lv: nat) -> Self {
-        NodeCell { token: arbitrary(), value: arbitrary(), level: lv }
+        NodeCell { token: arbitrary(), value: arbitrary(), level: lv, _kc: PhantomData }
     }
 
     proof fn lemma_default_preserves_inv() {
@@ -331,8 +362,8 @@ impl<T: LockedValue, const N: usize, const L: usize> TreeNodeValue<L> for NodeCe
 /// Every cell is unlockable, and every grafted child is the node its parent's
 /// value points to. Children the parent points to may be missing: they are in
 /// their own locks, or held by someone else.
-pub open spec fn tree_wf_at<T: LockedValue, const N: usize, const L: usize>(
-    t: LockedTree<T, N, L>,
+pub open spec fn tree_wf_at<T: LockedValue<K, C>, K, C, const N: usize, const L: usize>(
+    t: LockedTree<T, K, C, N, L>,
     depth: nat,
 ) -> bool
     decreases depth,
@@ -346,16 +377,16 @@ pub open spec fn tree_wf_at<T: LockedValue, const N: usize, const L: usize>(
         }
 }
 
-pub open spec fn tree_wf<T: LockedValue, const N: usize, const L: usize>(
-    t: LockedTree<T, N, L>,
+pub open spec fn tree_wf<T: LockedValue<K, C>, K, C, const N: usize, const L: usize>(
+    t: LockedTree<T, K, C, N, L>,
 ) -> bool {
     tree_wf_at(t, (L - t.level()) as nat)
 }
 
 /// Every child that some value in the tree points to has been grafted: the
 /// holder has the whole subtree.
-pub open spec fn complete_at<T: LockedValue, const N: usize, const L: usize>(
-    t: LockedTree<T, N, L>,
+pub open spec fn complete_at<T: LockedValue<K, C>, K, C, const N: usize, const L: usize>(
+    t: LockedTree<T, K, C, N, L>,
     depth: nat,
 ) -> bool
     decreases depth,
@@ -367,8 +398,8 @@ pub open spec fn complete_at<T: LockedValue, const N: usize, const L: usize>(
         }
 }
 
-pub open spec fn complete<T: LockedValue, const N: usize, const L: usize>(
-    t: LockedTree<T, N, L>,
+pub open spec fn complete<T: LockedValue<K, C>, K, C, const N: usize, const L: usize>(
+    t: LockedTree<T, K, C, N, L>,
 ) -> bool {
     complete_at(t, (L - t.level()) as nat)
 }
@@ -391,9 +422,9 @@ proof fn tracked_none_seq<A>(n: nat) -> (tracked res: Seq<Option<A>>)
 }
 
 /// A held cell as a one-node tree.
-pub proof fn tracked_leaf<T: LockedValue, const N: usize, const L: usize>(
-    tracked cell: NodeCell<T, N, L>,
-) -> (tracked res: LockedTree<T, N, L>)
+pub proof fn tracked_leaf<T: LockedValue<K, C>, K, C, const N: usize, const L: usize>(
+    tracked cell: NodeCell<T, K, C, N, L>,
+) -> (tracked res: LockedTree<T, K, C, N, L>)
     requires
         N > 0,
         cell.inv_cell(),
@@ -405,7 +436,7 @@ pub proof fn tracked_leaf<T: LockedValue, const N: usize, const L: usize>(
 {
     let ghost lv = cell.level();
     let tracked children = tracked_none_seq(N as nat);
-    let tracked res = LockedTree::<T, N, L>::tracked_new(cell, lv, children);
+    let tracked res = LockedTree::<T, K, C, N, L>::tracked_new(cell, lv, children);
     assert(res.inv());
     res
 }
@@ -414,11 +445,11 @@ pub proof fn tracked_leaf<T: LockedValue, const N: usize, const L: usize>(
 ///
 /// The child must be the node the parent points to at `i`, which the caller
 /// knows because it found the child's lock by following the parent's value.
-pub proof fn tracked_graft<T: LockedValue, const N: usize, const L: usize>(
-    tracked parent: LockedTree<T, N, L>,
+pub proof fn tracked_graft<T: LockedValue<K, C>, K, C, const N: usize, const L: usize>(
+    tracked parent: LockedTree<T, K, C, N, L>,
     i: int,
-    tracked child: LockedTree<T, N, L>,
-) -> (tracked res: LockedTree<T, N, L>)
+    tracked child: LockedTree<T, K, C, N, L>,
+) -> (tracked res: LockedTree<T, K, C, N, L>)
     requires
         tree_wf(parent),
         tree_wf(child),
@@ -437,7 +468,7 @@ pub proof fn tracked_graft<T: LockedValue, const N: usize, const L: usize>(
     let tracked _ = children.tracked_remove(i);
     children.tracked_insert(i, Some(child));
     assert(children =~= old_children.update(i, Some(child)));
-    let tracked res = LockedTree::<T, N, L>::tracked_new(value, lv, children);
+    let tracked res = LockedTree::<T, K, C, N, L>::tracked_new(value, lv, children);
     assert(res == parent.insert(i, child));
     assert(res.inv());
     assert forall|j: int| 0 <= j < N && #[trigger] res.has_child(j) implies {
@@ -452,10 +483,10 @@ pub proof fn tracked_graft<T: LockedValue, const N: usize, const L: usize>(
 }
 
 /// Detaches the child subtree at slot `i`, returning `(parent, child)`.
-pub proof fn tracked_detach<T: LockedValue, const N: usize, const L: usize>(
-    tracked parent: LockedTree<T, N, L>,
+pub proof fn tracked_detach<T: LockedValue<K, C>, K, C, const N: usize, const L: usize>(
+    tracked parent: LockedTree<T, K, C, N, L>,
     i: int,
-) -> (tracked res: (LockedTree<T, N, L>, LockedTree<T, N, L>))
+) -> (tracked res: (LockedTree<T, K, C, N, L>, LockedTree<T, K, C, N, L>))
     requires
         tree_wf(parent),
         0 <= i < N,
@@ -475,7 +506,7 @@ pub proof fn tracked_detach<T: LockedValue, const N: usize, const L: usize>(
     let tracked child = children.tracked_remove(i).tracked_unwrap();
     children.tracked_insert(i, None);
     assert(children =~= old_children.update(i, None));
-    let tracked rest = LockedTree::<T, N, L>::tracked_new(value, lv, children);
+    let tracked rest = LockedTree::<T, K, C, N, L>::tracked_new(value, lv, children);
     assert(rest == parent.remove(i));
     assert(rest.inv());
     assert forall|j: int| 0 <= j < N && #[trigger] rest.has_child(j) implies {
@@ -492,9 +523,9 @@ pub proof fn tracked_detach<T: LockedValue, const N: usize, const L: usize>(
 /// [`NodeCell::lock_const`] is the lock's `id`), and it is what unlocking a
 /// whole tree needs: following a key to its lock finds the lock each cell goes
 /// back to.
-pub open spec fn cells_belong_at<T: LockedValue, const N: usize, const L: usize>(
-    t: LockedTree<T, N, L>,
-    id: spec_fn(T::Key) -> LockConst<T::Key, T::Consts>,
+pub open spec fn cells_belong_at<T: LockedValue<K, C>, K, C, const N: usize, const L: usize>(
+    t: LockedTree<T, K, C, N, L>,
+    id: spec_fn(K) -> LockConst<K, C>,
     depth: nat,
 ) -> bool
     decreases depth,
@@ -508,18 +539,18 @@ pub open spec fn cells_belong_at<T: LockedValue, const N: usize, const L: usize>
         )
 }
 
-pub open spec fn cells_belong<T: LockedValue, const N: usize, const L: usize>(
-    t: LockedTree<T, N, L>,
-    id: spec_fn(T::Key) -> LockConst<T::Key, T::Consts>,
+pub open spec fn cells_belong<T: LockedValue<K, C>, K, C, const N: usize, const L: usize>(
+    t: LockedTree<T, K, C, N, L>,
+    id: spec_fn(K) -> LockConst<K, C>,
 ) -> bool {
     cells_belong_at(t, id, (L - t.level()) as nat)
 }
 
 /// Detaching a child keeps [`cells_belong`] for both parts.
-pub proof fn lemma_cells_belong_detach<T: LockedValue, const N: usize, const L: usize>(
-    parent: LockedTree<T, N, L>,
+pub proof fn lemma_cells_belong_detach<T: LockedValue<K, C>, K, C, const N: usize, const L: usize>(
+    parent: LockedTree<T, K, C, N, L>,
     i: int,
-    id: spec_fn(T::Key) -> LockConst<T::Key, T::Consts>,
+    id: spec_fn(K) -> LockConst<K, C>,
 )
     requires
         tree_wf(parent),
@@ -545,9 +576,9 @@ pub proof fn lemma_cells_belong_detach<T: LockedValue, const N: usize, const L: 
 }
 
 /// Turns a childless held tree back into its cell, ready to be unlocked.
-pub proof fn tracked_into_cell<T: LockedValue, const N: usize, const L: usize>(
-    tracked t: LockedTree<T, N, L>,
-) -> (tracked res: NodeCell<T, N, L>)
+pub proof fn tracked_into_cell<T: LockedValue<K, C>, K, C, const N: usize, const L: usize>(
+    tracked t: LockedTree<T, K, C, N, L>,
+) -> (tracked res: NodeCell<T, K, C, N, L>)
     requires
         tree_wf(t),
         forall|i: int| 0 <= i < N ==> !#[trigger] t.has_child(i),

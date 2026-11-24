@@ -2326,7 +2326,13 @@ proof fn lemma_dfs_unlocked_below_shrink<C: PageTableConfig>(
 /// A subtree of held page table lock cells, as a [`flat_tree`] tree.
 ///
 /// [`flat_tree`]: vstd_extra::resource::flat_tree
-pub type PtLockedTree = LockedTree<PtLockPayload, NR_ENTRIES, NR_LEVELS>;
+pub type PtLockedTree = LockedTree<
+    PtLockPayload,
+    Paddr,
+    crate::specs::mm::frame::meta_owners::PtLockConsts,
+    NR_ENTRIES,
+    NR_LEVELS,
+>;
 
 /// The lock cells in `cells` of the nodes of `t`, assembled into a tree: the
 /// root node's cell and, below it, the cells of the locked page-table nodes

@@ -175,11 +175,9 @@ unsafe impl PageTableConfig for KernelPtConfig {
 
     type Item = MappedItem;
 
-    type Perm = FrameRawPerms;
-
     open spec fn perm_well_formed_with_region(
         pa: Paddr,
-        perm: Tracked<Option<Self::Perm>>,
+        perm: Tracked<Option<FrameRawPerms>>,
         regions: MetaRegionOwners,
     ) -> bool {
         perm@ is Some ==> {
@@ -199,7 +197,7 @@ unsafe impl PageTableConfig for KernelPtConfig {
         Paddr,
         PagingLevel,
         PageProperty,
-        Tracked<Option<Self::Perm>>,
+        Tracked<Option<FrameRawPerms>>,
     ) {
         match item {
             MappedItem::Tracked(frame, prop) => (
@@ -229,7 +227,7 @@ unsafe impl PageTableConfig for KernelPtConfig {
         Paddr,
         PagingLevel,
         PageProperty,
-        Tracked<Option<Self::Perm>>,
+        Tracked<Option<FrameRawPerms>>,
     )) {
         match item {
             MappedItem::Tracked(frame, mut prop) => {
@@ -255,7 +253,7 @@ unsafe impl PageTableConfig for KernelPtConfig {
         paddr: Paddr,
         level: PagingLevel,
         prop: PageProperty,
-        perm: Tracked<Option<Self::Perm>>,
+        perm: Tracked<Option<FrameRawPerms>>,
     ) -> Self::Item {
         if prop.flags.contains(PageFlags::AVAIL1) {
             MappedItem::Tracked(
@@ -279,7 +277,7 @@ unsafe impl PageTableConfig for KernelPtConfig {
         paddr: Paddr,
         level: PagingLevel,
         prop: PageProperty,
-        Tracked(perm): Tracked<Option<Self::Perm>>,
+        Tracked(perm): Tracked<Option<FrameRawPerms>>,
     ) -> Self::Item {
         if prop.flags.contains(PageFlags::AVAIL1) {
             debug_assert_eq!(level, 1);
@@ -300,7 +298,7 @@ unsafe impl PageTableConfig for KernelPtConfig {
         pa: Paddr,
         level: PagingLevel,
         prop: PageProperty,
-        perm: Tracked<Option<Self::Perm>>,
+        perm: Tracked<Option<FrameRawPerms>>,
     ) {
         broadcast use group_page_meta;
 
@@ -320,7 +318,7 @@ unsafe impl PageTableConfig for KernelPtConfig {
         paddr: Paddr,
         level: PagingLevel,
         prop: PageProperty,
-        perm: Tracked<Option<Self::Perm>>,
+        perm: Tracked<Option<FrameRawPerms>>,
     ) {
         broadcast use group_page_meta;
 
@@ -347,7 +345,7 @@ unsafe impl PageTableConfig for KernelPtConfig {
     }
 
     open spec fn raw_item_well_formed(
-        item: (Paddr, PagingLevel, PageProperty, Tracked<Option<Self::Perm>>),
+        item: (Paddr, PagingLevel, PageProperty, Tracked<Option<FrameRawPerms>>),
     ) -> bool {
         let (pa, level, prop, perm) = item;
         &&& (prop.flags.contains(PageFlags::AVAIL1) <==> perm@ is Some)
@@ -362,7 +360,7 @@ unsafe impl PageTableConfig for KernelPtConfig {
 
     proof fn lemma_perm_well_formed_with_region_preserved(
         pa: Paddr,
-        perm: Tracked<Option<Self::Perm>>,
+        perm: Tracked<Option<FrameRawPerms>>,
         old_regions: MetaRegionOwners,
         new_regions: MetaRegionOwners,
     ) {
@@ -373,7 +371,7 @@ unsafe impl PageTableConfig for KernelPtConfig {
         level: PagingLevel,
         old_prop: PageProperty,
         new_prop: PageProperty,
-        perm: Tracked<Option<Self::Perm>>,
+        perm: Tracked<Option<FrameRawPerms>>,
     ) {
     }
 
@@ -383,7 +381,7 @@ unsafe impl PageTableConfig for KernelPtConfig {
         prop: PageProperty,
         child_pa: Paddr,
         child_idx: usize,
-        perm: Tracked<Option<Self::Perm>>,
+        perm: Tracked<Option<FrameRawPerms>>,
     ) {
         assert(<PageTableEntry as crate::mm::page_table::PageTableEntryTrait>::new_page_req(
             pa,
@@ -401,7 +399,7 @@ unsafe impl PageTableConfig for KernelPtConfig {
         pa: Paddr,
         level: PagingLevel,
         prop: PageProperty,
-        perm: Tracked<Option<Self::Perm>>,
+        perm: Tracked<Option<FrameRawPerms>>,
     ) {
     }
 
@@ -409,7 +407,7 @@ unsafe impl PageTableConfig for KernelPtConfig {
         pa: Paddr,
         level: PagingLevel,
         prop: PageProperty,
-        perm: Tracked<Option<Self::Perm>>,
+        perm: Tracked<Option<FrameRawPerms>>,
     ) {
         broadcast use group_page_meta;
 

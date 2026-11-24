@@ -30,6 +30,8 @@ use crate::mm::{
     kspace::FRAME_METADATA_RANGE,
 };
 
+use crate::specs::mm::frame::frame_specs::FrameRawPerms;
+
 verus! {
 
 pub ghost enum PageUsage {
@@ -51,6 +53,41 @@ pub ghost enum PageUsage {
 /// ghost variable: one raw `usize` per entry (`PageTableEntryTrait::as_usize`),
 /// so that it does not depend on the `PageTableConfig`.
 pub type PteRaws = Seq<usize>;
+
+/// What one slot of a node owns, as a ghost snapshot: the counted metadata
+/// token of the child node its PTE points to, or the permission of the frame
+/// it maps (neither, for an absent or untracked entry). The node's lock cell
+/// holds the authoritative half of a ghost variable recording one snapshot
+/// per slot ([`PtLockPayload::slot_auth`]); the page table tree holds the
+/// other half (`NodeOwner::slot_view`), so whoever holds the cell can prove
+/// that the tree's view of the slots is current.
+pub ghost struct SlotSnapshot {
+    pub node: Option<FracMetadataPerm>,
+    pub frame: Option<FrameRawPerms>,
+}
+
+/// One [`SlotSnapshot`] per entry of a node.
+pub type SlotSnapshots = Seq<SlotSnapshot>;
+
+/// `perms` holds exactly the frame item permissions that `snaps` records.
+pub open spec fn frame_perms_match(snaps: SlotSnapshots, perms: Map<int, FrameRawPerms>) -> bool {
+    &&& forall|i: int| #[trigger]
+        perms.contains_key(i) ==> 0 <= i < snaps.len() && snaps[i].frame == Some(perms[i])
+    &&& forall|i: int|
+        0 <= i < snaps.len() && (#[trigger] snaps[i]).frame is Some ==> perms.contains_key(i)
+}
+
+/// `tokens` holds exactly the child-node tokens that `snaps` records: one per
+/// slot whose snapshot has a `node`, and equal to it.
+pub open spec fn node_tokens_match(
+    snaps: SlotSnapshots,
+    tokens: Map<int, FracMetadataPerm>,
+) -> bool {
+    &&& forall|i: int| #[trigger]
+        tokens.contains_key(i) ==> 0 <= i < snaps.len() && snaps[i].node == Some(tokens[i])
+    &&& forall|i: int|
+        0 <= i < snaps.len() && (#[trigger] snaps[i]).node is Some ==> tokens.contains_key(i)
+}
 
 /// Number of entries among the first `n` of `s` that satisfy `f`.
 pub open spec fn count_where_upto(f: spec_fn(usize) -> bool, s: PteRaws, n: int) -> int
@@ -87,6 +124,8 @@ pub ghost struct PtLockConsts {
     pub stray_id: CellId,
     /// The id of the node's PTE-model ghost variable.
     pub pte_model_id: Loc,
+    /// The id of the node's slot-snapshot ghost variable.
+    pub slot_model_id: Loc,
     /// The paging level of the node.
     pub pt_level: PagingLevel,
     /// Whether a PTE, given by its bytes, is present.
@@ -121,16 +160,22 @@ pub tracked struct PtLockPayload {
     /// The authoritative half of the PTE model. The other half
     /// (`NodeOwner::pte_view`) stays with the page table tree.
     pub pte_auth: GhostVarAuth<PteRaws>,
+    /// The authoritative half of the slot snapshots. The other half
+    /// (`NodeOwner::slot_view`) stays with the page table tree.
+    pub slot_auth: GhostVarAuth<SlotSnapshots>,
+    /// The counted metadata tokens of the child nodes this node's PTEs point
+    /// to, by slot. Replacing a PTE moves its token, so only the lock holder
+    /// can.
+    pub node_tokens: Map<int, FracMetadataPerm>,
+    /// The item permissions of the tracked frames this node's PTEs map, by
+    /// slot. Mapping and unmapping move them, so only the lock holder can.
+    pub frame_perms: Map<int, FrameRawPerms>,
     /// The permission for the node's PTE array, as raw values. Whoever holds
     /// the lock may read and write the PTEs.
     pub ptes: array_ptr::PointsTo<usize, NR_ENTRIES>,
 }
 
-impl LockedValue for PtLockPayload {
-    type Key = Paddr;
-
-    type Consts = PtLockConsts;
-
+impl LockedValue<Paddr, PtLockConsts> for PtLockPayload {
     open spec fn key(self) -> Paddr {
         self.paddr
     }
@@ -140,6 +185,7 @@ impl LockedValue for PtLockPayload {
             nr_children_id: self.meta.nr_children.id(),
             stray_id: self.meta.stray.id(),
             pte_model_id: self.pte_auth.id(),
+            slot_model_id: self.slot_auth.id(),
             pt_level: self.pt_level,
             is_present: self.is_present,
             child_of: self.child_of,
@@ -165,13 +211,16 @@ impl LockedValue for PtLockPayload {
         &&& self.ptes.wf()
         &&& self.ptes.is_init_all()
         &&& self.ptes.value() == self.pte_auth@
+        &&& self.slot_auth@.len() == NR_ENTRIES
+        &&& node_tokens_match(self.slot_auth@, self.node_tokens)
+        &&& frame_perms_match(self.slot_auth@, self.frame_perms)
         &&& self.ptes.addr() == crate::mm::paddr_to_vaddr(self.paddr)
     }
 }
 
 /// The cell a page table node lock holds while free. The root of a page table
 /// is at flat-tree depth `0` and level-1 nodes at depth `NR_LEVELS - 1`.
-pub type PtLockCell = NodeCell<PtLockPayload, NR_ENTRIES, NR_LEVELS>;
+pub type PtLockCell = NodeCell<PtLockPayload, Paddr, PtLockConsts, NR_ENTRIES, NR_LEVELS>;
 
 /// The invariant of the page table node lock (see [`PageTableLock`]).
 pub struct PtLockPred;

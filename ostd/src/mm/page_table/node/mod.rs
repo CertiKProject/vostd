@@ -75,6 +75,8 @@ use crate::{
     task::atomic_mode::InAtomicMode,
 };
 
+use crate::specs::mm::frame::frame_specs::FrameRawPerms;
+
 verus! {
 
 /// The metadata of any kinds of page table pages.
@@ -181,7 +183,7 @@ unsafe impl<C: PageTableConfig> AnyFrameMeta for PageTablePageMeta<C> {
                     frame.drop(Tracked(regions));
                 } else {
                     proof_decl! {
-                        let tracked item_perm: Option<C::Perm>;
+                        let tracked item_perm: Option<FrameRawPerms>;
                     }
                     // SAFETY: The PTE points to a mapped item. The ownership
                     // of the item is transferred here then dropped.
@@ -390,6 +392,7 @@ impl<'a, C: PageTableConfig> PageTableNodeRef<'a, C> {
             self@.tracked_metadata_perm@ matches Some(p) ==> self.inv() && owner.matches_permission(p),
             owner.meta_value().lock_wf(),
             owner.pte_view.id() == owner.meta_value().lock.constant().consts.pte_model_id,
+            owner.slot_view.id() == owner.meta_value().lock.constant().consts.slot_model_id,
             lock_key_wf(owner.meta_value(), owner.slot_index),
             old(guards).unlocked(owner.slot_vaddr()),
             // This thread does not hold the lock already.
@@ -660,6 +663,7 @@ impl<'rcu, C: PageTableConfig> PageTableGuard<'rcu, C> {
             final(cell).value().meta == old(cell).value().meta,
             final(cell).lock_const() == old(cell).lock_const(),
             final(owner).pte_view.id() == old(owner).pte_view.id(),
+            final(owner).slot_view == old(owner).slot_view,
             final(owner).metadata == old(owner).metadata,
             final(owner).metadata_id == old(owner).metadata_id,
             final(owner).slot_index == old(owner).slot_index,
@@ -813,7 +817,7 @@ impl<C: PageTableConfig> PageTablePageMeta<C> {
         with
             Ghost(paddr): Ghost<Paddr>,
             Tracked(ptes): Tracked<array_ptr::PointsTo<usize, NR_ENTRIES>>,
-            -> pte_view: Tracked<GhostVar<PteRaws>>,
+            -> views: Tracked<(GhostVar<PteRaws>, GhostVar<SlotSnapshots>)>,
         requires
             1 <= level <= NR_LEVELS,
             // The node's frame, zeroed: every PTE is absent.
@@ -825,14 +829,19 @@ impl<C: PageTableConfig> PageTablePageMeta<C> {
             res.lock_wf(),
             res.level == level,
             res.lock.constant().key == paddr,
-            pte_view@.id() == res.lock.constant().consts.pte_model_id,
-            pte_view@@ == pte_raws(Seq::new(NR_ENTRIES as nat, |_i: int| C::E::new_absent_spec())),
+            views@.0.id() == res.lock.constant().consts.pte_model_id,
+            views@.0@ == pte_raws(Seq::new(NR_ENTRIES as nat, |_i: int| C::E::new_absent_spec())),
+            views@.1.id() == res.lock.constant().consts.slot_model_id,
+            views@.1@ == Seq::new(NR_ENTRIES as nat, |_i: int| SlotSnapshot { node: None, frame: None }),
     )]
     pub fn new(level: PagingLevel) -> Self {
         let (nr_children, Tracked(nr_children_perm)) = pcell_maybe_uninit::PCell::new(0);
         let (stray, Tracked(stray_perm)) = pcell_maybe_uninit::PCell::new(false);
         let ghost absent = Seq::new(NR_ENTRIES as nat, |_i: int| C::E::new_absent_spec());
         let tracked (pte_auth, pte_view) = GhostVarAuth::<PteRaws>::new(pte_raws(absent));
+        let tracked (slot_auth, slot_view) = GhostVarAuth::<SlotSnapshots>::new(
+            Seq::new(NR_ENTRIES as nat, |_i: int| SlotSnapshot { node: None, frame: None }),
+        );
         proof {
             C::E::lemma_page_table_entry_properties();
             lemma_count_present_upto_all_absent::<C::E>(absent, NR_ENTRIES as int);
@@ -845,6 +854,9 @@ impl<C: PageTableConfig> PageTablePageMeta<C> {
             child_of: raw_child_of_fn::<C::E>(),
             meta: PageMetaOwner { nr_children: nr_children_perm, stray: stray_perm },
             pte_auth,
+            slot_auth,
+            node_tokens: Map::tracked_empty(),
+            frame_perms: Map::tracked_empty(),
             ptes,
         };
         let tracked cell = PtLockCell::tracked_new(payload, (NR_LEVELS - level) as nat);
@@ -859,7 +871,7 @@ impl<C: PageTableConfig> PageTablePageMeta<C> {
         proof {
             reveal(PageTablePageMeta::lock_consts_wf);
         }
-        proof_with!{ |= Tracked(pte_view) }
+        proof_with!{ |= Tracked((pte_view, slot_view)) }
         res
     }
 

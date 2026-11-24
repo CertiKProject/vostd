@@ -314,6 +314,8 @@ impl<'rcu, C: PageTableConfig> CursorOwner<'rcu, C> {
                 0 <= j < NR_ENTRIES && #[trigger] child.children[j] is Some implies {
                 &&& child.children[j]->0.value().is_node()
                     ==> child.children[j]->0.value().node_permission is Some
+                &&& child.children[j]->0.value().slot_snapshot()
+                    == child.entry_own.node().slot_view@[j]
                 &&& child.children[j].unwrap().value().parent_level == child.level()
                 &&& child.children[j].unwrap().level() == child.tree_level + 1
                 &&& child.children[j].unwrap().value().path.len()

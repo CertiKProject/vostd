@@ -216,6 +216,8 @@ impl<'rcu, C: PageTableConfig> CursorOwner<'rcu, C> {
             other.continuations[self.level - 1].idx == self.continuations[self.level - 1].idx,
             other.continuations[self.level - 1].entry_own.parent_level
                 == self.continuations[self.level - 1].entry_own.parent_level,
+            other.continuations[self.level - 1].entry_own.node_permission
+                == self.continuations[self.level - 1].entry_own.node_permission,
             other.continuations[self.level - 1].guard.inner.slot_vaddr()
                 == self.continuations[self.level - 1].guard.inner.slot_vaddr(),
             other.continuations[self.level - 1].path() == self.continuations[self.level - 1].path(),
@@ -317,6 +319,8 @@ impl<'rcu, C: PageTableConfig> CursorOwner<'rcu, C> {
             self.continuations[self.level - 1].idx == owner0.continuations[owner0.level - 1].idx,
             self.continuations[self.level - 1].entry_own.parent_level
                 == owner0.continuations[owner0.level - 1].entry_own.parent_level,
+            self.continuations[self.level - 1].entry_own.node_permission
+                == owner0.continuations[owner0.level - 1].entry_own.node_permission,
             // Guard address preserved (from parent_perms_preserved).
             self.continuations[self.level - 1].guard.inner.slot_vaddr()
                 == owner0.continuations[owner0.level - 1].guard.inner.slot_vaddr(),

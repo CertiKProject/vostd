@@ -1536,7 +1536,7 @@ impl<'a> CursorMut<'a> {
             forall |p: PageProperty| op.requires((p,)),
             // Every well-formed raw item for `UserPtConfig` is tracked.
             forall |pa: Paddr, level: PagingLevel, p_in: PageProperty, p_out: PageProperty,
-                perm: Tracked<Option<<UserPtConfig as PageTableConfig>::Perm>>| #![auto]
+                perm: Tracked<Option<FrameRawPerms>>| #![auto]
                 op.ensures((p_in,), p_out)
                     && UserPtConfig::raw_item_well_formed((pa, level, p_in, perm)) ==> (
                     UserPtConfig::item_into_raw(UserPtConfig::item_from_raw(
@@ -1627,11 +1627,9 @@ unsafe impl PageTableConfig for UserPtConfig {
 
     type Item = MappedItem;
 
-    type Perm = FrameRawPerms;
-
     open spec fn perm_well_formed_with_region(
         pa: Paddr,
-        perm: Tracked<Option<Self::Perm>>,
+        perm: Tracked<Option<FrameRawPerms>>,
         regions: MetaRegionOwners,
     ) -> bool {
         perm@ is Some ==> {
@@ -1651,7 +1649,7 @@ unsafe impl PageTableConfig for UserPtConfig {
         Paddr,
         PagingLevel,
         PageProperty,
-        Tracked<Option<Self::Perm>>,
+        Tracked<Option<FrameRawPerms>>,
     ) {
         (
             item.frame.start_paddr_spec(),
@@ -1673,7 +1671,7 @@ unsafe impl PageTableConfig for UserPtConfig {
         Paddr,
         PagingLevel,
         PageProperty,
-        Tracked<Option<Self::Perm>>,
+        Tracked<Option<FrameRawPerms>>,
     )) {
         proof_decl! {
             let tracked raw_perm: FrameRawPerms;
@@ -1689,7 +1687,7 @@ unsafe impl PageTableConfig for UserPtConfig {
         paddr: Paddr,
         _level: PagingLevel,
         prop: PageProperty,
-        perm: Tracked<Option<Self::Perm>>,
+        perm: Tracked<Option<FrameRawPerms>>,
     ) -> Self::Item {
         MappedItem {
             frame: UFrame {
@@ -1709,7 +1707,7 @@ unsafe impl PageTableConfig for UserPtConfig {
         paddr: Paddr,
         level: PagingLevel,
         prop: PageProperty,
-        Tracked(perm): Tracked<Option<Self::Perm>>,
+        Tracked(perm): Tracked<Option<FrameRawPerms>>,
     ) -> Self::Item {
         let tracked raw_perm = perm.tracked_unwrap();
         // SAFETY: The caller ensures safety.
@@ -1722,7 +1720,7 @@ unsafe impl PageTableConfig for UserPtConfig {
         pa: Paddr,
         level: PagingLevel,
         prop: PageProperty,
-        perm: Tracked<Option<Self::Perm>>,
+        perm: Tracked<Option<FrameRawPerms>>,
     ) {
         broadcast use group_page_meta;
 
@@ -1737,7 +1735,7 @@ unsafe impl PageTableConfig for UserPtConfig {
         paddr: Paddr,
         level: PagingLevel,
         prop: PageProperty,
-        perm: Tracked<Option<Self::Perm>>,
+        perm: Tracked<Option<FrameRawPerms>>,
     ) {
         broadcast use group_page_meta;
 
@@ -1750,7 +1748,7 @@ unsafe impl PageTableConfig for UserPtConfig {
     }
 
     open spec fn raw_item_well_formed(
-        item: (Paddr, PagingLevel, PageProperty, Tracked<Option<Self::Perm>>),
+        item: (Paddr, PagingLevel, PageProperty, Tracked<Option<FrameRawPerms>>),
     ) -> bool {
         let (pa, level, _prop, perm) = item;
         &&& level == 1
@@ -1763,7 +1761,7 @@ unsafe impl PageTableConfig for UserPtConfig {
 
     proof fn lemma_perm_well_formed_with_region_preserved(
         pa: Paddr,
-        perm: Tracked<Option<Self::Perm>>,
+        perm: Tracked<Option<FrameRawPerms>>,
         old_regions: MetaRegionOwners,
         new_regions: MetaRegionOwners,
     ) {
@@ -1774,7 +1772,7 @@ unsafe impl PageTableConfig for UserPtConfig {
         level: PagingLevel,
         old_prop: PageProperty,
         new_prop: PageProperty,
-        perm: Tracked<Option<Self::Perm>>,
+        perm: Tracked<Option<FrameRawPerms>>,
     ) {
     }
 
@@ -1784,7 +1782,7 @@ unsafe impl PageTableConfig for UserPtConfig {
         prop: PageProperty,
         child_pa: Paddr,
         child_idx: usize,
-        perm: Tracked<Option<Self::Perm>>,
+        perm: Tracked<Option<FrameRawPerms>>,
     ) {
     }
 
@@ -1792,7 +1790,7 @@ unsafe impl PageTableConfig for UserPtConfig {
         pa: Paddr,
         level: PagingLevel,
         prop: PageProperty,
-        perm: Tracked<Option<Self::Perm>>,
+        perm: Tracked<Option<FrameRawPerms>>,
     ) {
     }
 
@@ -1800,7 +1798,7 @@ unsafe impl PageTableConfig for UserPtConfig {
         pa: Paddr,
         level: PagingLevel,
         prop: PageProperty,
-        perm: Tracked<Option<Self::Perm>>,
+        perm: Tracked<Option<FrameRawPerms>>,
     ) {
         broadcast use group_page_meta;
 
