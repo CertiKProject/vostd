@@ -337,25 +337,12 @@ impl<T: LockedValue<K, C>, K, C, const N: usize, const L: usize> TreeNodeValue<L
     N,
     L,
 > {
-    closed spec fn default(lv: nat) -> Self {
-        NodeCell { token: arbitrary(), value: arbitrary(), level: lv, _kc: PhantomData }
-    }
-
-    proof fn lemma_default_preserves_inv() {
-    }
-
     open spec fn la_inv(self, lv: nat) -> bool {
         self.level() == lv
     }
 
-    proof fn lemma_default_preserves_la_inv() {
-    }
-
     open spec fn rel_children(self, index: int, child: Option<Self>) -> bool {
         true
-    }
-
-    proof fn lemma_default_preserves_rel_children(self, lv: nat) {
     }
 }
 

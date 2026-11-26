@@ -29,18 +29,8 @@ impl Inv for Payload {
 }
 
 impl TreeNodeValue<2> for Payload {
-    open spec fn default(lv: nat) -> Self {
-        Payload { lv, val: 0 }
-    }
-
-    proof fn lemma_default_preserves_inv() {
-    }
-
     open spec fn la_inv(self, lv: nat) -> bool {
         self.lv == lv
-    }
-
-    proof fn lemma_default_preserves_la_inv() {
     }
 
     open spec fn rel_children(self, index: int, child: Option<Self>) -> bool {
@@ -48,9 +38,6 @@ impl TreeNodeValue<2> for Payload {
             Some(c) => c.lv == self.lv + 1,
             None => true,
         }
-    }
-
-    proof fn lemma_default_preserves_rel_children(self, lv: nat) {
     }
 }
 

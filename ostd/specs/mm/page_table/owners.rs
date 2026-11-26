@@ -258,32 +258,14 @@ pub proof fn sibling_paths_disjoint<C: PageTableConfig>(
 }
 
 impl<C: PageTableConfig, const L: usize> TreeNodeValue<L> for EntryOwner<C> {
-    open spec fn default(lv: nat) -> Self {
-        Self {
-            kind: EntryOwnerKind::Absent,
-            node_permission: None,
-            path: TreePath::new(Seq::empty()),
-            parent_level: (C::NR_LEVELS + 1 - lv) as PagingLevel,
-        }
-    }
-
-    proof fn lemma_default_preserves_inv() {
-    }
-
     open spec fn la_inv(self, lv: nat) -> bool {
         self.is_node() ==> lv < L - 1
-    }
-
-    proof fn lemma_default_preserves_la_inv() {
     }
 
     // PT-specific per-edge facts now live in `PageTableOwner::pt_inv` /
     // `CursorContinuation::pt_inv_children`.
     open spec fn rel_children(self, i: int, child: Option<Self>) -> bool {
         true
-    }
-
-    proof fn lemma_default_preserves_rel_children(self, lv: nat) {
     }
 }
 
